@@ -1,0 +1,57 @@
+create_task method 99 -> Some(
+    HttpRequest(
+        HttpRequest {
+            url: "https://example.com/work",
+            http_method: Post,
+            headers: {
+                "User-Agent": "Google-Cloud-Tasks",
+            },
+            body: [],
+            authorization_header: None,
+        },
+    ),
+)
+create_task view 99 -> (
+    Ok(
+        Unspecified,
+    ),
+    Some(
+        HttpRequest(
+            HttpRequest {
+                url: "https://example.com/work",
+                http_method: Post,
+                headers: {
+                    "User-Agent": "Google-Cloud-Tasks",
+                },
+                body: [],
+                authorization_header: None,
+            },
+        ),
+    ),
+)
+get_task view 99 -> (
+    Ok(
+        Unspecified,
+    ),
+    Some(
+        HttpRequest(
+            HttpRequest {
+                url: "https://example.com/work",
+                http_method: Post,
+                headers: {
+                    "User-Agent": "Google-Cloud-Tasks",
+                },
+                body: [],
+                authorization_header: None,
+            },
+        ),
+    ),
+)
+list_tasks view 99 -> [
+    Ok(
+        Basic,
+    ),
+    Ok(
+        Basic,
+    ),
+]

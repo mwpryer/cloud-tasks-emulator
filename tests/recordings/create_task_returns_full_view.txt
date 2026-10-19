@@ -1,0 +1,43 @@
+create_task -> Task {
+    name: "projects/{project}/locations/{location}/queues/{run}-full/tasks/t",
+    schedule_time: Some(
+        Timestamp {
+            seconds: {tomorrow},
+            nanos: 123456000,
+        },
+    ),
+    create_time: Some(
+        Timestamp {
+            seconds: {create_time},
+            nanos: 0,
+        },
+    ),
+    dispatch_deadline: Some(
+        Duration {
+            seconds: 600,
+            nanos: 0,
+        },
+    ),
+    dispatch_count: 0,
+    response_count: 0,
+    first_attempt: None,
+    last_attempt: None,
+    view: Full,
+    retry_config: None,
+    message_type: Some(
+        HttpRequest(
+            HttpRequest {
+                url: "https://example.com/work",
+                http_method: Post,
+                headers: {
+                    "User-Agent": "Google-Cloud-Tasks",
+                },
+                body: [
+                    104,
+                    105,
+                ],
+                authorization_header: None,
+            },
+        ),
+    ),
+}

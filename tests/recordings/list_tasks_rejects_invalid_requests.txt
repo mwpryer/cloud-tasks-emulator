@@ -1,0 +1,7 @@
+page size -1 -> InvalidArgument: ListTasksRequest.pageSize cannot be negative.
+invalid page token -> InvalidArgument: Invalid page_token
+unknown queue -> NotFound: Queue does not exist. If you just created the queue, wait at least a minute for the queue to initialize.
+empty parent -> InvalidArgument: Invalid resource field value in the request.
+parent not in a project -> PermissionDenied: Permission denied on resource project not-a-valid-parent.
+parent without queue id -> PermissionDenied: The principal (user or service account) lacks IAM permission "cloudtasks.tasks.list" for the resource "projects/{project}/locations/{location}/queues" (or the resource may not exist).
+parent with invalid queue id -> InvalidArgument: Queue ID "not_valid" can contain only letters ([A-Za-z]), numbers ([0-9]), or hyphens (-). Queue ID must be between 1 and 100 characters.

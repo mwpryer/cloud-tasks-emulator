@@ -1,0 +1,52 @@
+attempt 1 -> {
+    "user-agent": "Google-Cloud-Tasks",
+    "x-cloudtasks-queuename": "{run}-dispatch-retries",
+    "x-cloudtasks-taskexecutioncount": "0",
+    "x-cloudtasks-taskname": "t",
+    "x-cloudtasks-taskretrycount": "0",
+}
+attempt 2 -> {
+    "user-agent": "Google-Cloud-Tasks",
+    "x-cloudtasks-queuename": "{run}-dispatch-retries",
+    "x-cloudtasks-taskexecutioncount": "0",
+    "x-cloudtasks-taskname": "t",
+    "x-cloudtasks-taskpreviousresponse": "503",
+    "x-cloudtasks-taskretrycount": "1",
+    "x-cloudtasks-taskretryreason": "",
+}
+attempt 3 -> {
+    "user-agent": "Google-Cloud-Tasks",
+    "x-cloudtasks-queuename": "{run}-dispatch-retries",
+    "x-cloudtasks-taskexecutioncount": "1",
+    "x-cloudtasks-taskname": "t",
+    "x-cloudtasks-taskpreviousresponse": "404",
+    "x-cloudtasks-taskretrycount": "2",
+    "x-cloudtasks-taskretryreason": "",
+}
+attempt 4 -> {
+    "user-agent": "Google-Cloud-Tasks",
+    "x-cloudtasks-queuename": "{run}-dispatch-retries",
+    "x-cloudtasks-taskexecutioncount": "2",
+    "x-cloudtasks-taskname": "t",
+    "x-cloudtasks-taskpreviousresponse": "429",
+    "x-cloudtasks-taskretrycount": "3",
+    "x-cloudtasks-taskretryreason": "",
+}
+attempt 5 -> {
+    "user-agent": "Google-Cloud-Tasks",
+    "x-cloudtasks-queuename": "{run}-dispatch-retries",
+    "x-cloudtasks-taskexecutioncount": "2",
+    "x-cloudtasks-taskname": "t",
+    "x-cloudtasks-taskpreviousresponse": "500",
+    "x-cloudtasks-taskretrycount": "4",
+    "x-cloudtasks-taskretryreason": "",
+}
+attempt 6 -> {
+    "user-agent": "Google-Cloud-Tasks",
+    "x-cloudtasks-queuename": "{run}-dispatch-retries",
+    "x-cloudtasks-taskexecutioncount": "3",
+    "x-cloudtasks-taskname": "t",
+    "x-cloudtasks-taskpreviousresponse": "302",
+    "x-cloudtasks-taskretrycount": "5",
+    "x-cloudtasks-taskretryreason": "",
+}

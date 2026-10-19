@@ -1,0 +1,6 @@
+page size -1 -> InvalidArgument: ListQueuesRequest.pageSize cannot be negative.
+invalid page token -> InvalidArgument: Invalid page_token
+empty parent -> InvalidArgument: Invalid resource field value in the request.
+parent not in a project -> PermissionDenied: Permission denied on resource project not-a-valid-parent.
+parent without location -> PermissionDenied: The principal (user or service account) lacks IAM permission "cloudtasks.queues.list" for the resource "projects/{project}" (or the resource may not exist).
+parent with extra segment -> PermissionDenied: The principal (user or service account) lacks IAM permission "cloudtasks.queues.list" for the resource "projects/{project}/locations/{location}/extra" (or the resource may not exist).

@@ -1,0 +1,4 @@
+create_task header names -> [
+    "User-Agent",
+    "X-Kept",
+]

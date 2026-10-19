@@ -1,0 +1,220 @@
+301 -> (
+    1,
+    1,
+    Some(
+        Status {
+            code: 2,
+            message: "UNKNOWN(2): HTTP status code 301",
+            details: [],
+        },
+    ),
+)
+400 -> (
+    1,
+    1,
+    Some(
+        Status {
+            code: 3,
+            message: "INVALID_ARGUMENT(3): HTTP status code 400",
+            details: [],
+        },
+    ),
+)
+401 -> (
+    1,
+    1,
+    Some(
+        Status {
+            code: 16,
+            message: "UNAUTHENTICATED(16): HTTP status code 401",
+            details: [],
+        },
+    ),
+)
+403 -> (
+    1,
+    1,
+    Some(
+        Status {
+            code: 7,
+            message: "PERMISSION_DENIED(7): HTTP status code 403",
+            details: [],
+        },
+    ),
+)
+404 -> (
+    1,
+    1,
+    Some(
+        Status {
+            code: 5,
+            message: "NOT_FOUND(5): HTTP status code 404",
+            details: [],
+        },
+    ),
+)
+405 -> (
+    1,
+    1,
+    Some(
+        Status {
+            code: 9,
+            message: "FAILED_PRECONDITION(9): HTTP status code 405",
+            details: [],
+        },
+    ),
+)
+409 -> (
+    1,
+    1,
+    Some(
+        Status {
+            code: 10,
+            message: "ABORTED(10): HTTP status code 409",
+            details: [],
+        },
+    ),
+)
+410 -> (
+    1,
+    1,
+    Some(
+        Status {
+            code: 9,
+            message: "FAILED_PRECONDITION(9): HTTP status code 410",
+            details: [],
+        },
+    ),
+)
+418 -> (
+    1,
+    1,
+    Some(
+        Status {
+            code: 9,
+            message: "FAILED_PRECONDITION(9): HTTP status code 418",
+            details: [],
+        },
+    ),
+)
+429 -> (
+    1,
+    1,
+    Some(
+        Status {
+            code: 8,
+            message: "RESOURCE_EXHAUSTED(8): HTTP status code 429",
+            details: [],
+        },
+    ),
+)
+499 -> (
+    1,
+    1,
+    Some(
+        Status {
+            code: 1,
+            message: "CANCELLED(1): HTTP status code 499",
+            details: [],
+        },
+    ),
+)
+500 -> (
+    1,
+    0,
+    Some(
+        Status {
+            code: 13,
+            message: "INTERNAL(13): HTTP status code 500",
+            details: [],
+        },
+    ),
+)
+501 -> (
+    1,
+    0,
+    Some(
+        Status {
+            code: 12,
+            message: "UNIMPLEMENTED(12): HTTP status code 501",
+            details: [],
+        },
+    ),
+)
+502 -> (
+    1,
+    0,
+    Some(
+        Status {
+            code: 13,
+            message: "INTERNAL(13): HTTP status code 502",
+            details: [],
+        },
+    ),
+)
+503 -> (
+    1,
+    0,
+    Some(
+        Status {
+            code: 14,
+            message: "UNAVAILABLE(14): HTTP status code 503",
+            details: [],
+        },
+    ),
+)
+504 -> (
+    1,
+    0,
+    Some(
+        Status {
+            code: 4,
+            message: "DEADLINE_EXCEEDED(4): HTTP status code 504",
+            details: [],
+        },
+    ),
+)
+505 -> (
+    1,
+    0,
+    Some(
+        Status {
+            code: 13,
+            message: "INTERNAL(13): HTTP status code 505",
+            details: [],
+        },
+    ),
+)
+507 -> (
+    1,
+    0,
+    Some(
+        Status {
+            code: 13,
+            message: "INTERNAL(13): HTTP status code 507",
+            details: [],
+        },
+    ),
+)
+slow -> (
+    1,
+    0,
+    Some(
+        Status {
+            code: 4,
+            message: "DEADLINE_EXCEEDED(4): HTTP status code 504",
+            details: [],
+        },
+    ),
+)
+unreachable -> (
+    1,
+    0,
+    Some(
+        Status {
+            code: 2,
+            message: "UNKNOWN(2): HTTP status code 0",
+            details: [],
+        },
+    ),
+)

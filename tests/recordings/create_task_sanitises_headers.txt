@@ -1,0 +1,19 @@
+create_task -> Some(
+    HttpRequest(
+        HttpRequest {
+            url: "https://example.com/work",
+            http_method: Post,
+            headers: {
+                "User-Agent": "Google-Cloud-Tasks",
+                "X-Crlf": "a__b",
+                "X-Newline": "a_b",
+                "X-Nul": "a",
+                "X-Space": " ",
+                "X-Tab": "a\tb",
+                "X/Slash": "value",
+            },
+            body: [],
+            authorization_header: None,
+        },
+    ),
+)

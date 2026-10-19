@@ -1,0 +1,15 @@
+request -> (
+    PUT,
+    {
+        "authorization": "Bearer token",
+        "content-type": "text/plain",
+        "user-agent": "Google-Cloud-Tasks",
+        "x-cloudtasks-queuename": "{run}-dispatch-headers",
+        "x-cloudtasks-tasketa": "{eta}.12",
+        "x-cloudtasks-taskexecutioncount": "0",
+        "x-cloudtasks-taskname": "t",
+        "x-cloudtasks-taskretrycount": "0",
+        "x-custom": "value",
+    },
+    "hi",
+)

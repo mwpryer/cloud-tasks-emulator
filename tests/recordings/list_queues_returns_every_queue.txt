@@ -1,0 +1,6 @@
+list_queues -> [
+    "projects/{project}/locations/{location}/queues/{run}-list-a",
+    "projects/{project}/locations/{location}/queues/{run}-list-b",
+    "projects/{project}/locations/{location}/queues/{run}-list-invalid",
+    "projects/{project}/locations/{location}/queues/{run}-list-tasks",
+]

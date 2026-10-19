@@ -1,0 +1,11 @@
+no task -> InvalidArgument: Task.payload_type is not set.
+no target -> InvalidArgument: Task.payload_type is not set.
+empty url -> InvalidArgument: HttpRequest.url is required.
+ftp url -> InvalidArgument: HttpTarget.url must start with 'http://' or 'https://'.
+url without scheme -> InvalidArgument: HttpTarget.url must start with 'http://' or 'https://'.
+body on GET -> InvalidArgument: Body can only be set if the http_method is POST, PUT, or PATCH.
+body on HEAD -> InvalidArgument: Body can only be set if the http_method is POST, PUT, or PATCH.
+body on DELETE -> InvalidArgument: Body can only be set if the http_method is POST, PUT, or PATCH.
+body on OPTIONS -> InvalidArgument: Body can only be set if the http_method is POST, PUT, or PATCH.
+deadline 14s -> InvalidArgument: Task.dispatchDeadline must be between [15s, 30m].
+deadline 1801s -> InvalidArgument: Task.dispatchDeadline must be between [15s, 30m].

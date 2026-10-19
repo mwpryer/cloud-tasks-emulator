@@ -1,0 +1,19 @@
+create_queue -> Some(
+    RetryConfig {
+        max_attempts: 100,
+        max_retry_duration: None,
+        min_backoff: Some(
+            Duration {
+                seconds: 1,
+                nanos: 234567891,
+            },
+        ),
+        max_backoff: Some(
+            Duration {
+                seconds: 10,
+                nanos: 987654321,
+            },
+        ),
+        max_doublings: 16,
+    },
+)

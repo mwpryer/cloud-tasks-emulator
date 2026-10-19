@@ -1,0 +1,19 @@
+create_task -> Some(
+    HttpRequest(
+        HttpRequest {
+            url: "https://example.com/work",
+            http_method: Post,
+            headers: {
+                "Authorization": "Bearer token",
+                "Content-Type": "text/plain",
+                "Trailer": "Expires",
+                "User-Agent": "Google-Cloud-Tasks",
+                "X-CloudTasks-TaskName": "spoofed",
+                "X-Forwarded-Proto": "https",
+                "X-Goog-Custom": "value",
+            },
+            body: [],
+            authorization_header: None,
+        },
+    ),
+)

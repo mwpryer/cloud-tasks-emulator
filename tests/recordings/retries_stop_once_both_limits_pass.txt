@@ -1,0 +1,2 @@
+2 attempts, 3s, 2s backoff -> 3
+4 attempts, 1s, 1s backoff -> 4

@@ -1,0 +1,2 @@
+delete_queue -> ()
+get_queue -> NotFound: Queue does not exist. If you just created the queue, wait at least a minute for the queue to initialize.

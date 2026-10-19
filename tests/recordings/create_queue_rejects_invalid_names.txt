@@ -1,0 +1,8 @@
+no queue -> InvalidArgument: Queue name must be formatted: "projects/<PROJECT_ID>/locations/<LOCATION_ID>/queues/<QUEUE_ID>".
+malformed name -> InvalidArgument: Queue name must be formatted: "projects/<PROJECT_ID>/locations/<LOCATION_ID>/queues/<QUEUE_ID>".
+invalid queue id -> InvalidArgument: Queue ID "not_valid" can contain only letters ([A-Za-z]), numbers ([0-9]), or hyphens (-). Queue ID must be between 1 and 100 characters.
+queue id over 100 characters -> InvalidArgument: Queue ID "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" can contain only letters ([A-Za-z]), numbers ([0-9]), or hyphens (-). Queue ID must be between 1 and 100 characters.
+name in other location -> InvalidArgument: projects/{project}/locations/us-central1/queues/{run}-elsewhere must begin with projects/{project}/locations/{location}.
+existing name -> AlreadyExists: Queue already exists
+parent not in a project -> PermissionDenied: Permission denied on resource project not-a-valid-parent.
+parent without location -> PermissionDenied: The principal (user or service account) lacks IAM permission "cloudtasks.queues.create" for the resource "projects/{project}" (or the resource may not exist).

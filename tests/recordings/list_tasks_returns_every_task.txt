@@ -1,0 +1,5 @@
+list_tasks -> [
+    "projects/{project}/locations/{location}/queues/{run}-list-tasks/tasks/a",
+    "projects/{project}/locations/{location}/queues/{run}-list-tasks/tasks/b",
+    "projects/{project}/locations/{location}/queues/{run}-list-tasks/tasks/c",
+]

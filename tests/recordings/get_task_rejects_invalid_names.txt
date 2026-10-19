@@ -1,0 +1,8 @@
+unknown task -> NotFound: Requested entity was not found.
+unknown queue -> NotFound: Requested entity was not found.
+empty name -> InvalidArgument: Invalid resource field value in the request.
+name not in a project -> PermissionDenied: Permission denied on resource project not-a-valid-name.
+name without task id -> PermissionDenied: The principal (user or service account) lacks IAM permission "cloudtasks.tasks.get" for the resource "projects/{project}/locations/{location}/queues/{run}-get-tasks/tasks" (or the resource may not exist).
+invalid task id -> InvalidArgument: Task ID "not valid" can contain only letters ([A-Za-z]), numbers ([0-9]), hyphens (-), or underscores (_). Task ID must between 1 and 500 characters.
+invalid queue id -> InvalidArgument: Queue ID "not_valid" can contain only letters ([A-Za-z]), numbers ([0-9]), or hyphens (-). Queue ID must be between 1 and 100 characters.
+name with extra segment -> PermissionDenied: The principal (user or service account) lacks IAM permission "cloudtasks.tasks.get" for the resource "projects/{project}/locations/{location}/queues/{run}-get-tasks/tasks/t/extra" (or the resource may not exist).

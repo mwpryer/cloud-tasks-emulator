@@ -1,0 +1,12 @@
+first page -> (
+    2,
+    true,
+)
+second page -> (
+    1,
+    true,
+)
+third page -> (
+    0,
+    false,
+)

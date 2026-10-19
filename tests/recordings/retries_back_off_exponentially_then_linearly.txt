@@ -1,0 +1,7 @@
+seconds between attempts -> [
+    1,
+    2,
+    4,
+    6,
+    7,
+]

@@ -1,0 +1,4 @@
+empty name -> InvalidArgument: Invalid resource field value in the request.
+name not in a project -> PermissionDenied: Permission denied on resource project not-a-valid-name.
+location name -> InvalidArgument: CMEK Config name must be formatted: "projects/<PROJECT_ID>/locations/<LOCATION_ID>/cmekConfig".
+other config name -> InvalidArgument: CMEK Config name must be formatted: "projects/<PROJECT_ID>/locations/<LOCATION_ID>/cmekConfig".

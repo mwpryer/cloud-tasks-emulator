@@ -1,0 +1,90 @@
+unknown queue -> Decoded {
+    name: "projects/{project}/locations/{location}/operations/{operation}",
+    metadata: Some(
+        (
+            "type.googleapis.com/google.cloud.tasks.v2.BatchDeleteTasksMetadata",
+            BatchDeleteTasksMetadata {
+                start_time: Some(
+                    Timestamp {
+                        seconds: {create_time},
+                        nanos: {start_nanos},
+                    },
+                ),
+                end_time: Some(
+                    Timestamp {
+                        seconds: {create_time},
+                        nanos: {end_nanos},
+                    },
+                ),
+                state: PartiallySucceeded,
+                failed_requests: {
+                    0: Status {
+                        code: 5,
+                        message: "Requested entity was not found.",
+                        details: [],
+                    },
+                    1: Status {
+                        code: 5,
+                        message: "Requested entity was not found.",
+                        details: [],
+                    },
+                },
+            },
+        ),
+    ),
+    done: true,
+    result: Some(
+        Err(
+            Status {
+                code: 10,
+                message: "None of the requests succeeded, refer to BatchDeleteTasksMetadata.failed_requests for individual error details",
+                details: [],
+            },
+        ),
+    ),
+}
+every task missing -> Decoded {
+    name: "projects/{project}/locations/{location}/operations/{operation}",
+    metadata: Some(
+        (
+            "type.googleapis.com/google.cloud.tasks.v2.BatchDeleteTasksMetadata",
+            BatchDeleteTasksMetadata {
+                start_time: Some(
+                    Timestamp {
+                        seconds: {create_time},
+                        nanos: {start_nanos},
+                    },
+                ),
+                end_time: Some(
+                    Timestamp {
+                        seconds: {create_time},
+                        nanos: {end_nanos},
+                    },
+                ),
+                state: PartiallySucceeded,
+                failed_requests: {
+                    0: Status {
+                        code: 5,
+                        message: "Requested entity was not found.",
+                        details: [],
+                    },
+                    1: Status {
+                        code: 5,
+                        message: "Requested entity was not found.",
+                        details: [],
+                    },
+                },
+            },
+        ),
+    ),
+    done: true,
+    result: Some(
+        Err(
+            Status {
+                code: 10,
+                message: "None of the requests succeeded, refer to BatchDeleteTasksMetadata.failed_requests for individual error details",
+                details: [],
+            },
+        ),
+    ),
+}

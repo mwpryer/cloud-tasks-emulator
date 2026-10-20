@@ -1,0 +1,74 @@
+batch_delete_tasks -> Decoded {
+    name: "projects/{project}/locations/{location}/operations/{operation}",
+    metadata: Some(
+        (
+            "type.googleapis.com/google.cloud.tasks.v2.BatchDeleteTasksMetadata",
+            BatchDeleteTasksMetadata {
+                start_time: Some(
+                    Timestamp {
+                        seconds: {create_time},
+                        nanos: {start_nanos},
+                    },
+                ),
+                end_time: Some(
+                    Timestamp {
+                        seconds: {create_time},
+                        nanos: {end_nanos},
+                    },
+                ),
+                state: PartiallySucceeded,
+                failed_requests: {
+                    1: Status {
+                        code: 5,
+                        message: "Requested entity was not found.",
+                        details: [],
+                    },
+                    2: Status {
+                        code: 5,
+                        message: "Requested entity was not found.",
+                        details: [],
+                    },
+                    3: Status {
+                        code: 3,
+                        message: "The queue name from request ('projects/{project}/locations/{location}/queues/{run}-batch-delete-failures') must be the same as the queue name in the named task ('projects/{project}/locations/{location}/queues/{run}-batch-delete-other').",
+                        details: [],
+                    },
+                    4: Status {
+                        code: 3,
+                        message: "Invalid task name: Task ID \"not valid\" can contain only letters ([A-Za-z]), numbers ([0-9]), hyphens (-), or underscores (_). Task ID must between 1 and 500 characters.",
+                        details: [],
+                    },
+                    5: Status {
+                        code: 3,
+                        message: "Invalid task name: Task name must be formatted: \"projects/<PROJECT_ID>/locations/<LOCATION_ID>/queues/<QUEUE_ID>/tasks/<TASK_ID>\".",
+                        details: [],
+                    },
+                    6: Status {
+                        code: 3,
+                        message: "Invalid task name: Task name must be formatted: \"projects/<PROJECT_ID>/locations/<LOCATION_ID>/queues/<QUEUE_ID>/tasks/<TASK_ID>\".",
+                        details: [],
+                    },
+                    9: Status {
+                        code: 5,
+                        message: "Requested entity was not found.",
+                        details: [],
+                    },
+                    10: Status {
+                        code: 5,
+                        message: "Requested entity was not found.",
+                        details: [],
+                    },
+                },
+            },
+        ),
+    ),
+    done: true,
+    result: Some(
+        Ok(
+            (
+                "type.googleapis.com/google.protobuf.Empty",
+                (),
+            ),
+        ),
+    ),
+}

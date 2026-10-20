@@ -1,0 +1,64 @@
+unknown queue -> Decoded {
+    name: "projects/{project}/locations/{location}/operations/{operation}",
+    metadata: Some(
+        (
+            "type.googleapis.com/google.cloud.tasks.v2.BatchCreateTasksMetadata",
+            BatchCreateTasksMetadata {
+                start_time: Some(
+                    Timestamp {
+                        seconds: {create_time},
+                        nanos: {start_nanos},
+                    },
+                ),
+                end_time: Some(
+                    Timestamp {
+                        seconds: {create_time},
+                        nanos: {end_nanos},
+                    },
+                ),
+                state: Failed,
+                failed_requests: {
+                    0: Status {
+                        code: 5,
+                        message: "Queue does not exist. If you just created the queue, wait at least a minute for the queue to initialize.",
+                        details: [],
+                    },
+                },
+            },
+        ),
+    ),
+    done: true,
+    result: None,
+}
+every request invalid -> Decoded {
+    name: "projects/{project}/locations/{location}/operations/{operation}",
+    metadata: Some(
+        (
+            "type.googleapis.com/google.cloud.tasks.v2.BatchCreateTasksMetadata",
+            BatchCreateTasksMetadata {
+                start_time: Some(
+                    Timestamp {
+                        seconds: {create_time},
+                        nanos: {start_nanos},
+                    },
+                ),
+                end_time: Some(
+                    Timestamp {
+                        seconds: {create_time},
+                        nanos: {end_nanos},
+                    },
+                ),
+                state: Failed,
+                failed_requests: {
+                    0: Status {
+                        code: 3,
+                        message: "HttpTarget.url must start with 'http://' or 'https://'.",
+                        details: [],
+                    },
+                },
+            },
+        ),
+    ),
+    done: true,
+    result: None,
+}

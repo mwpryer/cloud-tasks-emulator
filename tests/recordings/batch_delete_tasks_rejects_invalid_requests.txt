@@ -1,0 +1,4 @@
+no names -> InvalidArgument: Request contains an invalid argument.
+1001 names -> InvalidArgument: A maximum of 1000 tasks can be handled in a batch, but 1001 were requested.
+empty parent -> InvalidArgument: Invalid resource field value in the request.
+parent not in a project -> PermissionDenied: Permission denied on resource project not-a-valid-name.

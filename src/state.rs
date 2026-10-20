@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
@@ -6,6 +6,7 @@ use reqwest::Url;
 use tokio::sync::Notify;
 
 use crate::names;
+use crate::proto::google::longrunning::Operation;
 
 pub(crate) struct Emulator {
     pub state: Mutex<State>,
@@ -19,6 +20,10 @@ pub(crate) struct State {
     pub queues: BTreeMap<String, Queue>,
     /// Deleted queue names, blocked for the 3 days the proto documents
     pub deleted_queues: Tombstones,
+    /// Finished batch operations, kept as returned since nothing changes them
+    pub operations: BTreeMap<String, Operation>,
+    /// KMS key of each location with CMEK on, which the emulator stores without encrypting
+    pub cmek_keys: BTreeMap<String, String>,
     next_attempt_id: u64,
 }
 
@@ -36,9 +41,18 @@ pub(crate) struct Queue {
     pub tasks: BTreeMap<String, Task>,
     /// Finished and deleted task names, blocked for the 24 hours the proto documents
     pub removed_tasks: Tombstones,
+    /// None until a policy is first set
+    pub policy: Option<Policy>,
     tokens: f64,
     refilled_at: SystemTime,
     in_flight: HashSet<u64>,
+}
+
+/// Stored only, as the emulator has no caller identity to check it against
+pub(crate) struct Policy {
+    pub etag: [u8; 8],
+    /// Members of each role
+    pub bindings: BTreeMap<String, BTreeSet<String>>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -258,6 +272,8 @@ impl Default for State {
         Self {
             queues: BTreeMap::new(),
             deleted_queues: Tombstones::new(Duration::from_secs(3 * 24 * 60 * 60)),
+            operations: BTreeMap::new(),
+            cmek_keys: BTreeMap::new(),
             next_attempt_id: 0,
         }
     }
@@ -398,6 +414,7 @@ impl Queue {
             purge_time: None,
             tasks: BTreeMap::new(),
             removed_tasks: Tombstones::new(Duration::from_secs(24 * 60 * 60)),
+            policy: None,
             tokens: rate_limits.max_burst_size as f64,
             refilled_at: now,
             in_flight: HashSet::new(),

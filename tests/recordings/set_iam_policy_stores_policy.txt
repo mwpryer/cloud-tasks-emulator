@@ -1,0 +1,26 @@
+set_iam_policy -> Etagged {
+    version: 1,
+    etag: "{etag}",
+    bindings: [
+        Binding {
+            role: "roles/cloudtasks.viewer",
+            members: [
+                "serviceAccount:{service_account}",
+            ],
+            condition: None,
+        },
+    ],
+}
+get_iam_policy -> Etagged {
+    version: 1,
+    etag: "{etag}",
+    bindings: [
+        Binding {
+            role: "roles/cloudtasks.viewer",
+            members: [
+                "serviceAccount:{service_account}",
+            ],
+            condition: None,
+        },
+    ],
+}

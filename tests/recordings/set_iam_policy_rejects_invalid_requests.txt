@@ -1,0 +1,14 @@
+role without prefix -> InvalidArgument: The role name must be in the form "roles/{role}", "organizations/{organization_id}/roles/{role}", or "projects/{project_id}/roles/{role}".
+member without type -> InvalidArgument: The member nobody is of an unknown type. Please set a valid type prefix for the member.
+member of unknown type -> InvalidArgument: The member robot:x@example.com is of an unknown type. Please set a valid type prefix for the member.
+condition -> InvalidArgument: Can't set conditional policy on this resource
+version 4 -> InvalidArgument: Specified policy version (4) is not supported. For more information, please refer to https://cloud.google.com/iam/help/allow-policies/versions.
+no policy -> Etagged {
+    version: 1,
+    etag: "{etag}",
+    bindings: [],
+}
+unknown queue -> NotFound: Queue does not exist. If you just created the queue, wait at least a minute for the queue to initialize.
+empty name -> InvalidArgument: Invalid resource field value in the request.
+name not in a project -> PermissionDenied: Permission denied on resource project not-a-valid-name.
+name without queue id -> PermissionDenied: The principal (user or service account) lacks IAM permission "cloudtasks.queues.list" for the resource "projects/{project}/locations/{location}/queues" (or the resource may not exist).

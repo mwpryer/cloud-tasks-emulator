@@ -1,0 +1,5 @@
+list_operations has operation -> PermissionDenied: Method doesn't allow unregistered callers (callers without established identity). Please use API Key or other form of API consumer identity to call this API.
+wait_operation -> PermissionDenied: Method doesn't allow unregistered callers (callers without established identity). Please use API Key or other form of API consumer identity to call this API.
+cancel_operation -> PermissionDenied: Method doesn't allow unregistered callers (callers without established identity). Please use API Key or other form of API consumer identity to call this API.
+delete_operation -> PermissionDenied: Method doesn't allow unregistered callers (callers without established identity). Please use API Key or other form of API consumer identity to call this API.
+get_operation -> "projects/{project}/locations/{location}/operations/{operation}"

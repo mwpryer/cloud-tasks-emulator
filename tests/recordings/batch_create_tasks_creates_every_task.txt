@@ -1,0 +1,117 @@
+batch_create_tasks -> Decoded {
+    name: "projects/{project}/locations/{location}/operations/{operation}",
+    metadata: Some(
+        (
+            "type.googleapis.com/google.cloud.tasks.v2.BatchCreateTasksMetadata",
+            BatchCreateTasksMetadata {
+                start_time: Some(
+                    Timestamp {
+                        seconds: {create_time},
+                        nanos: {start_nanos},
+                    },
+                ),
+                end_time: Some(
+                    Timestamp {
+                        seconds: {create_time},
+                        nanos: {end_nanos},
+                    },
+                ),
+                state: Succeeded,
+                failed_requests: {},
+            },
+        ),
+    ),
+    done: true,
+    result: Some(
+        Ok(
+            (
+                "type.googleapis.com/google.cloud.tasks.v2.BatchCreateTasksResponse",
+                BatchCreateTasksResponse {
+                    tasks: [
+                        Task {
+                            name: "projects/{project}/locations/{location}/queues/{run}-batch-create/tasks/a",
+                            schedule_time: Some(
+                                Timestamp {
+                                    seconds: {tomorrow},
+                                    nanos: 123456000,
+                                },
+                            ),
+                            create_time: Some(
+                                Timestamp {
+                                    seconds: {create_time},
+                                    nanos: 0,
+                                },
+                            ),
+                            dispatch_deadline: Some(
+                                Duration {
+                                    seconds: 600,
+                                    nanos: 0,
+                                },
+                            ),
+                            dispatch_count: 0,
+                            response_count: 0,
+                            first_attempt: None,
+                            last_attempt: None,
+                            view: Basic,
+                            retry_config: None,
+                            message_type: Some(
+                                HttpRequest(
+                                    HttpRequest {
+                                        url: "https://example.com/a",
+                                        http_method: Post,
+                                        headers: {
+                                            "User-Agent": "Google-Cloud-Tasks",
+                                        },
+                                        body: [],
+                                        authorization_header: None,
+                                    },
+                                ),
+                            ),
+                        },
+                        Task {
+                            name: "projects/{project}/locations/{location}/queues/{run}-batch-create/tasks/b",
+                            schedule_time: Some(
+                                Timestamp {
+                                    seconds: {tomorrow},
+                                    nanos: 123456000,
+                                },
+                            ),
+                            create_time: Some(
+                                Timestamp {
+                                    seconds: {create_time},
+                                    nanos: 0,
+                                },
+                            ),
+                            dispatch_deadline: Some(
+                                Duration {
+                                    seconds: 600,
+                                    nanos: 0,
+                                },
+                            ),
+                            dispatch_count: 0,
+                            response_count: 0,
+                            first_attempt: None,
+                            last_attempt: None,
+                            view: Full,
+                            retry_config: None,
+                            message_type: Some(
+                                HttpRequest(
+                                    HttpRequest {
+                                        url: "https://example.com/b",
+                                        http_method: Post,
+                                        headers: {
+                                            "User-Agent": "Google-Cloud-Tasks",
+                                        },
+                                        body: [],
+                                        authorization_header: None,
+                                    },
+                                ),
+                            ),
+                        },
+                    ],
+                },
+            ),
+        ),
+    ),
+}
+get_task -> "projects/{project}/locations/{location}/queues/{run}-batch-create/tasks/a"

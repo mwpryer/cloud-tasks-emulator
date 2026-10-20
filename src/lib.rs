@@ -12,6 +12,7 @@ use tokio::net::TcpListener;
 use tonic::transport::server::TcpIncoming;
 
 use crate::proto::google::cloud::tasks::v2::cloud_tasks_server::CloudTasksServer;
+use crate::proto::google::longrunning::operations_server::OperationsServer;
 
 pub mod proto {
     pub mod google {
@@ -59,7 +60,10 @@ pub async fn serve(
     tonic::transport::Server::builder()
         .accept_http1(true)
         .add_routes(discovery.into())
-        .add_service(CloudTasksServer::new(api::CloudTasksService::new(emulator)))
+        .add_service(CloudTasksServer::new(api::CloudTasksService::new(
+            emulator.clone(),
+        )))
+        .add_service(OperationsServer::new(api::OperationsService::new(emulator)))
         .serve_with_incoming(TcpIncoming::from(listener))
         .await
 }

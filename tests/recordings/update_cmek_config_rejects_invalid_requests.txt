@@ -1,0 +1,8 @@
+malformed key -> InvalidArgument: Resource name [not-a-key] does not match any known resource name pattern.
+key ring -> InvalidArgument: Request contains an invalid argument.
+key version -> InvalidArgument: Request contains an invalid argument.
+key in another location -> NotFound: Requested entity was not found.
+no config -> InvalidArgument: Invalid resource field value in the request.
+empty name -> InvalidArgument: Invalid resource field value in the request.
+name not in a project -> PermissionDenied: Permission denied on resource project not-a-valid-name.
+location name -> InvalidArgument: CMEK Config name must be formatted: "projects/<PROJECT_ID>/locations/<LOCATION_ID>/cmekConfig".

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ops::Bound;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -13,12 +13,13 @@ use crate::names;
 use crate::proto::google::cloud::tasks::v2 as pb;
 use crate::proto::google::cloud::tasks::v2::cloud_tasks_server::CloudTasks;
 use crate::proto::google::iam::v1 as iam;
-use crate::proto::google::longrunning::Operation;
+use crate::proto::google::longrunning::operations_server::Operations;
+use crate::proto::google::longrunning::{self, Operation, operation};
 use crate::proto::google::rpc;
 use crate::state::{
     AppEngineHttpRequest, AppEngineRouting, Attempt, AuthorizationHeader, DEFAULT_DEADLINE,
-    DEFAULT_SCOPE, Emulator, EnforceMode, HttpMethod, HttpRequest, HttpTarget, Payload, Queue,
-    QueueState, RateLimits, RetryConfig, Scheme, Task, UriOverride,
+    DEFAULT_SCOPE, Emulator, EnforceMode, HttpMethod, HttpRequest, HttpTarget, Payload, Policy,
+    Queue, QueueState, RateLimits, RetryConfig, Scheme, State, Task, UriOverride,
 };
 
 const QUEUE_NOT_FOUND: &str = "Queue does not exist. If you just created the queue, wait at least a minute for the queue to initialize.";
@@ -27,6 +28,11 @@ const QUEUE_RECENTLY_DELETED: &str =
 const TASK_RECENTLY_REMOVED: &str = "The task cannot be created because a task with this name existed too recently. For more information about task de-duplication see https://cloud.google.com/tasks/docs/reference/rest/v2/projects.locations.queues.tasks/create#body.request_body.FIELDS.task.";
 const TASK_GONE: &str = "The task no longer exists, though a task with this name existed recently. The task either successfully completed or was deleted.";
 const NOT_FOUND: &str = "Requested entity was not found.";
+/// Wording and code are guesses, as recording this needs a Cloud KMS key
+const CMEK_HEADER_OVERRIDES: &str =
+    "Queues with HTTP Target Override headers cannot be created or updated while CMEK is enabled.";
+/// How Google's front end refuses the Operations RPCs that Cloud Tasks does not serve
+const UNSERVED: &str = "Method doesn't allow unregistered callers (callers without established identity). Please use API Key or other form of API consumer identity to call this API.";
 /// Dropped from task headers and rejected in queue header overrides, along with `RESERVED_PREFIXES`
 const RESERVED_HEADERS: [&str; 14] = [
     "accept-encoding",
@@ -45,6 +51,34 @@ const RESERVED_HEADERS: [&str; 14] = [
     "x-forwarded-for",
 ];
 const RESERVED_PREFIXES: [&str; 2] = ["x-google", "x-appengine"];
+/// Etag of a queue that never had a policy, `ACAB` in base64
+const NO_POLICY_ETAG: [u8; 3] = [0x00, 0x20, 0x01];
+const MEMBER_PREFIXES: [&str; 7] = [
+    "user:",
+    "serviceAccount:",
+    "group:",
+    "domain:",
+    "principal:",
+    "principalSet:",
+    "deleted:",
+];
+/// Permissions TestIamPermissions accepts for a queue
+const QUEUE_PERMISSIONS: [&str; 14] = [
+    "cloudtasks.queues.delete",
+    "cloudtasks.queues.get",
+    "cloudtasks.queues.getIamPolicy",
+    "cloudtasks.queues.pause",
+    "cloudtasks.queues.purge",
+    "cloudtasks.queues.resume",
+    "cloudtasks.queues.setIamPolicy",
+    "cloudtasks.queues.update",
+    "cloudtasks.tasks.create",
+    "cloudtasks.tasks.delete",
+    "cloudtasks.tasks.fullView",
+    "cloudtasks.tasks.get",
+    "cloudtasks.tasks.list",
+    "cloudtasks.tasks.run",
+];
 /// Largest encoded task, 1 MiB less the 5 bytes Cloud Tasks stores beyond the proto
 const MAX_TASK_SIZE: usize = 1024 * 1024 - 5;
 
@@ -55,6 +89,123 @@ pub(crate) struct CloudTasksService {
 impl CloudTasksService {
     pub fn new(emulator: Arc<Emulator>) -> Self {
         Self { emulator }
+    }
+
+    /// Checks the task and adds it to the queue, failing as CreateTask does
+    fn create(
+        &self,
+        state: &mut State,
+        parent: &str,
+        name: String,
+        task: pb::Task,
+        view: pb::task::View,
+    ) -> Result<pb::Task, Status> {
+        let mut payload = match task.message_type {
+            Some(pb::task::MessageType::HttpRequest(http)) => Payload::Http(http_request(http)?),
+            Some(pb::task::MessageType::AppEngineHttpRequest(app_engine)) => {
+                if self.emulator.app_engine.is_none() {
+                    return Err(no_app_engine(parent));
+                }
+                Payload::AppEngine(app_engine_http_request(app_engine)?)
+            }
+            None => return Err(Status::invalid_argument("Task.payload_type is not set.")),
+        };
+        let task_retry_config = task.retry_config.map(retry_config).transpose()?;
+        let (max_deadline, range) = match payload {
+            Payload::Http(_) => (Duration::from_secs(30 * 60), "[15s, 30m]"),
+            Payload::AppEngine(_) => (Duration::from_secs(24 * 60 * 60 + 15), "[15s, 24h15s]"),
+        };
+        let dispatch_deadline = task
+            .dispatch_deadline
+            .map(|deadline| {
+                Duration::try_from(deadline)
+                    .ok()
+                    // Cloud Tasks keeps milliseconds
+                    .map(|deadline| Duration::from_millis(deadline.as_millis() as u64))
+                    .filter(|deadline| (Duration::from_secs(15)..=max_deadline).contains(deadline))
+                    .ok_or_else(|| {
+                        Status::invalid_argument(format!(
+                            "Task.dispatchDeadline must be between {range}."
+                        ))
+                    })
+            })
+            .transpose()?;
+        let now = SystemTime::now();
+        let schedule_time = match task.schedule_time {
+            None => now,
+            // Past 9999, which a Timestamp cannot hold
+            Some(time) if time.seconds > 253_402_300_799 => {
+                return Err(Status::invalid_argument(
+                    "Request contains an invalid argument.",
+                ));
+            }
+            Some(time) => {
+                let schedule_time = SystemTime::try_from(time)
+                    .ok()
+                    .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+                    // Cloud Tasks keeps microseconds
+                    .map(|since_epoch| {
+                        SystemTime::UNIX_EPOCH
+                            + Duration::from_micros(since_epoch.as_micros() as u64)
+                    })
+                    // Cloud Tasks moves any past time to now, even one before the epoch
+                    .filter(|&schedule_time| schedule_time > now)
+                    .unwrap_or(now);
+                if schedule_time > now + Duration::from_secs(720 * 60 * 60) {
+                    return Err(Status::invalid_argument(format!(
+                        "The Task.scheduleTime, {}, is too far in the future. Schedule time must be no more than 720h in the future.",
+                        pacific_time(time)
+                    )));
+                }
+                schedule_time
+            }
+        };
+
+        let queue = state
+            .queues
+            .get_mut(parent)
+            .ok_or_else(|| Status::not_found(QUEUE_NOT_FOUND))?;
+        if let Payload::Http(http_request) = &mut payload {
+            // The queue's token replaces the task's before the URL check, which never sees the replaced one
+            if let Some(header) = queue
+                .http_target
+                .as_ref()
+                .and_then(|target| target.authorization_header.clone())
+            {
+                http_request.authorization_header = Some(header);
+            }
+            // Checks only the host, allowing the http URLs Cloud Tasks rejects tokens for, so local handlers get tokens
+            if let Some(AuthorizationHeader::OAuthToken { .. }) = http_request.authorization_header
+                && !reqwest::Url::parse(&http_request.url).is_ok_and(|url| {
+                    url.host_str()
+                        .is_some_and(|host| host.ends_with(".googleapis.com"))
+                })
+            {
+                return Err(Status::invalid_argument(
+                    r#"Invalid url for HttpRequest.oauth_token. The hostname in the url must end with ".googleapis.com""#,
+                ));
+            }
+        }
+        if queue.tasks.contains_key(&name) {
+            return Err(Status::already_exists("Requested entity already exists"));
+        }
+        if queue.removed_tasks.contains(&name, now) {
+            return Err(Status::already_exists(TASK_RECENTLY_REMOVED));
+        }
+        let task = Task::new(
+            name,
+            payload,
+            task_retry_config,
+            schedule_time,
+            dispatch_deadline,
+            now,
+        );
+        if task_to_proto(&task, pb::task::View::Full).encoded_len() > MAX_TASK_SIZE {
+            return Err(Status::invalid_argument("Task size too large"));
+        }
+        let response = task_to_proto(&task, view);
+        queue.tasks.insert(task.name.clone(), task);
+        Ok(response)
     }
 }
 
@@ -129,7 +280,7 @@ impl CloudTasks for CloudTasksService {
                 r#"Queue name must be formatted: "projects/<PROJECT_ID>/locations/<LOCATION_ID>/queues/<QUEUE_ID>"."#,
             )
         })?;
-        check_ids(&ids)?;
+        check_ids(&ids, names::QUEUE)?;
         if !queue
             .name
             .starts_with(&format!("{}/queues/", request.parent))
@@ -166,6 +317,13 @@ impl CloudTasks for CloudTasksService {
         }
         if state.deleted_queues.contains(&queue.name, now) {
             return Err(Status::failed_precondition(QUEUE_RECENTLY_DELETED));
+        }
+        if http_target
+            .as_ref()
+            .is_some_and(|target| !target.header_overrides.is_empty())
+            && state.cmek_keys.contains_key(&request.parent)
+        {
+            return Err(Status::failed_precondition(CMEK_HEADER_OVERRIDES));
         }
         let queue = Queue::new(
             queue.name,
@@ -230,6 +388,17 @@ impl CloudTasks for CloudTasksService {
             .map(http_target)
             .transpose()?;
         let log_sampling_ratio = log_sampling_ratio(merged.stackdriver_logging_config)?;
+        let (location, _) = merged
+            .name
+            .rsplit_once("/queues/")
+            .expect("checked queue name");
+        if http_target
+            .as_ref()
+            .is_some_and(|target| !target.header_overrides.is_empty())
+            && state.cmek_keys.contains_key(location)
+        {
+            return Err(Status::failed_precondition(CMEK_HEADER_OVERRIDES));
+        }
         let queue = state.queues.entry(merged.name.clone()).or_insert_with(|| {
             Queue::new(
                 merged.name,
@@ -317,25 +486,131 @@ impl CloudTasks for CloudTasksService {
 
     async fn get_iam_policy(
         &self,
-        _: Request<iam::GetIamPolicyRequest>,
+        request: Request<iam::GetIamPolicyRequest>,
     ) -> Result<Response<iam::Policy>, Status> {
-        Err(Status::unimplemented("GetIamPolicy is not supported yet"))
+        let request = request.into_inner();
+        resource(&request.resource, names::QUEUE, "cloudtasks.queues.list")?;
+        let state = self.emulator.state.lock().unwrap();
+        let queue = state
+            .queues
+            .get(&request.resource)
+            .ok_or_else(|| Status::not_found(QUEUE_NOT_FOUND))?;
+        Ok(Response::new(policy_to_proto(queue.policy.as_ref())))
     }
 
     async fn set_iam_policy(
         &self,
-        _: Request<iam::SetIamPolicyRequest>,
+        request: Request<iam::SetIamPolicyRequest>,
     ) -> Result<Response<iam::Policy>, Status> {
-        Err(Status::unimplemented("SetIamPolicy is not supported yet"))
+        let request = request.into_inner();
+        resource(&request.resource, names::QUEUE, "cloudtasks.queues.list")?;
+        // Cloud Tasks reads a missing policy as an empty one
+        let policy = request.policy.unwrap_or_default();
+        if policy.version > 3 {
+            return Err(Status::invalid_argument(format!(
+                "Specified policy version ({}) is not supported. For more information, please refer to https://cloud.google.com/iam/help/allow-policies/versions.",
+                policy.version
+            )));
+        }
+        let mut bindings: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for binding in policy.bindings {
+            if binding.condition.is_some() {
+                return Err(Status::invalid_argument(
+                    "Can't set conditional policy on this resource",
+                ));
+            }
+            if ![
+                &["roles"][..],
+                &["projects", "roles"],
+                &["organizations", "roles"],
+            ]
+            .iter()
+            .any(|collections| names::ids(&binding.role, collections).is_some())
+            {
+                return Err(Status::invalid_argument(
+                    r#"The role name must be in the form "roles/{role}", "organizations/{organization_id}/roles/{role}", or "projects/{project_id}/roles/{role}"."#,
+                ));
+            }
+            if let Some(member) = binding.members.iter().find(|member| {
+                !matches!(member.as_str(), "allUsers" | "allAuthenticatedUsers")
+                    && !MEMBER_PREFIXES
+                        .iter()
+                        .any(|prefix| member.starts_with(prefix))
+            }) {
+                return Err(Status::invalid_argument(format!(
+                    "The member {member} is of an unknown type. Please set a valid type prefix for the member."
+                )));
+            }
+            if !binding.members.is_empty() {
+                bindings
+                    .entry(binding.role)
+                    .or_default()
+                    .extend(binding.members);
+            }
+        }
+
+        let mut state = self.emulator.state.lock().unwrap();
+        let queue = state
+            .queues
+            .get_mut(&request.resource)
+            .ok_or_else(|| Status::not_found(QUEUE_NOT_FOUND))?;
+        let etag = queue
+            .policy
+            .as_ref()
+            .map_or(&NO_POLICY_ETAG[..], |policy| &policy.etag);
+        if !policy.etag.is_empty() && policy.etag != etag {
+            return Err(Status::aborted(format!(
+                "There were concurrent policy changes. Please retry the whole read-modify-write with exponential backoff. The request's ETag '{}' did not match the current policy's ETag '{}'.",
+                c_escape(&policy.etag),
+                c_escape(etag)
+            )));
+        }
+        let policy = queue.policy.insert(Policy {
+            etag: rand::random(),
+            bindings,
+        });
+        Ok(Response::new(policy_to_proto(Some(policy))))
     }
 
     async fn test_iam_permissions(
         &self,
-        _: Request<iam::TestIamPermissionsRequest>,
+        request: Request<iam::TestIamPermissionsRequest>,
     ) -> Result<Response<iam::TestIamPermissionsResponse>, Status> {
-        Err(Status::unimplemented(
-            "TestIamPermissions is not supported yet",
-        ))
+        let request = request.into_inner();
+        resource(&request.resource, names::QUEUE, "cloudtasks.queues.list")?;
+        if !self
+            .emulator
+            .state
+            .lock()
+            .unwrap()
+            .queues
+            .contains_key(&request.resource)
+        {
+            return Err(Status::not_found(QUEUE_NOT_FOUND));
+        }
+        if request.permissions.is_empty() {
+            return Err(Status::invalid_argument(
+                "At least one permission must be specified.",
+            ));
+        }
+        for permission in &request.permissions {
+            if permission.split('.').count() != 3 || permission.split('.').any(str::is_empty) {
+                return Err(Status::invalid_argument(format!(
+                    "The permission {permission} is invalid."
+                )));
+            }
+            if !QUEUE_PERMISSIONS.contains(&permission.as_str()) {
+                return Err(Status::invalid_argument(format!(
+                    "Permission {permission} is not valid for this resource."
+                )));
+            }
+        }
+        // Grants every permission, as the emulator has no caller identity
+        let mut permissions = request.permissions;
+        permissions.sort();
+        Ok(Response::new(iam::TestIamPermissionsResponse {
+            permissions,
+        }))
     }
 
     async fn list_tasks(
@@ -406,133 +681,17 @@ impl CloudTasks for CloudTasksService {
     ) -> Result<Response<pb::Task>, Status> {
         let request = request.into_inner();
         resource(&request.parent, names::QUEUE, "cloudtasks.tasks.create")?;
-        let view = response_view(request.response_view);
         // Cloud Tasks reads a missing task as one without a payload
         let task = request.task.unwrap_or_default();
-        let name = if task.name.is_empty() {
-            format!("{}/tasks/{}", request.parent, rand::random::<u64>())
-        } else {
-            let ids = names::ids(&task.name, names::TASK).ok_or_else(|| {
-                Status::invalid_argument(
-                    r#"Task name must be formatted: "projects/<PROJECT_ID>/locations/<LOCATION_ID>/queues/<QUEUE_ID>/tasks/<TASK_ID>"."#,
-                )
-            })?;
-            check_ids(&ids)?;
-            let (queue, _) = task.name.rsplit_once("/tasks/").expect("checked task name");
-            if queue != request.parent {
-                return Err(Status::invalid_argument(format!(
-                    "The queue name from request ('{}') must be the same as the queue name in the named task ('{queue}').",
-                    request.parent
-                )));
-            }
-            task.name
-        };
-        let mut payload = match task.message_type {
-            Some(pb::task::MessageType::HttpRequest(http)) => Payload::Http(http_request(http)?),
-            Some(pb::task::MessageType::AppEngineHttpRequest(app_engine)) => {
-                if self.emulator.app_engine.is_none() {
-                    return Err(no_app_engine(&request.parent));
-                }
-                Payload::AppEngine(app_engine_http_request(app_engine)?)
-            }
-            None => return Err(Status::invalid_argument("Task.payload_type is not set.")),
-        };
-        let task_retry_config = task.retry_config.map(retry_config).transpose()?;
-        let (max_deadline, range) = match payload {
-            Payload::Http(_) => (Duration::from_secs(30 * 60), "[15s, 30m]"),
-            Payload::AppEngine(_) => (Duration::from_secs(24 * 60 * 60 + 15), "[15s, 24h15s]"),
-        };
-        let dispatch_deadline = task
-            .dispatch_deadline
-            .map(|deadline| {
-                Duration::try_from(deadline)
-                    .ok()
-                    // Cloud Tasks keeps milliseconds
-                    .map(|deadline| Duration::from_millis(deadline.as_millis() as u64))
-                    .filter(|deadline| (Duration::from_secs(15)..=max_deadline).contains(deadline))
-                    .ok_or_else(|| {
-                        Status::invalid_argument(format!(
-                            "Task.dispatchDeadline must be between {range}."
-                        ))
-                    })
-            })
-            .transpose()?;
-        let now = SystemTime::now();
-        let schedule_time = match task.schedule_time {
-            None => now,
-            // Past 9999, which a Timestamp cannot hold
-            Some(time) if time.seconds > 253_402_300_799 => {
-                return Err(Status::invalid_argument(
-                    "Request contains an invalid argument.",
-                ));
-            }
-            Some(time) => {
-                let schedule_time = SystemTime::try_from(time)
-                    .ok()
-                    .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
-                    // Cloud Tasks keeps microseconds
-                    .map(|since_epoch| {
-                        SystemTime::UNIX_EPOCH
-                            + Duration::from_micros(since_epoch.as_micros() as u64)
-                    })
-                    // Cloud Tasks moves any past time to now, even one before the epoch
-                    .filter(|&schedule_time| schedule_time > now)
-                    .unwrap_or(now);
-                if schedule_time > now + Duration::from_secs(720 * 60 * 60) {
-                    return Err(Status::invalid_argument(format!(
-                        "The Task.scheduleTime, {}, is too far in the future. Schedule time must be no more than 720h in the future.",
-                        pacific_time(time)
-                    )));
-                }
-                schedule_time
-            }
-        };
-
+        let name = task_name(&request.parent, &task.name)?;
         let mut state = self.emulator.state.lock().unwrap();
-        let queue = state
-            .queues
-            .get_mut(&request.parent)
-            .ok_or_else(|| Status::not_found(QUEUE_NOT_FOUND))?;
-        if let Payload::Http(http_request) = &mut payload {
-            // The queue's token replaces the task's before the URL check, which never sees the replaced one
-            if let Some(header) = queue
-                .http_target
-                .as_ref()
-                .and_then(|target| target.authorization_header.clone())
-            {
-                http_request.authorization_header = Some(header);
-            }
-            // Checks only the host, allowing the http URLs Cloud Tasks rejects tokens for, so local handlers get tokens
-            if let Some(AuthorizationHeader::OAuthToken { .. }) = http_request.authorization_header
-                && !reqwest::Url::parse(&http_request.url).is_ok_and(|url| {
-                    url.host_str()
-                        .is_some_and(|host| host.ends_with(".googleapis.com"))
-                })
-            {
-                return Err(Status::invalid_argument(
-                    r#"Invalid url for HttpRequest.oauth_token. The hostname in the url must end with ".googleapis.com""#,
-                ));
-            }
-        }
-        if queue.tasks.contains_key(&name) {
-            return Err(Status::already_exists("Requested entity already exists"));
-        }
-        if queue.removed_tasks.contains(&name, now) {
-            return Err(Status::already_exists(TASK_RECENTLY_REMOVED));
-        }
-        let task = Task::new(
+        let response = self.create(
+            &mut state,
+            &request.parent,
             name,
-            payload,
-            task_retry_config,
-            schedule_time,
-            dispatch_deadline,
-            now,
-        );
-        if task_to_proto(&task, pb::task::View::Full).encoded_len() > MAX_TASK_SIZE {
-            return Err(Status::invalid_argument("Task size too large"));
-        }
-        let response = task_to_proto(&task, view);
-        queue.tasks.insert(task.name.clone(), task);
+            task,
+            response_view(request.response_view),
+        )?;
         drop(state);
         self.emulator.wake.notify_one();
         Ok(Response::new(response))
@@ -540,11 +699,97 @@ impl CloudTasks for CloudTasksService {
 
     async fn batch_create_tasks(
         &self,
-        _: Request<pb::BatchCreateTasksRequest>,
+        request: Request<pb::BatchCreateTasksRequest>,
     ) -> Result<Response<Operation>, Status> {
-        Err(Status::unimplemented(
-            "BatchCreateTasks is not supported yet",
-        ))
+        let request = request.into_inner();
+        resource(&request.parent, names::QUEUE, "cloudtasks.tasks.create")?;
+        if request.requests.is_empty() {
+            return Err(Status::invalid_argument(
+                "Request must contain at least one task.",
+            ));
+        }
+        if request.requests.len() > 100 {
+            return Err(Status::invalid_argument(format!(
+                "A maximum of 100 tasks can be created in a single batch, but got {} tasks.",
+                request.requests.len()
+            )));
+        }
+        let mut creates = Vec::new();
+        let mut task_names = HashSet::new();
+        for create in request.requests {
+            if create.parent != request.parent {
+                return Err(Status::invalid_argument(format!(
+                    "All tasks in a batch request must target the same queue. Found task for queue {} in batch request for queue {}.",
+                    create.parent, request.parent
+                )));
+            }
+            let task = create.task.unwrap_or_default();
+            let name = task_name(&request.parent, &task.name)?;
+            if !task_names.insert(name.clone()) {
+                return Err(Status::invalid_argument(format!(
+                    "Duplicate task name in the batch request: {name}"
+                )));
+            }
+            creates.push((name, task, response_view(create.response_view)));
+        }
+
+        let start_time = SystemTime::now();
+        let mut state = self.emulator.state.lock().unwrap();
+        let name = operation_name(&state, &request.parent, request.request_id)?;
+        let mut tasks = Vec::new();
+        let mut failed_requests = BTreeMap::new();
+        for (index, (task_name, task, view)) in creates.into_iter().enumerate() {
+            // A batch words a missing payload differently from CreateTask
+            let created = match task.message_type {
+                None => Err(Status::invalid_argument("Payload type must be set.")),
+                Some(_) => self.create(&mut state, &request.parent, task_name, task, view),
+            };
+            match created {
+                Ok(task) => tasks.push(task),
+                Err(status) => {
+                    failed_requests.insert(
+                        index as i32,
+                        rpc::Status {
+                            code: status.code() as i32,
+                            message: status.message().to_owned(),
+                            details: Vec::new(),
+                        },
+                    );
+                }
+            }
+        }
+        let batch_state = match (tasks.is_empty(), failed_requests.is_empty()) {
+            (_, true) => pb::batch_create_tasks_metadata::State::Succeeded,
+            (true, false) => pb::batch_create_tasks_metadata::State::Failed,
+            (false, false) => pb::batch_create_tasks_metadata::State::PartiallySucceeded,
+        };
+        let metadata = pb::BatchCreateTasksMetadata {
+            start_time: Some(start_time.into()),
+            end_time: Some(SystemTime::now().into()),
+            state: batch_state.into(),
+            failed_requests,
+        };
+        let operation = Operation {
+            name: name.clone(),
+            metadata: Some(prost_types::Any {
+                type_url: "type.googleapis.com/google.cloud.tasks.v2.BatchCreateTasksMetadata"
+                    .to_owned(),
+                value: metadata.encode_to_vec(),
+            }),
+            done: true,
+            // A batch that created nothing has no response
+            result: (!tasks.is_empty()).then(|| {
+                operation::Result::Response(prost_types::Any {
+                    type_url: "type.googleapis.com/google.cloud.tasks.v2.BatchCreateTasksResponse"
+                        .to_owned(),
+                    value: pb::BatchCreateTasksResponse { tasks }.encode_to_vec(),
+                })
+            }),
+        };
+        state.operations.insert(name, operation.clone());
+        drop(state);
+        self.emulator.wake.notify_one();
+        Ok(Response::new(operation))
     }
 
     async fn delete_task(
@@ -570,11 +815,96 @@ impl CloudTasks for CloudTasksService {
 
     async fn batch_delete_tasks(
         &self,
-        _: Request<pb::BatchDeleteTasksRequest>,
+        request: Request<pb::BatchDeleteTasksRequest>,
     ) -> Result<Response<Operation>, Status> {
-        Err(Status::unimplemented(
-            "BatchDeleteTasks is not supported yet",
-        ))
+        let request = request.into_inner();
+        resource(&request.parent, names::QUEUE, "cloudtasks.tasks.delete")?;
+        if request.names.is_empty() {
+            return Err(Status::invalid_argument(
+                "Request contains an invalid argument.",
+            ));
+        }
+        if request.names.len() > 1000 {
+            return Err(Status::invalid_argument(format!(
+                "A maximum of 1000 tasks can be handled in a batch, but {} were requested.",
+                request.names.len()
+            )));
+        }
+
+        let start_time = SystemTime::now();
+        let mut state = self.emulator.state.lock().unwrap();
+        let name = operation_name(&state, &request.parent, request.request_id)?;
+        let mut deleted = HashSet::new();
+        let mut failed_requests = BTreeMap::new();
+        for (index, task) in request.names.iter().enumerate() {
+            // A name deleted earlier in the batch counts as deleted again
+            if deleted.contains(task) {
+                continue;
+            }
+            let result = check_task_name(task)
+                .map_err(|status| {
+                    Status::invalid_argument(format!("Invalid task name: {}", status.message()))
+                })
+                .and_then(|()| check_task_queue(&request.parent, task))
+                .and_then(|()| {
+                    state
+                        .queues
+                        .get_mut(&request.parent)
+                        .and_then(|queue| queue.remove_task(task, SystemTime::now()))
+                        .ok_or_else(|| Status::not_found(NOT_FOUND))
+                });
+            match result {
+                Ok(_) => {
+                    deleted.insert(task);
+                }
+                Err(status) => {
+                    failed_requests.insert(
+                        index as i32,
+                        rpc::Status {
+                            code: status.code() as i32,
+                            message: status.message().to_owned(),
+                            details: Vec::new(),
+                        },
+                    );
+                }
+            }
+        }
+        let result = if failed_requests.len() == request.names.len() {
+            operation::Result::Error(rpc::Status {
+                code: tonic::Code::Aborted as i32,
+                message: "None of the requests succeeded, refer to BatchDeleteTasksMetadata.failed_requests for individual error details".to_owned(),
+                details: Vec::new(),
+            })
+        } else {
+            operation::Result::Response(prost_types::Any {
+                type_url: "type.googleapis.com/google.protobuf.Empty".to_owned(),
+                value: Vec::new(),
+            })
+        };
+        // Cloud Tasks reports partial success even when every deletion fails
+        let batch_state = if failed_requests.is_empty() {
+            pb::batch_delete_tasks_metadata::State::Succeeded
+        } else {
+            pb::batch_delete_tasks_metadata::State::PartiallySucceeded
+        };
+        let metadata = pb::BatchDeleteTasksMetadata {
+            start_time: Some(start_time.into()),
+            end_time: Some(SystemTime::now().into()),
+            state: batch_state.into(),
+            failed_requests,
+        };
+        let operation = Operation {
+            name: name.clone(),
+            metadata: Some(prost_types::Any {
+                type_url: "type.googleapis.com/google.cloud.tasks.v2.BatchDeleteTasksMetadata"
+                    .to_owned(),
+                value: metadata.encode_to_vec(),
+            }),
+            done: true,
+            result: Some(result),
+        };
+        state.operations.insert(name, operation.clone());
+        Ok(Response::new(operation))
     }
 
     async fn run_task(
@@ -613,23 +943,147 @@ impl CloudTasks for CloudTasksService {
 
     async fn update_cmek_config(
         &self,
-        _: Request<pb::UpdateCmekConfigRequest>,
+        request: Request<pb::UpdateCmekConfigRequest>,
     ) -> Result<Response<pb::CmekConfig>, Status> {
-        Err(Status::unimplemented(
-            "UpdateCmekConfig is not supported yet",
-        ))
+        // Cloud Tasks reads a missing config as one with an empty name
+        let config = request.into_inner().cmek_config.unwrap_or_default();
+        let location = cmek_location(&config.name)?;
+        let mut state = self.emulator.state.lock().unwrap();
+        if config.kms_key.is_empty() {
+            state.cmek_keys.remove(location);
+            return Ok(Response::new(config));
+        }
+        // Unlike the docs, which name a URI override host instead
+        let prefix = format!("{location}/queues/");
+        if state.queues.values().any(|queue| {
+            queue.name.starts_with(&prefix)
+                && queue
+                    .http_target
+                    .as_ref()
+                    .is_some_and(|target| !target.header_overrides.is_empty())
+        }) {
+            return Err(Status::failed_precondition(
+                "CMEK cannot be enabled on any project that has one or more queues with HTTP Target Override headers or tasks ttl of more than 60 days.",
+            ));
+        }
+        let key_ring = &["projects", "locations", "keyRings"];
+        let crypto_key = &["projects", "locations", "keyRings", "cryptoKeys"];
+        let key_version = &[
+            "projects",
+            "locations",
+            "keyRings",
+            "cryptoKeys",
+            "cryptoKeyVersions",
+        ];
+        // Checks only the key's form and location, as the emulator cannot see Cloud KMS
+        match names::ids(&config.kms_key, crypto_key) {
+            Some(ids) if ids[1] != names::last_segment(location) => {
+                return Err(Status::not_found(NOT_FOUND));
+            }
+            Some(_) => {}
+            None if names::ids(&config.kms_key, key_ring).is_some()
+                || names::ids(&config.kms_key, key_version).is_some() =>
+            {
+                return Err(Status::invalid_argument(
+                    "Request contains an invalid argument.",
+                ));
+            }
+            None => {
+                return Err(Status::invalid_argument(format!(
+                    "Resource name [{}] does not match any known resource name pattern.",
+                    config.kms_key
+                )));
+            }
+        }
+        state
+            .cmek_keys
+            .insert(location.to_owned(), config.kms_key.clone());
+        Ok(Response::new(config))
     }
 
     async fn get_cmek_config(
         &self,
-        _: Request<pb::GetCmekConfigRequest>,
+        request: Request<pb::GetCmekConfigRequest>,
     ) -> Result<Response<pb::CmekConfig>, Status> {
-        Err(Status::unimplemented("GetCmekConfig is not supported yet"))
+        let request = request.into_inner();
+        let location = cmek_location(&request.name)?;
+        let state = self.emulator.state.lock().unwrap();
+        let kms_key = state.cmek_keys.get(location).cloned().unwrap_or_default();
+        Ok(Response::new(pb::CmekConfig {
+            name: request.name,
+            kms_key,
+        }))
+    }
+}
+
+pub(crate) struct OperationsService {
+    emulator: Arc<Emulator>,
+}
+
+impl OperationsService {
+    pub fn new(emulator: Arc<Emulator>) -> Self {
+        Self { emulator }
+    }
+}
+
+#[tonic::async_trait]
+impl Operations for OperationsService {
+    async fn get_operation(
+        &self,
+        request: Request<longrunning::GetOperationRequest>,
+    ) -> Result<Response<Operation>, Status> {
+        let request = request.into_inner();
+        resource(&request.name, names::OPERATION, "cloudtasks.operations.get")?;
+        let state = self.emulator.state.lock().unwrap();
+        let operation = state
+            .operations
+            .get(&request.name)
+            .ok_or_else(|| Status::not_found(NOT_FOUND))?;
+        Ok(Response::new(operation.clone()))
+    }
+
+    async fn list_operations(
+        &self,
+        _: Request<longrunning::ListOperationsRequest>,
+    ) -> Result<Response<longrunning::ListOperationsResponse>, Status> {
+        Err(Status::permission_denied(UNSERVED))
+    }
+
+    async fn delete_operation(
+        &self,
+        _: Request<longrunning::DeleteOperationRequest>,
+    ) -> Result<Response<()>, Status> {
+        Err(Status::permission_denied(UNSERVED))
+    }
+
+    async fn cancel_operation(
+        &self,
+        _: Request<longrunning::CancelOperationRequest>,
+    ) -> Result<Response<()>, Status> {
+        Err(Status::permission_denied(UNSERVED))
+    }
+
+    async fn wait_operation(
+        &self,
+        _: Request<longrunning::WaitOperationRequest>,
+    ) -> Result<Response<Operation>, Status> {
+        Err(Status::permission_denied(UNSERVED))
     }
 }
 
 /// Rejects a malformed name the way Google's front end does, then checks its IDs as Cloud Tasks does
 fn resource(name: &str, collections: &[&str], permission: &str) -> Result<(), Status> {
+    check_project(name)?;
+    let ids = names::ids(name, collections).ok_or_else(|| {
+        Status::permission_denied(format!(
+            r#"The principal (user or service account) lacks IAM permission "{permission}" for the resource "{name}" (or the resource may not exist)."#
+        ))
+    })?;
+    check_ids(&ids, collections)
+}
+
+/// Rejects an empty name or one outside a project, the way Google's front end does
+fn check_project(name: &str) -> Result<(), Status> {
     if name.is_empty() {
         return Err(Status::invalid_argument(
             "Invalid resource field value in the request.",
@@ -640,29 +1094,84 @@ fn resource(name: &str, collections: &[&str], permission: &str) -> Result<(), St
             "Permission denied on resource project {name}."
         )));
     }
-    let ids = names::ids(name, collections).ok_or_else(|| {
-        Status::permission_denied(format!(
-            r#"The principal (user or service account) lacks IAM permission "{permission}" for the resource "{name}" (or the resource may not exist)."#
-        ))
-    })?;
-    check_ids(&ids)
+    Ok(())
 }
 
-/// Checks the queue and task IDs among a name's project, location, queue and task IDs
-fn check_ids(ids: &[&str]) -> Result<(), Status> {
-    if let Some(queue_id) = ids.get(2)
-        && !names::is_queue_id(queue_id)
-    {
+/// Checks a CMEK config name and returns its location's name
+fn cmek_location(name: &str) -> Result<&str, Status> {
+    check_project(name)?;
+    name.strip_suffix("/cmekConfig")
+        .filter(|location| names::ids(location, names::LOCATION).is_some())
+        .ok_or_else(|| {
+            Status::invalid_argument(
+                r#"CMEK Config name must be formatted: "projects/<PROJECT_ID>/locations/<LOCATION_ID>/cmekConfig"."#,
+            )
+        })
+}
+
+/// Checks a create request's task name, generating an ID for an unnamed task
+fn task_name(parent: &str, name: &str) -> Result<String, Status> {
+    if name.is_empty() {
+        return Ok(format!("{parent}/tasks/{}", rand::random::<u64>()));
+    }
+    check_task_name(name)?;
+    check_task_queue(parent, name)?;
+    Ok(name.to_owned())
+}
+
+fn check_task_name(name: &str) -> Result<(), Status> {
+    let ids = names::ids(name, names::TASK).ok_or_else(|| {
+        Status::invalid_argument(
+            r#"Task name must be formatted: "projects/<PROJECT_ID>/locations/<LOCATION_ID>/queues/<QUEUE_ID>/tasks/<TASK_ID>"."#,
+        )
+    })?;
+    check_ids(&ids, names::TASK)
+}
+
+/// Checks that a well-formed task name is in the request's queue
+fn check_task_queue(parent: &str, name: &str) -> Result<(), Status> {
+    let (queue, _) = name.rsplit_once("/tasks/").expect("checked task name");
+    if queue != parent {
         return Err(Status::invalid_argument(format!(
-            "Queue ID \"{queue_id}\" can contain only letters ([A-Za-z]), numbers ([0-9]), or hyphens (-). Queue ID must be between 1 and 100 characters."
+            "The queue name from request ('{parent}') must be the same as the queue name in the named task ('{queue}')."
         )));
     }
-    if let Some(task_id) = ids.get(3)
-        && !names::is_task_id(task_id)
-    {
+    Ok(())
+}
+
+/// Names a batch's operation by its request ID, or a generated one, refusing a name already taken
+fn operation_name(state: &State, parent: &str, request_id: String) -> Result<String, Status> {
+    let id = if request_id.is_empty() {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        request_id
+    };
+    let (location, _) = parent.rsplit_once("/queues/").expect("checked queue name");
+    let name = format!("{location}/operations/{id}");
+    if state.operations.contains_key(&name) {
         return Err(Status::invalid_argument(format!(
-            "Task ID \"{task_id}\" can contain only letters ([A-Za-z]), numbers ([0-9]), hyphens (-), or underscores (_). Task ID must between 1 and 500 characters."
+            "Duplicate operation id in the batch request: {id}"
         )));
+    }
+    Ok(name)
+}
+
+/// Checks the queue, task and operation IDs among the IDs of a name in these collections
+fn check_ids(ids: &[&str], collections: &[&str]) -> Result<(), Status> {
+    for (collection, id) in collections.iter().zip(ids) {
+        let message = match *collection {
+            "queues" if !names::is_queue_id(id) => format!(
+                "Queue ID \"{id}\" can contain only letters ([A-Za-z]), numbers ([0-9]), or hyphens (-). Queue ID must be between 1 and 100 characters."
+            ),
+            "tasks" if !names::is_task_id(id) => format!(
+                "Task ID \"{id}\" can contain only letters ([A-Za-z]), numbers ([0-9]), hyphens (-), or underscores (_). Task ID must between 1 and 500 characters."
+            ),
+            "operations" if !names::is_operation_id(id) => format!(
+                "Operation ID \"{id}\" can contain only letters ([A-Za-z]), numbers ([0-9]), hyphens (-), or underscores (_). Operation ID must be between 1 and 100 characters."
+            ),
+            _ => continue,
+        };
+        return Err(Status::invalid_argument(message));
     }
     Ok(())
 }
@@ -1446,6 +1955,40 @@ fn timestamp(time: SystemTime) -> Timestamp {
         seconds: since_epoch.as_secs() as i64,
         nanos: (since_epoch.subsec_micros() * 1000) as i32,
     }
+}
+
+fn policy_to_proto(policy: Option<&Policy>) -> iam::Policy {
+    match policy {
+        None => iam::Policy {
+            etag: NO_POLICY_ETAG.to_vec(),
+            ..Default::default()
+        },
+        Some(policy) => iam::Policy {
+            version: 1,
+            etag: policy.etag.to_vec(),
+            bindings: policy
+                .bindings
+                .iter()
+                .map(|(role, members)| iam::Binding {
+                    role: role.clone(),
+                    members: members.iter().cloned().collect(),
+                    condition: None,
+                })
+                .collect(),
+            audit_configs: Vec::new(),
+        },
+    }
+}
+
+/// Prints bytes as Google's error messages do, in octal outside printable ASCII
+fn c_escape(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|&byte| match byte {
+            b' '..=b'~' => (byte as char).to_string(),
+            _ => format!("\\{byte:03o}"),
+        })
+        .collect()
 }
 
 fn queue_to_proto(queue: &Queue) -> pb::Queue {

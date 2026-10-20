@@ -1,0 +1,34 @@
+batch_delete_tasks -> Decoded {
+    name: "projects/{project}/locations/{location}/operations/{operation}",
+    metadata: Some(
+        (
+            "type.googleapis.com/google.cloud.tasks.v2.BatchDeleteTasksMetadata",
+            BatchDeleteTasksMetadata {
+                start_time: Some(
+                    Timestamp {
+                        seconds: {create_time},
+                        nanos: {start_nanos},
+                    },
+                ),
+                end_time: Some(
+                    Timestamp {
+                        seconds: {create_time},
+                        nanos: {end_nanos},
+                    },
+                ),
+                state: Succeeded,
+                failed_requests: {},
+            },
+        ),
+    ),
+    done: true,
+    result: Some(
+        Ok(
+            (
+                "type.googleapis.com/google.protobuf.Empty",
+                (),
+            ),
+        ),
+    ),
+}
+get_task -> NotFound: The task no longer exists, though a task with this name existed recently. The task either successfully completed or was deleted.

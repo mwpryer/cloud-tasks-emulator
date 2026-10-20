@@ -1,0 +1,4 @@
+get_cmek_config -> CmekConfig {
+    name: "projects/{project}/locations/{location}/cmekConfig",
+    kms_key: "",
+}

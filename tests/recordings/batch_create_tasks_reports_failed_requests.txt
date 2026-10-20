@@ -1,0 +1,122 @@
+batch_create_tasks -> Decoded {
+    name: "projects/{project}/locations/{location}/operations/{operation}",
+    metadata: Some(
+        (
+            "type.googleapis.com/google.cloud.tasks.v2.BatchCreateTasksMetadata",
+            BatchCreateTasksMetadata {
+                start_time: Some(
+                    Timestamp {
+                        seconds: {create_time},
+                        nanos: {start_nanos},
+                    },
+                ),
+                end_time: Some(
+                    Timestamp {
+                        seconds: {create_time},
+                        nanos: {end_nanos},
+                    },
+                ),
+                state: PartiallySucceeded,
+                failed_requests: {
+                    1: Status {
+                        code: 3,
+                        message: "Payload type must be set.",
+                        details: [],
+                    },
+                    2: Status {
+                        code: 3,
+                        message: "Payload type must be set.",
+                        details: [],
+                    },
+                    3: Status {
+                        code: 3,
+                        message: "HttpTarget.url must start with 'http://' or 'https://'.",
+                        details: [],
+                    },
+                    4: Status {
+                        code: 3,
+                        message: "Body can only be set if the http_method is POST, PUT, or PATCH.",
+                        details: [],
+                    },
+                    5: Status {
+                        code: 3,
+                        message: "Task.dispatchDeadline must be between [15s, 30m].",
+                        details: [],
+                    },
+                    6: Status {
+                        code: 3,
+                        message: "The Task.scheduleTime, 2099-12-31T16:00:00-08:00, is too far in the future. Schedule time must be no more than 720h in the future.",
+                        details: [],
+                    },
+                    7: Status {
+                        code: 3,
+                        message: "Invalid url for HttpRequest.oauth_token. The hostname in the url must end with \".googleapis.com\"",
+                        details: [],
+                    },
+                    8: Status {
+                        code: 6,
+                        message: "Requested entity already exists",
+                        details: [],
+                    },
+                    9: Status {
+                        code: 6,
+                        message: "The task cannot be created because a task with this name existed too recently. For more information about task de-duplication see https://cloud.google.com/tasks/docs/reference/rest/v2/projects.locations.queues.tasks/create#body.request_body.FIELDS.task.",
+                        details: [],
+                    },
+                },
+            },
+        ),
+    ),
+    done: true,
+    result: Some(
+        Ok(
+            (
+                "type.googleapis.com/google.cloud.tasks.v2.BatchCreateTasksResponse",
+                BatchCreateTasksResponse {
+                    tasks: [
+                        Task {
+                            name: "projects/{project}/locations/{location}/queues/{run}-batch-failures/tasks/new",
+                            schedule_time: Some(
+                                Timestamp {
+                                    seconds: {tomorrow},
+                                    nanos: 123456000,
+                                },
+                            ),
+                            create_time: Some(
+                                Timestamp {
+                                    seconds: {create_time},
+                                    nanos: 0,
+                                },
+                            ),
+                            dispatch_deadline: Some(
+                                Duration {
+                                    seconds: 600,
+                                    nanos: 0,
+                                },
+                            ),
+                            dispatch_count: 0,
+                            response_count: 0,
+                            first_attempt: None,
+                            last_attempt: None,
+                            view: Basic,
+                            retry_config: None,
+                            message_type: Some(
+                                HttpRequest(
+                                    HttpRequest {
+                                        url: "https://example.com/work",
+                                        http_method: Post,
+                                        headers: {
+                                            "User-Agent": "Google-Cloud-Tasks",
+                                        },
+                                        body: [],
+                                        authorization_header: None,
+                                    },
+                                ),
+                            ),
+                        },
+                    ],
+                },
+            ),
+        ),
+    ),
+}

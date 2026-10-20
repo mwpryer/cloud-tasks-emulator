@@ -1,6 +1,7 @@
 pub(crate) const LOCATION: &[&str] = &["projects", "locations"];
 pub(crate) const QUEUE: &[&str] = &["projects", "locations", "queues"];
 pub(crate) const TASK: &[&str] = &["projects", "locations", "queues", "tasks"];
+pub(crate) const OPERATION: &[&str] = &["projects", "locations", "operations"];
 
 /// IDs of a name made of exactly these `collection/id` pairs, in order
 pub(crate) fn ids<'a>(name: &'a str, collections: &[&str]) -> Option<Vec<&'a str>> {
@@ -27,6 +28,10 @@ pub(crate) fn is_queue_id(id: &str) -> bool {
 
 pub(crate) fn is_task_id(id: &str) -> bool {
     is_id(id, 500, &['-', '_'])
+}
+
+pub(crate) fn is_operation_id(id: &str) -> bool {
+    is_id(id, 100, &['-', '_'])
 }
 
 pub(crate) fn last_segment(name: &str) -> &str {

@@ -1,0 +1,6 @@
+test_iam_permissions -> [
+    "cloudtasks.queues.get",
+    "cloudtasks.queues.setIamPolicy",
+    "cloudtasks.tasks.run",
+    "cloudtasks.tasks.run",
+]

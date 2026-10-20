@@ -1,0 +1,9 @@
+no requests -> InvalidArgument: Request must contain at least one task.
+101 requests -> InvalidArgument: A maximum of 100 tasks can be created in a single batch, but got 101 tasks.
+request for another queue -> InvalidArgument: All tasks in a batch request must target the same queue. Found task for queue projects/{project}/locations/{location}/queues/{run}-batch-other in batch request for queue projects/{project}/locations/{location}/queues/{run}-batch-invalid.
+request without parent -> InvalidArgument: All tasks in a batch request must target the same queue. Found task for queue  in batch request for queue projects/{project}/locations/{location}/queues/{run}-batch-invalid.
+duplicate task names -> InvalidArgument: Duplicate task name in the batch request: projects/{project}/locations/{location}/queues/{run}-batch-invalid/tasks/t
+invalid task id -> InvalidArgument: Task ID "not valid" can contain only letters ([A-Za-z]), numbers ([0-9]), hyphens (-), or underscores (_). Task ID must between 1 and 500 characters.
+task named in another queue -> InvalidArgument: The queue name from request ('projects/{project}/locations/{location}/queues/{run}-batch-invalid') must be the same as the queue name in the named task ('projects/{project}/locations/{location}/queues/{run}-batch-other').
+empty parent -> InvalidArgument: Invalid resource field value in the request.
+parent not in a project -> PermissionDenied: Permission denied on resource project not-a-valid-name.

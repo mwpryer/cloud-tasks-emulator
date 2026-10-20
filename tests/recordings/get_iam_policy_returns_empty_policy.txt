@@ -1,0 +1,5 @@
+get_iam_policy -> Etagged {
+    version: 0,
+    etag: "ACAB",
+    bindings: [],
+}

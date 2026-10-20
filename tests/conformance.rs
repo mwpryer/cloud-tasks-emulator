@@ -11,24 +11,38 @@ use std::process::Stdio;
 use std::time::SystemTime;
 
 use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use cloud_tasks_emulator::proto::google::cloud::tasks::v2::cloud_tasks_client::CloudTasksClient;
 use cloud_tasks_emulator::proto::google::cloud::tasks::v2::{
-    AppEngineHttpRequest, AppEngineRouting, CreateQueueRequest, CreateTaskRequest,
-    DeleteQueueRequest, DeleteTaskRequest, GetQueueRequest, GetTaskRequest, HttpMethod,
-    HttpRequest, HttpTarget, ListQueuesRequest, ListQueuesResponse, ListTasksRequest,
-    ListTasksResponse, OAuthToken, OidcToken, PathOverride, PauseQueueRequest, PurgeQueueRequest,
-    QueryOverride, Queue, RateLimits, ResumeQueueRequest, RetryConfig, RunTaskRequest,
-    StackdriverLoggingConfig, Task, UpdateQueueRequest, UriOverride, http_request, http_target,
-    queue, task, uri_override,
+    AppEngineHttpRequest, AppEngineRouting, BatchCreateTasksMetadata, BatchCreateTasksRequest,
+    BatchCreateTasksResponse, BatchDeleteTasksMetadata, BatchDeleteTasksRequest, CmekConfig,
+    CreateQueueRequest, CreateTaskRequest, DeleteQueueRequest, DeleteTaskRequest,
+    GetCmekConfigRequest, GetQueueRequest, GetTaskRequest, HttpMethod, HttpRequest, HttpTarget,
+    ListQueuesRequest, ListQueuesResponse, ListTasksRequest, ListTasksResponse, OAuthToken,
+    OidcToken, PathOverride, PauseQueueRequest, PurgeQueueRequest, QueryOverride, Queue,
+    RateLimits, ResumeQueueRequest, RetryConfig, RunTaskRequest, StackdriverLoggingConfig, Task,
+    UpdateCmekConfigRequest, UpdateQueueRequest, UriOverride, http_request, http_target, queue,
+    task, uri_override,
 };
-use prost_types::{Duration, FieldMask, Timestamp};
+use cloud_tasks_emulator::proto::google::iam::v1::{
+    Binding, GetIamPolicyRequest, GetPolicyOptions, Policy, SetIamPolicyRequest,
+    TestIamPermissionsRequest,
+};
+use cloud_tasks_emulator::proto::google::longrunning::operations_client::OperationsClient;
+use cloud_tasks_emulator::proto::google::longrunning::{
+    CancelOperationRequest, DeleteOperationRequest, GetOperationRequest, ListOperationsRequest,
+    Operation, WaitOperationRequest, operation,
+};
+use cloud_tasks_emulator::proto::google::rpc;
+use cloud_tasks_emulator::proto::google::r#type::Expr;
+use prost::Message;
+use prost_types::{Any, Duration, FieldMask, Timestamp};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::task::JoinError;
 use tonic::metadata::MetadataMap;
-use tonic::transport::Channel;
+use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request, Status};
 
 use crate::support::{Received, Receiver};
@@ -38,9 +52,10 @@ const RECORDINGS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/recordings"
 #[tokio::test]
 async fn emulator_matches_recordings() {
     let receiver = Receiver::start().await;
-    let (client, url) = support::start_emulator_with(Some(&receiver.url)).await;
+    let (_, url) = support::start_emulator_with(Some(&receiver.url)).await;
+    let channel = Endpoint::new(url.clone()).unwrap().connect().await.unwrap();
     let mut target = Target::new(
-        client,
+        channel,
         MetadataMap::new(),
         "emulator-project",
         "emulator-location",
@@ -84,14 +99,16 @@ async fn record() {
             .parse()
             .unwrap(),
     );
-    let client = CloudTasksClient::connect("https://cloudtasks.googleapis.com")
+    let channel = Endpoint::new("https://cloudtasks.googleapis.com")
+        .unwrap()
+        .connect()
         .await
         .unwrap();
     let mut receiver = Receiver::start().await;
     let (_tunnel, url) = open_tunnel(&receiver.url).await;
     receiver.url = url;
     let mut target = Target::new(
-        client,
+        channel,
         metadata,
         &env("CLOUD_TASKS_PROJECT"),
         &env("CLOUD_TASKS_LOCATION"),
@@ -199,6 +216,7 @@ async fn open_tunnel(local_url: &str) -> (Child, String) {
 #[derive(Clone)]
 struct Target {
     client: CloudTasksClient<Channel>,
+    operations: OperationsClient<Channel>,
     /// Sent with every request, so empty for the emulator
     metadata: MetadataMap,
     project: String,
@@ -216,7 +234,7 @@ struct Target {
 
 impl Target {
     fn new(
-        client: CloudTasksClient<Channel>,
+        channel: Channel,
         metadata: MetadataMap,
         project: &str,
         location: &str,
@@ -227,7 +245,8 @@ impl Target {
         let run = format!("r{:08x}", rand::random::<u32>());
         let tomorrow = seconds_from_now(24 * 60 * 60);
         Self {
-            client,
+            client: CloudTasksClient::new(channel.clone()),
+            operations: OperationsClient::new(channel),
             metadata,
             project: format!("projects/{project}"),
             parent: format!("projects/{project}/locations/{location}"),
@@ -421,6 +440,169 @@ impl Target {
         Ok(task)
     }
 
+    async fn batch_create_tasks(
+        &mut self,
+        request: BatchCreateTasksRequest,
+    ) -> Result<Decoded<BatchCreateTasksMetadata, BatchCreateTasksResponse>, Status> {
+        let named = !request.request_id.is_empty();
+        let request = self.request(format!("parent={}", request.parent), request);
+        let operation = self.client.batch_create_tasks(request).await?.into_inner();
+        if !named {
+            self.operation_id(&operation.name);
+        }
+        let operation: Decoded<BatchCreateTasksMetadata, BatchCreateTasksResponse> =
+            decode(operation);
+        if let Some((_, metadata)) = &operation.metadata {
+            self.times(metadata.start_time, metadata.end_time);
+        }
+        if let Some(Ok((_, response))) = &operation.result {
+            for task in &response.tasks {
+                self.placeholder(
+                    task.create_time.unwrap().seconds.to_string(),
+                    "{create_time}",
+                );
+            }
+        }
+        Ok(operation)
+    }
+
+    async fn batch_delete_tasks(
+        &mut self,
+        request: BatchDeleteTasksRequest,
+    ) -> Result<Decoded<BatchDeleteTasksMetadata, ()>, Status> {
+        let named = !request.request_id.is_empty();
+        let request = self.request(format!("parent={}", request.parent), request);
+        let operation = self.client.batch_delete_tasks(request).await?.into_inner();
+        if !named {
+            self.operation_id(&operation.name);
+        }
+        let operation: Decoded<BatchDeleteTasksMetadata, ()> = decode(operation);
+        if let Some((_, metadata)) = &operation.metadata {
+            self.times(metadata.start_time, metadata.end_time);
+        }
+        Ok(operation)
+    }
+
+    async fn get_iam_policy(&mut self, request: GetIamPolicyRequest) -> Result<Etagged, Status> {
+        let request = self.request(format!("resource={}", request.resource), request);
+        let policy = self.client.get_iam_policy(request).await?.into_inner();
+        Ok(self.etagged(policy))
+    }
+
+    async fn set_iam_policy(&mut self, request: SetIamPolicyRequest) -> Result<Etagged, Status> {
+        let request = self.request(format!("resource={}", request.resource), request);
+        let policy = self.client.set_iam_policy(request).await?.into_inner();
+        Ok(self.etagged(policy))
+    }
+
+    async fn test_iam_permissions(
+        &mut self,
+        request: TestIamPermissionsRequest,
+    ) -> Result<Vec<String>, Status> {
+        let request = self.request(format!("resource={}", request.resource), request);
+        let response = self
+            .client
+            .test_iam_permissions(request)
+            .await?
+            .into_inner();
+        Ok(response.permissions)
+    }
+
+    /// Sends the routing field that real Cloud Tasks wants, as it rejects the `name` that official clients send
+    async fn get_cmek_config(
+        &mut self,
+        request: GetCmekConfigRequest,
+    ) -> Result<CmekConfig, Status> {
+        let request = self.request(format!("cmek_config.name={}", request.name), request);
+        Ok(self.client.get_cmek_config(request).await?.into_inner())
+    }
+
+    async fn update_cmek_config(
+        &mut self,
+        request: UpdateCmekConfigRequest,
+    ) -> Result<CmekConfig, Status> {
+        let name = request
+            .cmek_config
+            .as_ref()
+            .map_or_else(String::new, |config| config.name.clone());
+        let request = self.request(format!("cmek_config.name={name}"), request);
+        Ok(self.client.update_cmek_config(request).await?.into_inner())
+    }
+
+    /// Replaces each changing etag, keeping the fixed one of a queue that never had a policy
+    fn etagged(&mut self, policy: Policy) -> Etagged {
+        let etag = STANDARD.encode(&policy.etag);
+        if etag != "ACAB" {
+            self.placeholder(etag.clone(), "{etag}");
+        }
+        Etagged {
+            version: policy.version,
+            etag,
+            bindings: policy.bindings,
+        }
+    }
+
+    /// Replaces the ID that Cloud Tasks generated for an operation
+    fn operation_id(&mut self, name: &str) {
+        let (_, id) = name.rsplit_once("/operations/").unwrap();
+        self.placeholder(id.to_owned(), "{operation}");
+    }
+
+    /// Gets an operation whose times an earlier call already replaced
+    async fn get_operation<M: Message + Default, R: Message + Default>(
+        &mut self,
+        request: GetOperationRequest,
+    ) -> Result<Decoded<M, R>, Status> {
+        let request = self.request(format!("name={}", request.name), request);
+        Ok(decode(
+            self.operations.get_operation(request).await?.into_inner(),
+        ))
+    }
+
+    async fn list_operations(
+        &mut self,
+        request: ListOperationsRequest,
+    ) -> Result<Vec<String>, Status> {
+        let request = self.request(format!("name={}", request.name), request);
+        let response = self.operations.list_operations(request).await?.into_inner();
+        Ok(response
+            .operations
+            .into_iter()
+            .map(|operation| operation.name)
+            .collect())
+    }
+
+    async fn delete_operation(&mut self, request: DeleteOperationRequest) -> Result<(), Status> {
+        let request = self.request(format!("name={}", request.name), request);
+        self.operations.delete_operation(request).await?;
+        Ok(())
+    }
+
+    async fn cancel_operation(&mut self, request: CancelOperationRequest) -> Result<(), Status> {
+        let request = self.request(format!("name={}", request.name), request);
+        self.operations.cancel_operation(request).await?;
+        Ok(())
+    }
+
+    async fn wait_operation<M: Message + Default, R: Message + Default>(
+        &mut self,
+        request: WaitOperationRequest,
+    ) -> Result<Decoded<M, R>, Status> {
+        let request = self.request(format!("name={}", request.name), request);
+        Ok(decode(
+            self.operations.wait_operation(request).await?.into_inner(),
+        ))
+    }
+
+    /// Replaces an operation's times, sharing the create time placeholder as both fall in the same second or two
+    fn times(&mut self, start: Option<Timestamp>, end: Option<Timestamp>) {
+        for (time, nanos) in [(start, "{start_nanos}"), (end, "{end_nanos}")] {
+            let time = time.unwrap();
+            self.placeholder(time.seconds.to_string(), "{create_time}");
+            self.placeholder(time.nanos.to_string(), nanos);
+        }
+    }
+
     async fn get_task(&mut self, request: GetTaskRequest) -> Result<Task, Status> {
         let request = self.request(format!("name={}", request.name), request);
         let task = self.client.get_task(request).await?.into_inner();
@@ -475,6 +657,42 @@ impl Target {
         );
         Ok(task)
     }
+}
+
+/// An operation with its metadata and result unpacked, each beside its type URL
+#[derive(Debug)]
+struct Decoded<M, R> {
+    name: String,
+    metadata: Option<(String, M)>,
+    #[expect(dead_code, reason = "read through Debug in transcripts")]
+    done: bool,
+    result: Option<Result<(String, R), rpc::Status>>,
+}
+
+/// A policy with its etag in base64, as REST shows it
+#[derive(Debug)]
+#[expect(dead_code, reason = "read through Debug in transcripts")]
+struct Etagged {
+    version: i32,
+    etag: String,
+    bindings: Vec<Binding>,
+}
+
+fn decode<M: Message + Default, R: Message + Default>(operation: Operation) -> Decoded<M, R> {
+    Decoded {
+        name: operation.name,
+        metadata: operation.metadata.map(unpack),
+        done: operation.done,
+        result: operation.result.map(|result| match result {
+            operation::Result::Error(status) => Err(status),
+            operation::Result::Response(response) => Ok(unpack(response)),
+        }),
+    }
+}
+
+fn unpack<M: Message + Default>(any: Any) -> (String, M) {
+    let message = M::decode(any.value.as_slice()).unwrap();
+    (any.type_url, message)
 }
 
 /// Repeats `call` each second until `done` holds, for answers real Cloud Tasks varies between requests
@@ -615,6 +833,30 @@ cases!(
     create_queue_keeps_one_target,
     create_queue_returns_routing_override,
     update_queue_changes_routing_override,
+    batch_create_tasks_creates_every_task,
+    batch_create_tasks_reports_failed_requests,
+    batch_create_tasks_fails_when_every_request_fails,
+    batch_create_tasks_rejects_invalid_requests,
+    batch_create_tasks_names_operation_by_request_id,
+    batch_delete_tasks_deletes_every_task,
+    batch_delete_tasks_reports_failed_requests,
+    batch_delete_tasks_fails_when_every_request_fails,
+    batch_delete_tasks_rejects_invalid_requests,
+    batch_delete_tasks_shares_request_ids_with_batch_create,
+    get_operation_returns_batch_operations,
+    get_operation_rejects_invalid_names,
+    only_get_operation_is_served,
+    get_iam_policy_returns_empty_policy,
+    get_iam_policy_rejects_invalid_names,
+    set_iam_policy_stores_policy,
+    set_iam_policy_checks_etag,
+    set_iam_policy_rejects_invalid_requests,
+    test_iam_permissions_returns_requested_permissions,
+    test_iam_permissions_rejects_invalid_requests,
+    get_cmek_config_returns_config,
+    get_cmek_config_rejects_invalid_names,
+    update_cmek_config_rejects_invalid_requests,
+    update_cmek_config_refuses_queues_with_header_overrides,
 );
 
 fn http(url: &str) -> HttpRequest {
@@ -4758,4 +5000,844 @@ async fn update_queue_changes_routing_override(t: &mut Target) {
 
         t.record(path, result.map(|queue| queue.app_engine_routing_override));
     }
+}
+
+async fn batch_create_tasks_creates_every_task(t: &mut Target) {
+    let queue = t.queue("batch-create").await;
+    let request = BatchCreateTasksRequest {
+        parent: queue.clone(),
+        requests: vec![
+            CreateTaskRequest {
+                parent: queue.clone(),
+                task: Some(t.task(&format!("{queue}/tasks/a"), http("https://example.com/a"))),
+                response_view: task::View::Unspecified.into(),
+            },
+            CreateTaskRequest {
+                parent: queue.clone(),
+                task: Some(t.task(&format!("{queue}/tasks/b"), http("https://example.com/b"))),
+                response_view: task::View::Full.into(),
+            },
+        ],
+        request_id: String::new(),
+    };
+
+    let result = t.batch_create_tasks(request).await;
+    let got = t
+        .get_task(GetTaskRequest {
+            name: format!("{queue}/tasks/a"),
+            response_view: task::View::Unspecified.into(),
+        })
+        .await;
+
+    t.record("batch_create_tasks", result);
+    t.record("get_task", got.map(|task| task.name));
+}
+
+async fn batch_create_tasks_reports_failed_requests(t: &mut Target) {
+    let queue = t.queue("batch-failures").await;
+    let existing = format!("{queue}/tasks/existing");
+    let deleted = format!("{queue}/tasks/deleted");
+    for name in [&existing, &deleted] {
+        t.create_task(CreateTaskRequest {
+            parent: queue.clone(),
+            task: Some(t.task(name, http("https://example.com/work"))),
+            response_view: task::View::Unspecified.into(),
+        })
+        .await
+        .unwrap();
+    }
+    t.delete_task(DeleteTaskRequest {
+        name: deleted.clone(),
+    })
+    .await
+    .unwrap();
+    let create = |task| CreateTaskRequest {
+        parent: queue.clone(),
+        task,
+        response_view: task::View::Unspecified.into(),
+    };
+    let request = BatchCreateTasksRequest {
+        parent: queue.clone(),
+        requests: vec![
+            create(Some(t.task(
+                &format!("{queue}/tasks/new"),
+                http("https://example.com/work"),
+            ))),
+            create(None),
+            create(Some(Task {
+                message_type: None,
+                ..t.task("", http(""))
+            })),
+            create(Some(t.task("", http("ftp://example.com/work")))),
+            create(Some(t.task(
+                "",
+                HttpRequest {
+                    http_method: HttpMethod::Get.into(),
+                    body: b"hi".to_vec(),
+                    ..http("https://example.com/work")
+                },
+            ))),
+            create(Some(Task {
+                dispatch_deadline: Some(Duration {
+                    seconds: 14,
+                    nanos: 0,
+                }),
+                ..t.task("", http("https://example.com/work"))
+            })),
+            create(Some(Task {
+                schedule_time: Some(Timestamp {
+                    seconds: 4_102_444_800,
+                    nanos: 0,
+                }),
+                ..t.task("", http("https://example.com/work"))
+            })),
+            create(Some(t.task(
+                "",
+                HttpRequest {
+                    authorization_header: oauth(&t.service_account, ""),
+                    ..http("https://example.com/work")
+                },
+            ))),
+            create(Some(t.task(&existing, http("https://example.com/work")))),
+            create(Some(t.task(&deleted, http("https://example.com/work")))),
+        ],
+        request_id: String::new(),
+    };
+
+    let result = t.batch_create_tasks(request).await;
+
+    t.record("batch_create_tasks", result);
+}
+
+async fn batch_create_tasks_fails_when_every_request_fails(t: &mut Target) {
+    let queue = t.queue("batch-all-fail").await;
+    let missing = t.queue_name("batch-missing");
+    for (label, parent, url) in [
+        ("unknown queue", missing, "https://example.com/work"),
+        ("every request invalid", queue, "ftp://example.com/work"),
+    ] {
+        let request = BatchCreateTasksRequest {
+            parent: parent.clone(),
+            requests: vec![CreateTaskRequest {
+                parent,
+                task: Some(t.task("", http(url))),
+                response_view: task::View::Unspecified.into(),
+            }],
+            request_id: String::new(),
+        };
+
+        let result = t.batch_create_tasks(request).await;
+
+        t.record(label, result);
+    }
+}
+
+async fn batch_create_tasks_rejects_invalid_requests(t: &mut Target) {
+    let queue = t.queue("batch-invalid").await;
+    let other = t.queue_name("batch-other");
+    let create = |parent: &str, name: &str| CreateTaskRequest {
+        parent: parent.to_owned(),
+        task: Some(t.task(name, http("https://example.com/work"))),
+        response_view: task::View::Unspecified.into(),
+    };
+    for (label, parent, requests) in [
+        ("no requests", queue.clone(), vec![]),
+        ("101 requests", queue.clone(), vec![create(&queue, ""); 101]),
+        (
+            "request for another queue",
+            queue.clone(),
+            vec![create(&other, "")],
+        ),
+        (
+            "request without parent",
+            queue.clone(),
+            vec![create("", "")],
+        ),
+        (
+            "duplicate task names",
+            queue.clone(),
+            vec![
+                create(&queue, &format!("{queue}/tasks/t")),
+                create(&queue, &format!("{queue}/tasks/t")),
+            ],
+        ),
+        (
+            "invalid task id",
+            queue.clone(),
+            vec![create(&queue, &format!("{queue}/tasks/not valid"))],
+        ),
+        (
+            "task named in another queue",
+            queue.clone(),
+            vec![create(&queue, &format!("{other}/tasks/t"))],
+        ),
+        ("empty parent", String::new(), vec![create("", "")]),
+        (
+            "parent not in a project",
+            "not-a-valid-name".to_owned(),
+            vec![create("not-a-valid-name", "")],
+        ),
+    ] {
+        let request = BatchCreateTasksRequest {
+            parent,
+            requests,
+            request_id: String::new(),
+        };
+
+        let result = t.batch_create_tasks(request).await;
+
+        t.record(label, result);
+    }
+}
+
+async fn batch_create_tasks_names_operation_by_request_id(t: &mut Target) {
+    let queue = t.queue("batch-request-id").await;
+    let batch = |t: &Target, id: &str| BatchCreateTasksRequest {
+        parent: queue.clone(),
+        requests: vec![CreateTaskRequest {
+            parent: queue.clone(),
+            task: Some(t.task(
+                &format!("{queue}/tasks/{id}"),
+                http("https://example.com/work"),
+            )),
+            response_view: task::View::Unspecified.into(),
+        }],
+        request_id: format!("{}-request", t.run),
+    };
+
+    let first = t.batch_create_tasks(batch(t, "a")).await;
+    let repeated = t.batch_create_tasks(batch(t, "b")).await;
+    let got = t
+        .get_task(GetTaskRequest {
+            name: format!("{queue}/tasks/b"),
+            response_view: task::View::Unspecified.into(),
+        })
+        .await;
+
+    t.record("first", first.map(|operation| operation.name));
+    t.record("repeated", repeated.map(|operation| operation.name));
+    t.record("get_task", got.map(|task| task.name));
+}
+
+async fn batch_delete_tasks_deletes_every_task(t: &mut Target) {
+    let queue = t.queue("batch-delete").await;
+    for id in ["a", "b"] {
+        t.create_task(CreateTaskRequest {
+            parent: queue.clone(),
+            task: Some(t.task(
+                &format!("{queue}/tasks/{id}"),
+                http("https://example.com/work"),
+            )),
+            response_view: task::View::Unspecified.into(),
+        })
+        .await
+        .unwrap();
+    }
+    let request = BatchDeleteTasksRequest {
+        parent: queue.clone(),
+        names: vec![format!("{queue}/tasks/a"), format!("{queue}/tasks/b")],
+        request_id: String::new(),
+    };
+
+    let result = t.batch_delete_tasks(request).await;
+    let got = t
+        .get_task(GetTaskRequest {
+            name: format!("{queue}/tasks/a"),
+            response_view: task::View::Unspecified.into(),
+        })
+        .await;
+
+    t.record("batch_delete_tasks", result);
+    t.record("get_task", got.map(|task| task.name));
+}
+
+async fn batch_delete_tasks_reports_failed_requests(t: &mut Target) {
+    let queue = t.queue("batch-delete-failures").await;
+    for id in ["existing", "repeated", "deleted"] {
+        t.create_task(CreateTaskRequest {
+            parent: queue.clone(),
+            task: Some(t.task(
+                &format!("{queue}/tasks/{id}"),
+                http("https://example.com/work"),
+            )),
+            response_view: task::View::Unspecified.into(),
+        })
+        .await
+        .unwrap();
+    }
+    t.delete_task(DeleteTaskRequest {
+        name: format!("{queue}/tasks/deleted"),
+    })
+    .await
+    .unwrap();
+    let request = BatchDeleteTasksRequest {
+        parent: queue.clone(),
+        names: vec![
+            format!("{queue}/tasks/existing"),
+            format!("{queue}/tasks/missing"),
+            format!("{queue}/tasks/deleted"),
+            format!("{}/tasks/t", t.queue_name("batch-delete-other")),
+            format!("{queue}/tasks/not valid"),
+            "not-a-valid-name".to_owned(),
+            String::new(),
+            format!("{queue}/tasks/repeated"),
+            format!("{queue}/tasks/repeated"),
+            format!("{queue}/tasks/repeated-missing"),
+            format!("{queue}/tasks/repeated-missing"),
+        ],
+        request_id: String::new(),
+    };
+
+    let result = t.batch_delete_tasks(request).await;
+
+    t.record("batch_delete_tasks", result);
+}
+
+async fn batch_delete_tasks_fails_when_every_request_fails(t: &mut Target) {
+    let queue = t.queue("batch-delete-all-fail").await;
+    let missing = t.queue_name("batch-delete-missing");
+    for (label, parent) in [("unknown queue", missing), ("every task missing", queue)] {
+        let request = BatchDeleteTasksRequest {
+            parent: parent.clone(),
+            names: vec![format!("{parent}/tasks/a"), format!("{parent}/tasks/b")],
+            request_id: String::new(),
+        };
+
+        let result = t.batch_delete_tasks(request).await;
+
+        t.record(label, result);
+    }
+}
+
+async fn batch_delete_tasks_rejects_invalid_requests(t: &mut Target) {
+    let queue = t.queue("batch-delete-invalid").await;
+    for (label, parent, names) in [
+        ("no names", queue.clone(), vec![]),
+        (
+            "1001 names",
+            queue.clone(),
+            vec![format!("{queue}/tasks/t"); 1001],
+        ),
+        ("empty parent", String::new(), vec!["t".to_owned()]),
+        (
+            "parent not in a project",
+            "not-a-valid-name".to_owned(),
+            vec!["t".to_owned()],
+        ),
+    ] {
+        let request = BatchDeleteTasksRequest {
+            parent,
+            names,
+            request_id: String::new(),
+        };
+
+        let result = t.batch_delete_tasks(request).await;
+
+        t.record(label, result);
+    }
+}
+
+async fn batch_delete_tasks_shares_request_ids_with_batch_create(t: &mut Target) {
+    let queue = t.queue("batch-delete-request-id").await;
+    let request_id = format!("{}-delete-request", t.run);
+    let delete = BatchDeleteTasksRequest {
+        parent: queue.clone(),
+        names: vec![format!("{queue}/tasks/missing")],
+        request_id: request_id.clone(),
+    };
+    let create = BatchCreateTasksRequest {
+        parent: queue.clone(),
+        requests: vec![CreateTaskRequest {
+            parent: queue.clone(),
+            task: Some(t.task("", http("https://example.com/work"))),
+            response_view: task::View::Unspecified.into(),
+        }],
+        request_id,
+    };
+
+    let first = t.batch_delete_tasks(delete.clone()).await;
+    let repeated = t.batch_delete_tasks(delete).await;
+    let created = t.batch_create_tasks(create).await;
+
+    t.record("first", first.map(|operation| operation.name));
+    t.record("repeated", repeated.map(|operation| operation.name));
+    t.record(
+        "batch_create_tasks",
+        created.map(|operation| operation.name),
+    );
+}
+
+async fn get_operation_returns_batch_operations(t: &mut Target) {
+    let queue = t.queue("get-operation").await;
+    let created = t
+        .batch_create_tasks(BatchCreateTasksRequest {
+            parent: queue.clone(),
+            requests: vec![CreateTaskRequest {
+                parent: queue.clone(),
+                task: Some(t.task(
+                    &format!("{queue}/tasks/t"),
+                    http("https://example.com/work"),
+                )),
+                response_view: task::View::Unspecified.into(),
+            }],
+            request_id: String::new(),
+        })
+        .await
+        .unwrap();
+    let deleted = t
+        .batch_delete_tasks(BatchDeleteTasksRequest {
+            parent: queue.clone(),
+            names: vec![format!("{queue}/tasks/t")],
+            request_id: String::new(),
+        })
+        .await
+        .unwrap();
+
+    let got_create = t
+        .get_operation::<BatchCreateTasksMetadata, BatchCreateTasksResponse>(GetOperationRequest {
+            name: created.name,
+        })
+        .await;
+    let got_delete = t
+        .get_operation::<BatchDeleteTasksMetadata, ()>(GetOperationRequest { name: deleted.name })
+        .await;
+
+    t.record("get_operation batch create", got_create);
+    t.record("get_operation batch delete", got_delete);
+}
+
+async fn get_operation_rejects_invalid_names(t: &mut Target) {
+    for (label, name) in [
+        (
+            "unknown operation",
+            format!("{}/operations/{}-missing", t.parent, t.run),
+        ),
+        ("empty name", String::new()),
+        ("name not in a project", "not-a-valid-name".to_owned()),
+        (
+            "name without operation id",
+            format!("{}/operations", t.parent),
+        ),
+    ] {
+        let result = t
+            .get_operation::<BatchCreateTasksMetadata, BatchCreateTasksResponse>(
+                GetOperationRequest { name },
+            )
+            .await;
+
+        t.record(label, result);
+    }
+}
+
+async fn only_get_operation_is_served(t: &mut Target) {
+    let queue = t.queue("other-operation-rpcs").await;
+    let operation = t
+        .batch_delete_tasks(BatchDeleteTasksRequest {
+            parent: queue.clone(),
+            names: vec![format!("{queue}/tasks/t")],
+            request_id: String::new(),
+        })
+        .await
+        .unwrap();
+
+    let listed = t
+        .list_operations(ListOperationsRequest {
+            name: t.parent.clone(),
+            ..Default::default()
+        })
+        .await;
+    let waited = t
+        .wait_operation::<BatchDeleteTasksMetadata, ()>(WaitOperationRequest {
+            name: operation.name.clone(),
+            timeout: None,
+        })
+        .await;
+    let cancelled = t
+        .cancel_operation(CancelOperationRequest {
+            name: operation.name.clone(),
+        })
+        .await;
+    let deleted = t
+        .delete_operation(DeleteOperationRequest {
+            name: operation.name.clone(),
+        })
+        .await;
+    let got = t
+        .get_operation::<BatchDeleteTasksMetadata, ()>(GetOperationRequest {
+            name: operation.name.clone(),
+        })
+        .await;
+
+    t.record(
+        "list_operations has operation",
+        listed.map(|names| names.contains(&operation.name)),
+    );
+    t.record("wait_operation", waited.map(|waited| waited.name));
+    t.record("cancel_operation", cancelled);
+    t.record("delete_operation", deleted);
+    t.record("get_operation", got.map(|got| got.name));
+}
+
+fn viewer(t: &Target) -> Binding {
+    Binding {
+        role: "roles/cloudtasks.viewer".to_owned(),
+        members: vec![format!("serviceAccount:{}", t.service_account)],
+        condition: None,
+    }
+}
+
+async fn get_iam_policy_returns_empty_policy(t: &mut Target) {
+    let queue = t.queue("empty-policy").await;
+    let request = GetIamPolicyRequest {
+        resource: queue,
+        options: None,
+    };
+
+    let result = t.get_iam_policy(request).await;
+
+    t.record("get_iam_policy", result);
+}
+
+async fn get_iam_policy_rejects_invalid_names(t: &mut Target) {
+    for (label, resource) in [
+        ("unknown queue", t.queue_name("policy-missing")),
+        ("empty name", String::new()),
+        ("name not in a project", "not-a-valid-name".to_owned()),
+        ("name without queue id", format!("{}/queues", t.parent)),
+    ] {
+        let request = GetIamPolicyRequest {
+            resource,
+            options: None,
+        };
+
+        let result = t.get_iam_policy(request).await;
+
+        t.record(label, result);
+    }
+}
+
+async fn set_iam_policy_stores_policy(t: &mut Target) {
+    let queue = t.queue("set-policy").await;
+    let account = format!("serviceAccount:{}", t.service_account);
+    let request = SetIamPolicyRequest {
+        resource: queue.clone(),
+        policy: Some(Policy {
+            // Cloud Tasks merges repeated roles and members and drops roles without members
+            bindings: vec![
+                Binding {
+                    members: vec![account.clone(), account],
+                    ..viewer(t)
+                },
+                viewer(t),
+                Binding {
+                    role: "roles/cloudtasks.enqueuer".to_owned(),
+                    members: vec![],
+                    condition: None,
+                },
+            ],
+            ..Default::default()
+        }),
+        update_mask: None,
+    };
+
+    let set = t.set_iam_policy(request).await;
+    let got = t
+        .get_iam_policy(GetIamPolicyRequest {
+            resource: queue,
+            options: Some(GetPolicyOptions {
+                requested_policy_version: 3,
+            }),
+        })
+        .await;
+
+    t.record("set_iam_policy", set);
+    t.record("get_iam_policy", got);
+}
+
+async fn set_iam_policy_checks_etag(t: &mut Target) {
+    let queue = t.queue("policy-etag").await;
+    let set = |t: &Target, etag: Vec<u8>| SetIamPolicyRequest {
+        resource: queue.clone(),
+        policy: Some(Policy {
+            etag,
+            bindings: vec![viewer(t)],
+            ..Default::default()
+        }),
+        update_mask: None,
+    };
+    let first = t.set_iam_policy(set(t, vec![])).await.unwrap();
+    let first_etag = STANDARD.decode(&first.etag).unwrap();
+
+    let current = t.set_iam_policy(set(t, first_etag.clone())).await;
+    let stale = t.set_iam_policy(set(t, first_etag)).await;
+    let empty_policy_etag = t.set_iam_policy(set(t, vec![0x00, 0x20, 0x01])).await;
+    let no_etag = t.set_iam_policy(set(t, vec![])).await;
+
+    // Cuts the message before the first etag that changes on every set
+    let cut = |result: Result<Etagged, Status>, at: &str| {
+        result.map_err(|status| {
+            let (message, _) = status.message().split_once(at).unwrap();
+            Status::new(status.code(), message)
+        })
+    };
+    t.record("current etag", current.map(|policy| policy.etag));
+    t.record("stale etag", cut(stale, " The request's ETag"));
+    t.record(
+        "empty policy etag",
+        cut(empty_policy_etag, " did not match"),
+    );
+    t.record("no etag", no_etag.map(|policy| policy.etag));
+}
+
+async fn set_iam_policy_rejects_invalid_requests(t: &mut Target) {
+    let queue = t.queue("invalid-policy").await;
+    let with_binding = |binding: Binding| {
+        Some(Policy {
+            bindings: vec![binding],
+            ..Default::default()
+        })
+    };
+    for (label, resource, policy) in [
+        (
+            "role without prefix",
+            queue.clone(),
+            with_binding(Binding {
+                role: "viewer".to_owned(),
+                ..viewer(t)
+            }),
+        ),
+        (
+            "member without type",
+            queue.clone(),
+            with_binding(Binding {
+                members: vec!["nobody".to_owned()],
+                ..viewer(t)
+            }),
+        ),
+        (
+            "member of unknown type",
+            queue.clone(),
+            with_binding(Binding {
+                members: vec!["robot:x@example.com".to_owned()],
+                ..viewer(t)
+            }),
+        ),
+        (
+            "condition",
+            queue.clone(),
+            Some(Policy {
+                version: 3,
+                bindings: vec![Binding {
+                    condition: Some(Expr {
+                        title: "until 2030".to_owned(),
+                        expression: r#"request.time < timestamp("2030-01-01T00:00:00Z")"#
+                            .to_owned(),
+                        ..Default::default()
+                    }),
+                    ..viewer(t)
+                }],
+                ..Default::default()
+            }),
+        ),
+        (
+            "version 4",
+            queue.clone(),
+            Some(Policy {
+                version: 4,
+                ..Default::default()
+            }),
+        ),
+        ("no policy", queue.clone(), None),
+        (
+            "unknown queue",
+            t.queue_name("invalid-policy-missing"),
+            Some(Policy::default()),
+        ),
+        ("empty name", String::new(), Some(Policy::default())),
+        (
+            "name not in a project",
+            "not-a-valid-name".to_owned(),
+            Some(Policy::default()),
+        ),
+        (
+            "name without queue id",
+            format!("{}/queues", t.parent),
+            Some(Policy::default()),
+        ),
+    ] {
+        let request = SetIamPolicyRequest {
+            resource,
+            policy,
+            update_mask: None,
+        };
+
+        let result = t.set_iam_policy(request).await;
+
+        t.record(label, result);
+    }
+}
+
+async fn test_iam_permissions_returns_requested_permissions(t: &mut Target) {
+    let queue = t.queue("test-permissions").await;
+    let request = TestIamPermissionsRequest {
+        resource: queue,
+        permissions: [
+            "cloudtasks.tasks.run",
+            "cloudtasks.queues.get",
+            "cloudtasks.tasks.run",
+            "cloudtasks.queues.setIamPolicy",
+        ]
+        .map(str::to_owned)
+        .to_vec(),
+    };
+
+    let result = t.test_iam_permissions(request).await;
+
+    t.record("test_iam_permissions", result);
+}
+
+async fn test_iam_permissions_rejects_invalid_requests(t: &mut Target) {
+    let queue = t.queue("invalid-permissions").await;
+    for (label, resource, permissions) in [
+        ("no permissions", queue.clone(), vec![]),
+        ("one part", queue.clone(), vec!["foo"]),
+        ("empty part", queue.clone(), vec!["cloudtasks.queues."]),
+        ("wildcard", queue.clone(), vec!["cloudtasks.*"]),
+        (
+            "another service",
+            queue.clone(),
+            vec!["storage.objects.get"],
+        ),
+        (
+            "location permission",
+            queue.clone(),
+            vec!["cloudtasks.queues.create"],
+        ),
+        (
+            "first invalid of several",
+            queue.clone(),
+            vec!["cloudtasks.queues.get", "storage.objects.get", "foo"],
+        ),
+        (
+            "unknown queue",
+            t.queue_name("invalid-permissions-missing"),
+            vec![],
+        ),
+        ("empty name", String::new(), vec!["cloudtasks.queues.get"]),
+        (
+            "name not in a project",
+            "not-a-valid-name".to_owned(),
+            vec!["cloudtasks.queues.get"],
+        ),
+        (
+            "name without queue id",
+            format!("{}/queues", t.parent),
+            vec!["cloudtasks.queues.get"],
+        ),
+    ] {
+        let request = TestIamPermissionsRequest {
+            resource,
+            permissions: permissions.into_iter().map(str::to_owned).collect(),
+        };
+
+        let result = t.test_iam_permissions(request).await;
+
+        t.record(label, result);
+    }
+}
+
+async fn get_cmek_config_returns_config(t: &mut Target) {
+    let request = GetCmekConfigRequest {
+        name: format!("{}/cmekConfig", t.parent),
+    };
+
+    let result = t.get_cmek_config(request).await;
+
+    t.record("get_cmek_config", result);
+}
+
+async fn get_cmek_config_rejects_invalid_names(t: &mut Target) {
+    for (label, name) in [
+        ("empty name", String::new()),
+        ("name not in a project", "not-a-valid-name".to_owned()),
+        ("location name", t.parent.clone()),
+        ("other config name", format!("{}/kmsConfig", t.parent)),
+    ] {
+        let result = t.get_cmek_config(GetCmekConfigRequest { name }).await;
+
+        t.record(label, result);
+    }
+}
+
+async fn update_cmek_config_rejects_invalid_requests(t: &mut Target) {
+    // The run creates no queues here, as a queue with header overrides blocks every key check
+    let location = format!("{}/locations/us-central1", t.project);
+    let name = format!("{location}/cmekConfig");
+    let key_ring = format!("{location}/keyRings/missing");
+    // Every key here is rejected, as a real one would turn on CMEK for the location
+    let config = |name: &str, kms_key: &str| {
+        Some(CmekConfig {
+            name: name.to_owned(),
+            kms_key: kms_key.to_owned(),
+        })
+    };
+    for (label, cmek_config) in [
+        ("malformed key", config(&name, "not-a-key")),
+        ("key ring", config(&name, &key_ring)),
+        (
+            "key version",
+            config(
+                &name,
+                &format!("{key_ring}/cryptoKeys/missing/cryptoKeyVersions/1"),
+            ),
+        ),
+        (
+            "key in another location",
+            config(
+                &name,
+                &format!("{}/keyRings/missing/cryptoKeys/missing", t.parent),
+            ),
+        ),
+        ("no config", None),
+        ("empty name", config("", "not-a-key")),
+        (
+            "name not in a project",
+            config("not-a-valid-name", "not-a-key"),
+        ),
+        ("location name", config(&location, "not-a-key")),
+    ] {
+        let request = UpdateCmekConfigRequest {
+            cmek_config,
+            update_mask: None,
+        };
+
+        let result = t.update_cmek_config(request).await;
+
+        t.record(label, result);
+    }
+}
+
+async fn update_cmek_config_refuses_queues_with_header_overrides(t: &mut Target) {
+    t.queue_with(
+        "cmek-header-overrides",
+        Queue {
+            http_target: Some(HttpTarget {
+                header_overrides: vec![header_override("X-Custom", "value")],
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .await;
+    let request = UpdateCmekConfigRequest {
+        cmek_config: Some(CmekConfig {
+            name: format!("{}/cmekConfig", t.parent),
+            kms_key: "not-a-key".to_owned(),
+        }),
+        update_mask: None,
+    };
+
+    let result = t.update_cmek_config(request).await;
+
+    t.record("update_cmek_config", result);
 }

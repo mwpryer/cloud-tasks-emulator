@@ -1,0 +1,4 @@
+current etag -> "{etag}"
+stale etag -> Aborted: There were concurrent policy changes. Please retry the whole read-modify-write with exponential backoff.
+empty policy etag -> Aborted: There were concurrent policy changes. Please retry the whole read-modify-write with exponential backoff. The request's ETag '\000 \001'
+no etag -> "{etag}"

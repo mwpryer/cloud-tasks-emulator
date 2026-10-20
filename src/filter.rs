@@ -46,7 +46,10 @@ enum Scalar {
 /// A queue field's value, by the kind of operand it takes
 enum Value<'a> {
     Text(&'a str),
-    Enum(i32),
+    /// A field of each element of a repeated message
+    Texts(Vec<&'a str>),
+    /// With the parser for its value names
+    Enum(i32, fn(&str) -> Option<i32>),
     Number(f64),
     Duration(Option<prost_types::Duration>),
     Time(Option<prost_types::Timestamp>),
@@ -90,7 +93,8 @@ impl Expression {
             Expression::Not(expression) => !expression.matches(queue),
             Expression::Present(path) => match value(queue, path).expect("resolved at parse") {
                 Value::Text(text) => !text.is_empty(),
-                Value::Enum(number) => number != 0,
+                Value::Texts(texts) => texts.iter().any(|text| !text.is_empty()),
+                Value::Enum(number, _) => number != 0,
                 Value::Number(number) => number != 0.0,
                 Value::Duration(duration) => duration.is_some(),
                 Value::Time(time) => time.is_some(),
@@ -99,13 +103,16 @@ impl Expression {
             Expression::Contains(path, needle) => {
                 match value(queue, path).expect("resolved at parse") {
                     Value::Text(text) => text.to_lowercase().contains(needle),
+                    Value::Texts(texts) => texts
+                        .iter()
+                        .any(|text| text.to_lowercase().contains(needle)),
                     _ => unreachable!("only text fields take a substring"),
                 }
             }
             Expression::Compare(path, comparator, operand) => {
                 // Unset durations and times compare as zero, as in Cloud Tasks
                 let field = match value(queue, path).expect("resolved at parse") {
-                    Value::Enum(number) => Scalar::Number(number.into()),
+                    Value::Enum(number, _) => Scalar::Number(number.into()),
                     Value::Number(number) => Scalar::Number(number),
                     Value::Duration(duration) => Scalar::Nanos(duration.map_or(0, |duration| {
                         i128::from(duration.seconds) * 1_000_000_000 + i128::from(duration.nanos)
@@ -113,7 +120,7 @@ impl Expression {
                     Value::Time(time) => Scalar::Nanos(time.map_or(0, |time| {
                         i128::from(time.seconds) * 1_000_000_000 + i128::from(time.nanos)
                     })),
-                    Value::Text(_) | Value::Message(_) => {
+                    Value::Text(_) | Value::Texts(_) | Value::Message(_) => {
                         unreachable!("text and message fields take no comparison")
                     }
                 };
@@ -133,11 +140,31 @@ impl Expression {
 
 /// Looks up a path in lower case without underscores, so snake and camel case both match
 fn value<'a>(queue: &'a pb::Queue, path: &str) -> Option<Value<'a>> {
+    use pb::http_target::AuthorizationHeader;
     let rate_limits = queue.rate_limits.unwrap_or_default();
     let retry_config = queue.retry_config.unwrap_or_default();
+    let routing = queue.app_engine_routing_override.as_ref();
+    let http_target = queue.http_target.as_ref();
+    let uri = http_target.and_then(|target| target.uri_override.as_ref());
+    let path_override = uri.and_then(|uri| uri.path_override.as_ref());
+    let query_override = uri.and_then(|uri| uri.query_override.as_ref());
+    let headers: Vec<&pb::http_target::Header> = http_target.map_or_else(Vec::new, |target| {
+        target
+            .header_overrides
+            .iter()
+            .filter_map(|header_override| header_override.header.as_ref())
+            .collect()
+    });
+    let (oauth, oidc) = match http_target.and_then(|target| target.authorization_header.as_ref()) {
+        Some(AuthorizationHeader::OauthToken(token)) => (Some(token), None),
+        Some(AuthorizationHeader::OidcToken(token)) => (None, Some(token)),
+        None => (None, None),
+    };
     Some(match path {
         "name" => Value::Text(&queue.name),
-        "state" => Value::Enum(queue.state),
+        "state" => Value::Enum(queue.state, |name| {
+            pb::queue::State::from_str_name(name).map(|state| state as i32)
+        }),
         "ratelimits" => Value::Message(queue.rate_limits.is_some()),
         "ratelimits.maxdispatchespersecond" => Value::Number(rate_limits.max_dispatches_per_second),
         "ratelimits.maxburstsize" => Value::Number(rate_limits.max_burst_size.into()),
@@ -151,25 +178,75 @@ fn value<'a>(queue: &'a pb::Queue, path: &str) -> Option<Value<'a>> {
         "retryconfig.maxbackoff" => Value::Duration(retry_config.max_backoff),
         "retryconfig.maxdoublings" => Value::Number(retry_config.max_doublings.into()),
         "purgetime" => Value::Time(queue.purge_time),
-        "appengineroutingoverride" => Value::Message(queue.app_engine_routing_override.is_some()),
-        "httptarget" => Value::Message(queue.http_target.is_some()),
+        "appengineroutingoverride" => Value::Message(routing.is_some()),
+        "appengineroutingoverride.service" => Value::Text(routing.map_or("", |r| &r.service)),
+        "appengineroutingoverride.version" => Value::Text(routing.map_or("", |r| &r.version)),
+        "appengineroutingoverride.instance" => Value::Text(routing.map_or("", |r| &r.instance)),
+        "appengineroutingoverride.host" => Value::Text(routing.map_or("", |r| &r.host)),
+        "httptarget" => Value::Message(http_target.is_some()),
+        "httptarget.urioverride" => Value::Message(uri.is_some()),
+        "httptarget.urioverride.scheme" => {
+            Value::Enum(uri.and_then(|uri| uri.scheme).unwrap_or(0), |name| {
+                pb::uri_override::Scheme::from_str_name(name).map(|scheme| scheme as i32)
+            })
+        }
+        "httptarget.urioverride.host" => {
+            Value::Text(uri.and_then(|uri| uri.host.as_deref()).unwrap_or(""))
+        }
+        "httptarget.urioverride.port" => {
+            Value::Number(uri.and_then(|uri| uri.port).unwrap_or(0) as f64)
+        }
+        "httptarget.urioverride.pathoverride" => Value::Message(path_override.is_some()),
+        "httptarget.urioverride.pathoverride.path" => {
+            Value::Text(path_override.map_or("", |path| &path.path))
+        }
+        "httptarget.urioverride.queryoverride" => Value::Message(query_override.is_some()),
+        "httptarget.urioverride.queryoverride.queryparams" => {
+            Value::Text(query_override.map_or("", |query| &query.query_params))
+        }
+        "httptarget.urioverride.urioverrideenforcemode" => {
+            Value::Enum(uri.map_or(0, |uri| uri.uri_override_enforce_mode), |name| {
+                pb::uri_override::UriOverrideEnforceMode::from_str_name(name)
+                    .map(|mode| mode as i32)
+            })
+        }
+        "httptarget.httpmethod" => {
+            Value::Enum(http_target.map_or(0, |target| target.http_method), |name| {
+                pb::HttpMethod::from_str_name(name).map(|method| method as i32)
+            })
+        }
+        "httptarget.headeroverrides" => {
+            Value::Message(http_target.is_some_and(|target| !target.header_overrides.is_empty()))
+        }
+        "httptarget.headeroverrides.header" => Value::Message(!headers.is_empty()),
+        "httptarget.headeroverrides.header.key" => {
+            Value::Texts(headers.iter().map(|header| header.key.as_str()).collect())
+        }
+        "httptarget.headeroverrides.header.value" => {
+            Value::Texts(headers.iter().map(|header| header.value.as_str()).collect())
+        }
+        "httptarget.oauthtoken" => Value::Message(oauth.is_some()),
+        "httptarget.oauthtoken.serviceaccountemail" => {
+            Value::Text(oauth.map_or("", |token| &token.service_account_email))
+        }
+        "httptarget.oauthtoken.scope" => Value::Text(oauth.map_or("", |token| &token.scope)),
+        "httptarget.oidctoken" => Value::Message(oidc.is_some()),
+        "httptarget.oidctoken.serviceaccountemail" => {
+            Value::Text(oidc.map_or("", |token| &token.service_account_email))
+        }
+        "httptarget.oidctoken.audience" => Value::Text(oidc.map_or("", |token| &token.audience)),
         "stackdriverloggingconfig" => Value::Message(queue.stackdriver_logging_config.is_some()),
+        "stackdriverloggingconfig.samplingratio" => Value::Number(
+            queue
+                .stackdriver_logging_config
+                .map_or(0.0, |config| config.sampling_ratio),
+        ),
         _ => return None,
     })
 }
 
 fn restriction(field: &str, comparator: Comparator, operand: &str) -> Result<Expression, Error> {
     let path = field.to_lowercase().replace('_', "");
-    if [
-        "appengineroutingoverride.",
-        "httptarget.",
-        "stackdriverloggingconfig.",
-    ]
-    .iter()
-    .any(|message| path.starts_with(message))
-    {
-        return Err(Error::Unsupported("fields of later layers' messages"));
-    }
     // Types the operand by the field's value in an empty queue
     let empty = pb::Queue::default();
     let kind = value(&empty, &path).ok_or_else(|| Error::FieldNotFound(field.to_owned()))?;
@@ -179,12 +256,14 @@ fn restriction(field: &str, comparator: Comparator, operand: &str) -> Result<Exp
     let incorrect_type = || Error::IncorrectType(operand.to_lowercase());
     let scalar = match kind {
         Value::Message(_) => return Err(Error::NestedType(field.to_owned())),
-        Value::Text(_) if comparator == Comparator::Has => {
+        Value::Text(_) | Value::Texts(_) if comparator == Comparator::Has => {
             return Ok(Expression::Contains(path, operand.to_lowercase()));
         }
-        Value::Text(_) => return Err(Error::Unsupported("text comparisons other than ':'")),
-        Value::Enum(_) => pb::queue::State::from_str_name(&operand.to_uppercase())
-            .map(|state| Scalar::Number(f64::from(state as i32)))
+        Value::Text(_) | Value::Texts(_) => {
+            return Err(Error::Unsupported("text comparisons other than ':'"));
+        }
+        Value::Enum(_, parse) => parse(&operand.to_uppercase())
+            .map(|number| Scalar::Number(number.into()))
             .ok_or_else(incorrect_type)?,
         Value::Number(_) => Scalar::Number(operand.parse().map_err(|_| incorrect_type())?),
         Value::Duration(_) => {

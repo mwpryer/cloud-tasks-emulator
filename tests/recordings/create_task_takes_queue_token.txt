@@ -1,0 +1,119 @@
+oidc replaces task oauth -> Some(
+    HttpRequest(
+        HttpRequest {
+            url: "https://example.com/work",
+            http_method: Post,
+            headers: {
+                "Authorization": "Bearer token",
+                "User-Agent": "Google-Cloud-Tasks",
+            },
+            body: [],
+            authorization_header: Some(
+                OidcToken(
+                    OidcToken {
+                        service_account_email: "{service_account}",
+                        audience: "https://example.com/audience",
+                    },
+                ),
+            ),
+        },
+    ),
+)
+oidc replaces invalid task token -> InvalidArgument: service_account_email must be set.
+oidc without audience -> Some(
+    HttpRequest(
+        HttpRequest {
+            url: "https://example.com/work?query",
+            http_method: Post,
+            headers: {
+                "User-Agent": "Google-Cloud-Tasks",
+            },
+            body: [],
+            authorization_header: Some(
+                OidcToken(
+                    OidcToken {
+                        service_account_email: "{service_account}",
+                        audience: "https://example.com/work?query",
+                    },
+                ),
+            ),
+        },
+    ),
+)
+oidc without audience under uri override -> Some(
+    HttpRequest(
+        HttpRequest {
+            url: "https://example.com/work",
+            http_method: Post,
+            headers: {
+                "User-Agent": "Google-Cloud-Tasks",
+            },
+            body: [],
+            authorization_header: Some(
+                OidcToken(
+                    OidcToken {
+                        service_account_email: "{service_account}",
+                        audience: "https://example.com/work",
+                    },
+                ),
+            ),
+        },
+    ),
+)
+oauth without scope -> Some(
+    HttpRequest(
+        HttpRequest {
+            url: "https://example.googleapis.com/work",
+            http_method: Post,
+            headers: {
+                "User-Agent": "Google-Cloud-Tasks",
+            },
+            body: [],
+            authorization_header: Some(
+                OauthToken(
+                    OAuthToken {
+                        service_account_email: "{service_account}",
+                        scope: "https://www.googleapis.com/auth/cloud-platform",
+                    },
+                ),
+            ),
+        },
+    ),
+)
+oauth to other host -> InvalidArgument: Invalid url for HttpRequest.oauth_token. The hostname in the url must end with ".googleapis.com"
+no queue token keeps task token -> Some(
+    HttpRequest(
+        HttpRequest {
+            url: "https://example.com/work",
+            http_method: Post,
+            headers: {
+                "User-Agent": "Google-Cloud-Tasks",
+            },
+            body: [],
+            authorization_header: Some(
+                OidcToken(
+                    OidcToken {
+                        service_account_email: "{service_account}",
+                        audience: "https://example.com/audience",
+                    },
+                ),
+            ),
+        },
+    ),
+)
+get override keeps task method and body -> Some(
+    HttpRequest(
+        HttpRequest {
+            url: "https://example.com/work",
+            http_method: Post,
+            headers: {
+                "User-Agent": "Google-Cloud-Tasks",
+            },
+            body: [
+                104,
+                105,
+            ],
+            authorization_header: None,
+        },
+    ),
+)

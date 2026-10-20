@@ -1,0 +1,23 @@
+request -> (
+    POST,
+    "/target-existing/overridden/200",
+    None,
+    {
+        "user-agent": "Google-Cloud-Tasks",
+    },
+    "",
+    [
+        (
+            "Bearer",
+            {
+                "aud": String("https://example.com/audience"),
+                "azp": String("{service_account_id}"),
+                "email": String("{service_account}"),
+                "email_verified": Bool(true),
+                "exp - iat": Number(3600),
+                "iss": String("{issuer}"),
+                "sub": String("{service_account_id}"),
+            },
+        ),
+    ],
+)

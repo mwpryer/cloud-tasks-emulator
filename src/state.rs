@@ -2,15 +2,17 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
+use reqwest::Url;
 use tokio::sync::Notify;
 
 use crate::names;
 
-#[derive(Default)]
 pub(crate) struct Emulator {
     pub state: Mutex<State>,
     /// Wakes the scheduler after any change that can make a task due sooner
     pub wake: Notify,
+    /// Origin that every App Engine task goes to, or None when no project has an App Engine app
+    pub app_engine: Option<String>,
 }
 
 pub(crate) struct State {
@@ -24,6 +26,11 @@ pub(crate) struct Queue {
     pub name: String,
     pub rate_limits: RateLimits,
     pub retry_config: RetryConfig,
+    /// Applies to every HTTP task as it dispatches, including tasks created before it
+    pub http_target: Option<HttpTarget>,
+    pub app_engine_routing_override: Option<AppEngineRouting>,
+    /// Stored only, as the emulator writes no operation logs
+    pub log_sampling_ratio: f64,
     pub state: QueueState,
     pub purge_time: Option<SystemTime>,
     pub tasks: BTreeMap<String, Task>,
@@ -66,14 +73,51 @@ pub(crate) struct RetryConfig {
     pub max_doublings: u32,
 }
 
+#[derive(Clone)]
+pub(crate) struct HttpTarget {
+    pub uri_override: Option<UriOverride>,
+    pub http_method: Option<HttpMethod>,
+    pub header_overrides: Vec<(String, String)>,
+    /// Also copied into each task as it is created
+    pub authorization_header: Option<AuthorizationHeader>,
+}
+
+/// Each part replaces that part of the task URL, and an empty port, path or query removes it
+#[derive(Clone)]
+pub(crate) struct UriOverride {
+    pub scheme: Option<Scheme>,
+    pub host: Option<String>,
+    /// Zero removes the port
+    pub port: Option<u64>,
+    pub path: Option<String>,
+    pub query: Option<String>,
+    /// None applies the override always
+    pub enforce_mode: Option<EnforceMode>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Scheme {
+    /// HTTPS, as the proto documents
+    Unspecified,
+    Http,
+    Https,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum EnforceMode {
+    IfNotExists,
+    Always,
+}
+
 pub(crate) struct Task {
     pub name: String,
-    pub http_request: HttpRequest,
+    pub payload: Payload,
     /// Overrides the queue's
     pub retry_config: Option<RetryConfig>,
     pub schedule_time: SystemTime,
     pub create_time: SystemTime,
-    pub dispatch_deadline: Duration,
+    /// None is `DEFAULT_DEADLINE`
+    pub dispatch_deadline: Option<Duration>,
     pub dispatch_count: u32,
     /// Responses other than 5xx, which Cloud Tasks also sends as X-CloudTasks-TaskExecutionCount
     pub response_count: u32,
@@ -85,6 +129,11 @@ pub(crate) struct Task {
     in_flight: Option<u64>,
 }
 
+pub(crate) enum Payload {
+    Http(HttpRequest),
+    AppEngine(AppEngineHttpRequest),
+}
+
 pub(crate) struct HttpRequest {
     pub url: String,
     pub http_method: HttpMethod,
@@ -93,18 +142,40 @@ pub(crate) struct HttpRequest {
     pub authorization_header: Option<AuthorizationHeader>,
 }
 
+pub(crate) struct AppEngineHttpRequest {
+    pub http_method: HttpMethod,
+    pub routing: AppEngineRouting,
+    pub relative_uri: String,
+    pub headers: BTreeMap<String, String>,
+    pub body: Vec<u8>,
+}
+
+/// Decides only the reported host, as every App Engine task goes to one origin
+#[derive(Clone)]
+pub(crate) struct AppEngineRouting {
+    pub service: Option<String>,
+    pub version: Option<String>,
+    pub instance: Option<String>,
+}
+
 /// Token generated for each attempt, which replaces any stored Authorization header
 #[derive(Clone)]
 pub(crate) enum AuthorizationHeader {
     OAuthToken {
         service_account_email: String,
-        scope: String,
+        /// None is `DEFAULT_SCOPE`
+        scope: Option<String>,
     },
     OidcToken {
         service_account_email: String,
-        audience: String,
+        /// None is the task URL
+        audience: Option<String>,
     },
 }
+
+pub(crate) const DEFAULT_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
+/// For HTTP tasks, and for App Engine apps with automatic scaling
+pub(crate) const DEFAULT_DEADLINE: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Clone, Copy)]
 pub(crate) enum HttpMethod {
@@ -150,12 +221,36 @@ pub(crate) struct Delivery {
     pub queue: String,
     pub task: String,
     pub attempt_id: u64,
+    /// None when Cloud Tasks fails the attempt without sending anything
+    pub request: Option<Request>,
+}
+
+pub(crate) struct Request {
     pub http_method: HttpMethod,
-    pub url: String,
+    pub url: Url,
     pub headers: Vec<(String, String)>,
-    pub authorization_header: Option<AuthorizationHeader>,
+    pub token: Option<Token>,
     pub body: Vec<u8>,
     pub deadline: Duration,
+    pub follows_redirects: bool,
+}
+
+pub(crate) enum Token {
+    OAuth,
+    Oidc {
+        service_account_email: String,
+        audience: String,
+    },
+}
+
+impl Emulator {
+    pub fn new(app_engine: Option<String>) -> Self {
+        Self {
+            state: Mutex::default(),
+            wake: Notify::new(),
+            app_engine,
+        }
+    }
 }
 
 impl Default for State {
@@ -170,7 +265,11 @@ impl Default for State {
 
 impl State {
     /// Starts every due attempt the queue limits allow and returns how long until one could next start
-    pub fn start_due(&mut self, now: SystemTime) -> (Vec<Delivery>, Option<Duration>) {
+    pub fn start_due(
+        &mut self,
+        app_engine: Option<&str>,
+        now: SystemTime,
+    ) -> (Vec<Delivery>, Option<Duration>) {
         let mut deliveries = Vec::new();
         let mut wait: Option<Duration> = None;
         for queue in self.queues.values_mut() {
@@ -185,7 +284,13 @@ impl State {
                 task.run_requested = false;
                 self.next_attempt_id += 1;
                 queue.in_flight.insert(self.next_attempt_id);
-                deliveries.push(task.start_attempt(&queue.name, self.next_attempt_id, now));
+                deliveries.push(task.start_attempt(
+                    &queue.name,
+                    queue.http_target.as_ref(),
+                    app_engine,
+                    self.next_attempt_id,
+                    now,
+                ));
             }
             // Resuming wakes the scheduler, so a paused queue needs no timer
             if queue.state == QueueState::Paused {
@@ -217,7 +322,13 @@ impl State {
                 queue.tokens -= 1.0;
                 self.next_attempt_id += 1;
                 queue.in_flight.insert(self.next_attempt_id);
-                deliveries.push(task.start_attempt(&queue.name, self.next_attempt_id, now));
+                deliveries.push(task.start_attempt(
+                    &queue.name,
+                    queue.http_target.as_ref(),
+                    app_engine,
+                    self.next_attempt_id,
+                    now,
+                ));
             }
         }
         (deliveries, wait)
@@ -271,12 +382,18 @@ impl Queue {
         name: String,
         rate_limits: RateLimits,
         retry_config: RetryConfig,
+        http_target: Option<HttpTarget>,
+        app_engine_routing_override: Option<AppEngineRouting>,
+        log_sampling_ratio: f64,
         now: SystemTime,
     ) -> Self {
         Self {
             name,
             rate_limits,
             retry_config,
+            http_target,
+            app_engine_routing_override,
+            log_sampling_ratio,
             state: QueueState::Running,
             purge_time: None,
             tasks: BTreeMap::new(),
@@ -299,6 +416,52 @@ impl Queue {
         for name in std::mem::take(&mut self.tasks).into_keys() {
             self.removed_tasks.insert(name, now);
         }
+    }
+}
+
+impl UriOverride {
+    /// None when the override leaves no valid URL
+    fn apply(&self, url: &str) -> Option<Url> {
+        let mut url = Url::parse(url).ok()?;
+        // A task always has a URL, so this mode never applies
+        if self.enforce_mode == Some(EnforceMode::IfNotExists) {
+            return Some(url);
+        }
+        if let Some(scheme) = self.scheme {
+            url.set_scheme(match scheme {
+                Scheme::Http => "http",
+                Scheme::Unspecified | Scheme::Https => "https",
+            })
+            .expect("http and https convert to each other");
+        }
+        if let Some(host) = &self.host {
+            url.set_host(Some(host))
+                .expect("queue hosts are checked as they are set");
+        }
+        match self.port {
+            None => {}
+            Some(0) => url.set_port(None).expect("http URLs have ports"),
+            Some(port) => url
+                .set_port(Some(u16::try_from(port).ok()?))
+                .expect("http URLs have ports"),
+        }
+        if let Some(path) = &self.path {
+            url.set_path(path);
+        }
+        if let Some(query) = &self.query {
+            url.set_query(
+                Some(query)
+                    .filter(|query| !query.is_empty())
+                    .map(String::as_str),
+            );
+        }
+        Some(url)
+    }
+}
+
+impl HttpMethod {
+    pub fn allows_body(self) -> bool {
+        matches!(self, HttpMethod::Post | HttpMethod::Put | HttpMethod::Patch)
     }
 }
 
@@ -359,15 +522,15 @@ impl RetryConfig {
 impl Task {
     pub fn new(
         name: String,
-        http_request: HttpRequest,
+        payload: Payload,
         retry_config: Option<RetryConfig>,
         schedule_time: SystemTime,
-        dispatch_deadline: Duration,
+        dispatch_deadline: Option<Duration>,
         now: SystemTime,
     ) -> Self {
         Self {
             name,
-            http_request,
+            payload,
             retry_config,
             schedule_time,
             create_time: now,
@@ -381,7 +544,14 @@ impl Task {
         }
     }
 
-    fn start_attempt(&mut self, queue: &str, attempt_id: u64, now: SystemTime) -> Delivery {
+    fn start_attempt(
+        &mut self,
+        queue: &str,
+        http_target: Option<&HttpTarget>,
+        app_engine: Option<&str>,
+        attempt_id: u64,
+        now: SystemTime,
+    ) -> Delivery {
         let previous = self
             .last_attempt
             .as_ref()
@@ -390,51 +560,125 @@ impl Task {
             .schedule_time
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default();
-        let mut injected = vec![
-            (
-                "X-CloudTasks-QueueName".to_owned(),
-                names::last_segment(queue).to_owned(),
-            ),
-            (
-                "X-CloudTasks-TaskName".to_owned(),
-                names::last_segment(&self.name).to_owned(),
-            ),
-            (
-                "X-CloudTasks-TaskRetryCount".to_owned(),
-                self.dispatch_count.to_string(),
-            ),
-            (
-                "X-CloudTasks-TaskExecutionCount".to_owned(),
-                self.response_count.to_string(),
-            ),
-            (
-                "X-CloudTasks-TaskETA".to_owned(),
-                // Shortest decimal for the float, so 1.120000 is 1.12
-                eta.as_secs_f64().to_string(),
-            ),
-        ];
-        if let Some(previous) = previous {
-            injected.push((
-                "X-CloudTasks-TaskPreviousResponse".to_owned(),
-                previous.outcome.status().to_string(),
-            ));
-            injected.push(("X-CloudTasks-TaskRetryReason".to_owned(), String::new()));
-        }
-        // Injected headers replace stored ones of the same name
-        let mut headers: Vec<(String, String)> = self
-            .http_request
-            .headers
-            .iter()
-            .filter(|(name, _)| {
-                !injected
+        // Named X-CloudTasks-* for HTTP tasks and X-AppEngine-* for App Engine tasks
+        let injected = |prefix: &str| {
+            let mut injected = vec![
+                (
+                    format!("{prefix}QueueName"),
+                    names::last_segment(queue).to_owned(),
+                ),
+                (
+                    format!("{prefix}TaskName"),
+                    names::last_segment(&self.name).to_owned(),
+                ),
+                (
+                    format!("{prefix}TaskRetryCount"),
+                    self.dispatch_count.to_string(),
+                ),
+                (
+                    format!("{prefix}TaskExecutionCount"),
+                    self.response_count.to_string(),
+                ),
+                (
+                    format!("{prefix}TaskETA"),
+                    // Shortest decimal for the float, so 1.120000 is 1.12
+                    eta.as_secs_f64().to_string(),
+                ),
+            ];
+            if let Some(previous) = previous {
+                injected.push((
+                    format!("{prefix}TaskPreviousResponse"),
+                    previous.outcome.status().to_string(),
+                ));
+                injected.push((format!("{prefix}TaskRetryReason"), String::new()));
+            }
+            injected
+        };
+        let request = match &self.payload {
+            Payload::Http(stored) => {
+                let injected = injected("X-CloudTasks-");
+                let authorization_header = http_target
+                    .and_then(|target| target.authorization_header.as_ref())
+                    .or(stored.authorization_header.as_ref());
+                // Overrides, then injected headers, replace stored ones of the same name
+                let overrides = http_target.map_or(&[][..], |target| &target.header_overrides);
+                let mut headers: Vec<(String, String)> = stored
+                    .headers
                     .iter()
-                    .any(|(injected, _)| injected.eq_ignore_ascii_case(name))
-                    && !(self.http_request.authorization_header.is_some()
-                        && name.eq_ignore_ascii_case("authorization"))
-            })
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect();
-        headers.extend(injected);
+                    .filter(|(name, _)| {
+                        !overrides
+                            .iter()
+                            .any(|(overridden, _)| overridden.eq_ignore_ascii_case(name))
+                    })
+                    .chain(overrides.iter().map(|(name, value)| (name, value)))
+                    .filter(|(name, _)| {
+                        !injected
+                            .iter()
+                            .any(|(injected, _)| injected.eq_ignore_ascii_case(name))
+                            && !(authorization_header.is_some()
+                                && name.eq_ignore_ascii_case("authorization"))
+                    })
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect();
+                headers.extend(injected);
+                let http_method = http_target
+                    .and_then(|target| target.http_method)
+                    .unwrap_or(stored.http_method);
+                let url = match http_target.and_then(|target| target.uri_override.as_ref()) {
+                    Some(uri_override) => uri_override.apply(&stored.url),
+                    None => Url::parse(&stored.url).ok(),
+                };
+                let token = authorization_header.map(|header| match header {
+                    AuthorizationHeader::OAuthToken { .. } => Token::OAuth,
+                    AuthorizationHeader::OidcToken {
+                        service_account_email,
+                        audience,
+                    } => Token::Oidc {
+                        service_account_email: service_account_email.clone(),
+                        audience: audience.clone().unwrap_or_else(|| stored.url.clone()),
+                    },
+                });
+                // Cloud Tasks fails a method override that disallows the body, though the proto says it drops it
+                url.filter(|_| stored.body.is_empty() || http_method.allows_body())
+                    .map(|url| Request {
+                        http_method,
+                        url,
+                        headers,
+                        token,
+                        body: stored.body.clone(),
+                        deadline: self.dispatch_deadline.unwrap_or(DEFAULT_DEADLINE),
+                        follows_redirects: true,
+                    })
+            }
+            Payload::AppEngine(stored) => {
+                let injected = injected("X-AppEngine-");
+                let mut headers: Vec<(String, String)> = stored
+                    .headers
+                    .iter()
+                    .filter(|(name, _)| {
+                        !injected
+                            .iter()
+                            .any(|(injected, _)| injected.eq_ignore_ascii_case(name))
+                    })
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect();
+                headers.extend(injected);
+                let origin =
+                    app_engine.expect("App Engine tasks exist only with an App Engine URL");
+                // Joined as text, so a relative URI that starts with // stays a path
+                Url::parse(&format!("{origin}{}", stored.relative_uri))
+                    .ok()
+                    .map(|url| Request {
+                        http_method: stored.http_method,
+                        url,
+                        headers,
+                        token: None,
+                        body: stored.body.clone(),
+                        deadline: self.dispatch_deadline.unwrap_or(DEFAULT_DEADLINE),
+                        follows_redirects: false,
+                    })
+            }
+        };
 
         self.dispatch_count += 1;
         self.first_attempt.get_or_insert(now);
@@ -448,12 +692,7 @@ impl Task {
             queue: queue.to_owned(),
             task: self.name.clone(),
             attempt_id,
-            http_method: self.http_request.http_method,
-            url: self.http_request.url.clone(),
-            headers,
-            authorization_header: self.http_request.authorization_header.clone(),
-            body: self.http_request.body.clone(),
-            deadline: self.dispatch_deadline,
+            request,
         }
     }
 }

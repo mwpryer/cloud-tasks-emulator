@@ -1,0 +1,174 @@
+every field -> Some(
+    HttpTarget {
+        uri_override: Some(
+            UriOverride {
+                scheme: Some(
+                    Http,
+                ),
+                host: Some(
+                    "example.net",
+                ),
+                port: Some(
+                    8080,
+                ),
+                path_override: Some(
+                    PathOverride {
+                        path: "/path",
+                    },
+                ),
+                query_override: Some(
+                    QueryOverride {
+                        query_params: "a=1&b=2",
+                    },
+                ),
+                uri_override_enforce_mode: IfNotExists,
+            },
+        ),
+        http_method: Put,
+        header_overrides: [
+            HeaderOverride {
+                header: Some(
+                    Header {
+                        key: "X-Custom",
+                        value: "queue",
+                    },
+                ),
+            },
+            HeaderOverride {
+                header: Some(
+                    Header {
+                        key: "Content-Type",
+                        value: "text/plain",
+                    },
+                ),
+            },
+        ],
+        authorization_header: Some(
+            OidcToken(
+                OidcToken {
+                    service_account_email: "{service_account}",
+                    audience: "https://example.com/audience",
+                },
+            ),
+        ),
+    },
+)
+no fields -> Some(
+    HttpTarget {
+        uri_override: None,
+        http_method: Unspecified,
+        header_overrides: [],
+        authorization_header: None,
+    },
+)
+empty uri override -> InvalidArgument: Error in parsing HttpTarget. Invalid uri_override.
+uri override clearing port, path and query -> Some(
+    HttpTarget {
+        uri_override: Some(
+            UriOverride {
+                scheme: None,
+                host: None,
+                port: Some(
+                    0,
+                ),
+                path_override: Some(
+                    PathOverride {
+                        path: "",
+                    },
+                ),
+                query_override: Some(
+                    QueryOverride {
+                        query_params: "",
+                    },
+                ),
+                uri_override_enforce_mode: Unspecified,
+            },
+        ),
+        http_method: Unspecified,
+        header_overrides: [],
+        authorization_header: None,
+    },
+)
+always enforced -> Some(
+    HttpTarget {
+        uri_override: Some(
+            UriOverride {
+                scheme: None,
+                host: Some(
+                    "example.net",
+                ),
+                port: None,
+                path_override: None,
+                query_override: None,
+                uri_override_enforce_mode: Always,
+            },
+        ),
+        http_method: Unspecified,
+        header_overrides: [],
+        authorization_header: None,
+    },
+)
+unspecified scheme -> Some(
+    HttpTarget {
+        uri_override: Some(
+            UriOverride {
+                scheme: Some(
+                    Unspecified,
+                ),
+                host: None,
+                port: None,
+                path_override: None,
+                query_override: None,
+                uri_override_enforce_mode: Unspecified,
+            },
+        ),
+        http_method: Unspecified,
+        header_overrides: [],
+        authorization_header: None,
+    },
+)
+oidc without audience -> Some(
+    HttpTarget {
+        uri_override: None,
+        http_method: Unspecified,
+        header_overrides: [],
+        authorization_header: Some(
+            OidcToken(
+                OidcToken {
+                    service_account_email: "{service_account}",
+                    audience: "",
+                },
+            ),
+        ),
+    },
+)
+oauth with scope -> Some(
+    HttpTarget {
+        uri_override: None,
+        http_method: Unspecified,
+        header_overrides: [],
+        authorization_header: Some(
+            OauthToken(
+                OAuthToken {
+                    service_account_email: "{service_account}",
+                    scope: "https://www.googleapis.com/auth/userinfo.email",
+                },
+            ),
+        ),
+    },
+)
+oauth without scope -> Some(
+    HttpTarget {
+        uri_override: None,
+        http_method: Unspecified,
+        header_overrides: [],
+        authorization_header: Some(
+            OauthToken(
+                OAuthToken {
+                    service_account_email: "{service_account}",
+                    scope: "",
+                },
+            ),
+        ),
+    },
+)

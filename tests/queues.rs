@@ -1,7 +1,7 @@
 mod support;
 
 use cloud_tasks_emulator::proto::google::cloud::tasks::v2::{
-    CreateQueueRequest, GetQueueRequest, ListQueuesRequest, Queue,
+    AppEngineRouting, CreateQueueRequest, GetQueueRequest, ListQueuesRequest, Queue,
 };
 use tonic::Code;
 
@@ -161,4 +161,25 @@ async fn list_queues_rejects_malformed_filter() {
         .unwrap_err();
 
     assert_eq!(status.code(), Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn routing_override_needs_app_engine_url() {
+    let mut client = support::start_emulator().await;
+
+    let status = client
+        .create_queue(create(
+            "projects/p/locations/l",
+            Queue {
+                app_engine_routing_override: Some(AppEngineRouting {
+                    service: "worker".to_owned(),
+                    ..Default::default()
+                }),
+                ..named("projects/p/locations/l/queues/q")
+            },
+        ))
+        .await
+        .unwrap_err();
+
+    assert_eq!(status.code(), Code::NotFound);
 }

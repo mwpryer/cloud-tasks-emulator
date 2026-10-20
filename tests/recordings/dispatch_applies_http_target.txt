@@ -1,0 +1,83 @@
+target-always "with-headers" -> (
+    PUT,
+    "/target-always/overridden/200",
+    Some(
+        "q=1",
+    ),
+    {
+        "content-type": "text/plain",
+        "user-agent": "Google-Cloud-Tasks",
+        "x-custom": "queue",
+        "x-other": "queue",
+    },
+    "hi",
+    [
+        (
+            "Bearer",
+            {
+                "aud": String("https://example.com/audience"),
+                "azp": String("{service_account_id}"),
+                "email": String("{service_account}"),
+                "email_verified": Bool(true),
+                "exp - iat": Number(3600),
+                "iss": String("{issuer}"),
+                "sub": String("{service_account_id}"),
+            },
+        ),
+    ],
+)
+target-always "without-headers" -> (
+    PUT,
+    "/target-always/overridden/200",
+    Some(
+        "q=1",
+    ),
+    {
+        "user-agent": "Google-Cloud-Tasks",
+        "x-custom": "queue",
+        "x-other": "queue",
+    },
+    "",
+    [
+        (
+            "Bearer",
+            {
+                "aud": String("https://example.com/audience"),
+                "azp": String("{service_account_id}"),
+                "email": String("{service_account}"),
+                "email_verified": Bool(true),
+                "exp - iat": Number(3600),
+                "iss": String("{issuer}"),
+                "sub": String("{service_account_id}"),
+            },
+        ),
+    ],
+)
+target-if-not-exists "t" -> (
+    POST,
+    "/target-if-not-exists/kept/200",
+    None,
+    {
+        "user-agent": "Google-Cloud-Tasks",
+    },
+    "",
+    [],
+)
+target-get "without-body" -> (
+    GET,
+    "/target-get/200",
+    None,
+    {
+        "content-type": "text/plain",
+        "user-agent": "Google-Cloud-Tasks",
+    },
+    "",
+    [],
+)
+target-get with body -> Some(
+    Status {
+        code: 2,
+        message: "UNKNOWN(2): HTTP status code 0",
+        details: [],
+    },
+)

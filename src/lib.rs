@@ -43,8 +43,13 @@ pub mod proto {
 }
 
 /// Serves the API, and OIDC discovery for tokens issued as `issuer`, an origin such as `http://127.0.0.1:8123`
-pub async fn serve(listener: TcpListener, issuer: String) -> Result<(), tonic::transport::Error> {
-    let emulator = Arc::new(state::Emulator::default());
+/// App Engine tasks go to the `app_engine` origin, and without one every project lacks an App Engine app
+pub async fn serve(
+    listener: TcpListener,
+    issuer: String,
+    app_engine: Option<String>,
+) -> Result<(), tonic::transport::Error> {
+    let emulator = Arc::new(state::Emulator::new(app_engine));
     let issuer = Arc::new(oidc::Issuer::new(issuer));
     tokio::spawn(scheduler::run(emulator.clone(), issuer.clone()));
     let discovery = axum::Router::new()

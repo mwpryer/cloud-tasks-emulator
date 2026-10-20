@@ -1,0 +1,96 @@
+relative uri without slash -> InvalidArgument: Invalid relative uri. The relative uri must begin with '/'. No spaces are allowed and the maximum length allowed is 2083 characters.
+relative uri with space -> InvalidArgument: Invalid relative uri. The relative uri must begin with '/'. No spaces are allowed and the maximum length allowed is 2083 characters.
+relative uri with fragment -> (
+    10,
+    "/work#part",
+    1,
+    Some(
+        AppEngineRouting {
+            service: "",
+            version: "",
+            instance: "",
+            host: "{app_domain}",
+        },
+    ),
+)
+relative uri of 2083 characters -> (
+    2083,
+    "/aaaaaaaaaaaaaaaaaaa",
+    1,
+    Some(
+        AppEngineRouting {
+            service: "",
+            version: "",
+            instance: "",
+            host: "{app_domain}",
+        },
+    ),
+)
+relative uri of 2084 characters -> InvalidArgument: Invalid relative uri. The relative uri must begin with '/'. No spaces are allowed and the maximum length allowed is 2083 characters.
+unknown method -> (
+    1,
+    "/",
+    1,
+    Some(
+        AppEngineRouting {
+            service: "",
+            version: "",
+            instance: "",
+            host: "{app_domain}",
+        },
+    ),
+)
+GET with body -> InvalidArgument: Body can only be set if the http_method is POST, PUT, or PATCH.
+PATCH with body -> (
+    1,
+    "/",
+    6,
+    Some(
+        AppEngineRouting {
+            service: "",
+            version: "",
+            instance: "",
+            host: "{app_domain}",
+        },
+    ),
+)
+DELETE with body -> InvalidArgument: Body can only be set if the http_method is POST, PUT, or PATCH.
+service with underscore -> (
+    1,
+    "/",
+    1,
+    Some(
+        AppEngineRouting {
+            service: "",
+            version: "",
+            instance: "",
+            host: "not_valid.{app_domain}",
+        },
+    ),
+)
+service with dot -> (
+    1,
+    "/",
+    1,
+    Some(
+        AppEngineRouting {
+            service: "b",
+            version: "a",
+            instance: "",
+            host: "a.b.{app_domain}",
+        },
+    ),
+)
+uppercase version -> (
+    1,
+    "/",
+    1,
+    Some(
+        AppEngineRouting {
+            service: "svc",
+            version: "V1",
+            instance: "",
+            host: "V1.svc.{app_domain}",
+        },
+    ),
+)

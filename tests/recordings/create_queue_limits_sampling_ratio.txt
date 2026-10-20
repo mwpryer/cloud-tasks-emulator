@@ -1,0 +1,14 @@
+0 -> None
+0.25 -> Some(
+    StackdriverLoggingConfig {
+        sampling_ratio: 0.25,
+    },
+)
+1 -> Some(
+    StackdriverLoggingConfig {
+        sampling_ratio: 1.0,
+    },
+)
+1.5 -> InvalidArgument: sampling_ratio must be between 0.0 and 1.0.
+-0.5 -> InvalidArgument: sampling_ratio must be between 0.0 and 1.0.
+NaN -> InvalidArgument: sampling_ratio must be between 0.0 and 1.0.

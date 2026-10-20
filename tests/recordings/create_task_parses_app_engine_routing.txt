@@ -1,0 +1,57 @@
+service -> Some(
+    AppEngineRouting {
+        service: "",
+        version: "",
+        instance: "",
+        host: "svc.{app_domain}",
+    },
+)
+version -> Some(
+    AppEngineRouting {
+        service: "",
+        version: "",
+        instance: "",
+        host: "ver.{app_domain}",
+    },
+)
+instance -> InvalidArgument: If instance is set then service or version must also be set. For more information, see https://cloud.google.com/appengine/docs/standard/python/how-requests-are-routed#targeted_routing
+service and version -> Some(
+    AppEngineRouting {
+        service: "svc",
+        version: "ver",
+        instance: "",
+        host: "ver.svc.{app_domain}",
+    },
+)
+service and instance -> Some(
+    AppEngineRouting {
+        service: "svc",
+        version: "inst",
+        instance: "",
+        host: "inst.svc.{app_domain}",
+    },
+)
+version and instance -> Some(
+    AppEngineRouting {
+        service: "ver",
+        version: "inst",
+        instance: "",
+        host: "inst.ver.{app_domain}",
+    },
+)
+every field -> Some(
+    AppEngineRouting {
+        service: "svc",
+        version: "ver",
+        instance: "inst",
+        host: "inst.ver.svc.{app_domain}",
+    },
+)
+host -> Some(
+    AppEngineRouting {
+        service: "",
+        version: "",
+        instance: "",
+        host: "{app_domain}",
+    },
+)

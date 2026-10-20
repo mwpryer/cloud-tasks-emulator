@@ -4,17 +4,27 @@ use std::time::SystemTime;
 use reqwest::Method;
 
 use crate::oidc::Issuer;
-use crate::state::{AuthorizationHeader, Delivery, Emulator, HttpMethod, Outcome};
+use crate::state::{Delivery, Emulator, HttpMethod, Outcome, Request, Token};
 
 pub(crate) async fn run(emulator: Arc<Emulator>, issuer: Arc<Issuer>) {
-    let client = reqwest::Client::new();
+    let clients = Clients {
+        following: reqwest::Client::new(),
+        not_following: reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("client config is valid"),
+    };
     loop {
-        let (deliveries, wait) = emulator.state.lock().unwrap().start_due(SystemTime::now());
+        let (deliveries, wait) = emulator
+            .state
+            .lock()
+            .unwrap()
+            .start_due(emulator.app_engine.as_deref(), SystemTime::now());
         for delivery in deliveries {
             tokio::spawn(deliver(
                 emulator.clone(),
                 issuer.clone(),
-                client.clone(),
+                clients.clone(),
                 delivery,
             ));
         }
@@ -30,13 +40,46 @@ pub(crate) async fn run(emulator: Arc<Emulator>, issuer: Arc<Issuer>) {
     }
 }
 
+/// Redirect policy is per client, and App Engine tasks don't follow redirects
+#[derive(Clone)]
+struct Clients {
+    following: reqwest::Client,
+    not_following: reqwest::Client,
+}
+
 async fn deliver(
     emulator: Arc<Emulator>,
     issuer: Arc<Issuer>,
-    client: reqwest::Client,
+    clients: Clients,
     delivery: Delivery,
 ) {
-    let method = match delivery.http_method {
+    let outcome = match &delivery.request {
+        Some(request) if request.follows_redirects => {
+            send(&issuer, &clients.following, request).await
+        }
+        Some(request) => send(&issuer, &clients.not_following, request).await,
+        None => Outcome::Unreachable,
+    };
+    let result = match outcome {
+        Outcome::Status(status) => status.to_string(),
+        Outcome::DeadlineExceeded => "deadline exceeded".to_owned(),
+        Outcome::Unreachable => "unreachable".to_owned(),
+    };
+    match &delivery.request {
+        Some(request) => eprintln!("{} {}: {result}", delivery.task, request.url),
+        None => eprintln!("{}: {result}", delivery.task),
+    }
+
+    emulator
+        .state
+        .lock()
+        .unwrap()
+        .finish_attempt(&delivery, outcome, SystemTime::now());
+    emulator.wake.notify_one();
+}
+
+async fn send(issuer: &Issuer, client: &reqwest::Client, request: &Request) -> Outcome {
+    let method = match request.http_method {
         HttpMethod::Post => Method::POST,
         HttpMethod::Get => Method::GET,
         HttpMethod::Head => Method::HEAD,
@@ -45,42 +88,27 @@ async fn deliver(
         HttpMethod::Patch => Method::PATCH,
         HttpMethod::Options => Method::OPTIONS,
     };
-    let mut request = client
-        .request(method, &delivery.url)
-        .timeout(delivery.deadline)
-        .body(delivery.body.clone());
-    for (name, value) in &delivery.headers {
-        request = request.header(name, value);
+    let mut builder = client
+        .request(method, request.url.clone())
+        .timeout(request.deadline)
+        .body(request.body.clone());
+    for (name, value) in &request.headers {
+        builder = builder.header(name, value);
     }
-    if let Some(authorization_header) = &delivery.authorization_header {
-        let token = match authorization_header {
-            AuthorizationHeader::OAuthToken { .. } => {
-                // Opaque, as only Google APIs could check a real access token
-                format!("{:032x}", rand::random::<u128>())
-            }
-            AuthorizationHeader::OidcToken {
+    if let Some(token) = &request.token {
+        let token = match token {
+            // Opaque, as only Google APIs could check a real access token
+            Token::OAuth => format!("{:032x}", rand::random::<u128>()),
+            Token::Oidc {
                 service_account_email,
                 audience,
             } => issuer.id_token(service_account_email, audience, SystemTime::now()),
         };
-        request = request.bearer_auth(token);
+        builder = builder.bearer_auth(token);
     }
-    let outcome = match request.send().await {
+    match builder.send().await {
         Ok(response) => Outcome::Status(response.status().as_u16()),
         Err(error) if error.is_timeout() => Outcome::DeadlineExceeded,
         Err(_) => Outcome::Unreachable,
-    };
-    let result = match outcome {
-        Outcome::Status(status) => status.to_string(),
-        Outcome::DeadlineExceeded => "deadline exceeded".to_owned(),
-        Outcome::Unreachable => "unreachable".to_owned(),
-    };
-    eprintln!("{} {}: {result}", delivery.task, delivery.url);
-
-    emulator
-        .state
-        .lock()
-        .unwrap()
-        .finish_attempt(&delivery, outcome, SystemTime::now());
-    emulator.wake.notify_one();
+    }
 }

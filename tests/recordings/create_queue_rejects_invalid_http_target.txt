@@ -1,0 +1,124 @@
+empty host -> InvalidArgument: Error in parsing HttpTarget. Invalid Host.
+host with scheme -> InvalidArgument: Error in parsing HttpTarget. Invalid Host.
+host with port -> InvalidArgument: Error in parsing HttpTarget. Invalid Host.
+host with path -> InvalidArgument: Error in parsing HttpTarget. Invalid Host.
+port -1 -> InvalidArgument: Error in parsing HttpTarget. Port number should be a positive integer.
+port 65536 -> Some(
+    HttpTarget {
+        uri_override: Some(
+            UriOverride {
+                scheme: None,
+                host: None,
+                port: Some(
+                    65536,
+                ),
+                path_override: None,
+                query_override: None,
+                uri_override_enforce_mode: Unspecified,
+            },
+        ),
+        http_method: Unspecified,
+        header_overrides: [],
+        authorization_header: None,
+    },
+)
+path without slash -> Some(
+    HttpTarget {
+        uri_override: Some(
+            UriOverride {
+                scheme: None,
+                host: None,
+                port: None,
+                path_override: Some(
+                    PathOverride {
+                        path: "path",
+                    },
+                ),
+                query_override: None,
+                uri_override_enforce_mode: Unspecified,
+            },
+        ),
+        http_method: Unspecified,
+        header_overrides: [],
+        authorization_header: None,
+    },
+)
+path with space -> Some(
+    HttpTarget {
+        uri_override: Some(
+            UriOverride {
+                scheme: None,
+                host: None,
+                port: None,
+                path_override: Some(
+                    PathOverride {
+                        path: "/a b",
+                    },
+                ),
+                query_override: None,
+                uri_override_enforce_mode: Unspecified,
+            },
+        ),
+        http_method: Unspecified,
+        header_overrides: [],
+        authorization_header: None,
+    },
+)
+query with question mark -> Some(
+    HttpTarget {
+        uri_override: Some(
+            UriOverride {
+                scheme: None,
+                host: None,
+                port: None,
+                path_override: None,
+                query_override: Some(
+                    QueryOverride {
+                        query_params: "?a=1",
+                    },
+                ),
+                uri_override_enforce_mode: Unspecified,
+            },
+        ),
+        http_method: Unspecified,
+        header_overrides: [],
+        authorization_header: None,
+    },
+)
+unknown scheme -> InvalidArgument: Error in parsing HttpTarget. 
+unknown enforce mode -> InvalidArgument: Error in parsing HttpTarget. 
+unknown http method -> InvalidArgument: Error in parsing HttpTarget. 
+oidc without email -> InvalidArgument: service_account_email must be set.
+oidc with malformed email -> InvalidArgument: Request contains an invalid argument.
+oidc with audience without scheme -> Some(
+    HttpTarget {
+        uri_override: None,
+        http_method: Unspecified,
+        header_overrides: [],
+        authorization_header: Some(
+            OidcToken(
+                OidcToken {
+                    service_account_email: "{service_account}",
+                    audience: "audience",
+                },
+            ),
+        ),
+    },
+)
+oauth without email -> InvalidArgument: service_account_email must be set.
+oauth with malformed email -> InvalidArgument: Request contains an invalid argument.
+oauth with scope without scheme -> Some(
+    HttpTarget {
+        uri_override: None,
+        http_method: Unspecified,
+        header_overrides: [],
+        authorization_header: Some(
+            OauthToken(
+                OAuthToken {
+                    service_account_email: "{service_account}",
+                    scope: "scope",
+                },
+            ),
+        ),
+    },
+)

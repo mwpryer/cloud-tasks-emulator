@@ -1,0 +1,789 @@
+http_target -> (
+    Some(
+        HttpTarget {
+            uri_override: Some(
+                UriOverride {
+                    scheme: Some(
+                        Https,
+                    ),
+                    host: None,
+                    port: Some(
+                        8080,
+                    ),
+                    path_override: None,
+                    query_override: Some(
+                        QueryOverride {
+                            query_params: "u=1",
+                        },
+                    ),
+                    uri_override_enforce_mode: Unspecified,
+                },
+            ),
+            http_method: Get,
+            header_overrides: [
+                HeaderOverride {
+                    header: Some(
+                        Header {
+                            key: "X-Other",
+                            value: "updated",
+                        },
+                    ),
+                },
+            ],
+            authorization_header: Some(
+                OauthToken(
+                    OAuthToken {
+                        service_account_email: "{service_account}",
+                        scope: "https://www.googleapis.com/auth/userinfo.email",
+                    },
+                ),
+            ),
+        },
+    ),
+    Some(
+        StackdriverLoggingConfig {
+            sampling_ratio: 0.5,
+        },
+    ),
+)
+http_target.uri_override -> (
+    Some(
+        HttpTarget {
+            uri_override: Some(
+                UriOverride {
+                    scheme: Some(
+                        Https,
+                    ),
+                    host: None,
+                    port: Some(
+                        8080,
+                    ),
+                    path_override: None,
+                    query_override: Some(
+                        QueryOverride {
+                            query_params: "u=1",
+                        },
+                    ),
+                    uri_override_enforce_mode: Unspecified,
+                },
+            ),
+            http_method: Put,
+            header_overrides: [
+                HeaderOverride {
+                    header: Some(
+                        Header {
+                            key: "X-Custom",
+                            value: "created",
+                        },
+                    ),
+                },
+            ],
+            authorization_header: Some(
+                OidcToken(
+                    OidcToken {
+                        service_account_email: "{service_account}",
+                        audience: "https://example.com/audience",
+                    },
+                ),
+            ),
+        },
+    ),
+    Some(
+        StackdriverLoggingConfig {
+            sampling_ratio: 0.5,
+        },
+    ),
+)
+http_target.uri_override.scheme -> (
+    Some(
+        HttpTarget {
+            uri_override: Some(
+                UriOverride {
+                    scheme: Some(
+                        Https,
+                    ),
+                    host: Some(
+                        "example.net",
+                    ),
+                    port: None,
+                    path_override: Some(
+                        PathOverride {
+                            path: "/path",
+                        },
+                    ),
+                    query_override: None,
+                    uri_override_enforce_mode: Unspecified,
+                },
+            ),
+            http_method: Put,
+            header_overrides: [
+                HeaderOverride {
+                    header: Some(
+                        Header {
+                            key: "X-Custom",
+                            value: "created",
+                        },
+                    ),
+                },
+            ],
+            authorization_header: Some(
+                OidcToken(
+                    OidcToken {
+                        service_account_email: "{service_account}",
+                        audience: "https://example.com/audience",
+                    },
+                ),
+            ),
+        },
+    ),
+    Some(
+        StackdriverLoggingConfig {
+            sampling_ratio: 0.5,
+        },
+    ),
+)
+http_target.uri_override.host -> (
+    Some(
+        HttpTarget {
+            uri_override: Some(
+                UriOverride {
+                    scheme: None,
+                    host: None,
+                    port: None,
+                    path_override: Some(
+                        PathOverride {
+                            path: "/path",
+                        },
+                    ),
+                    query_override: None,
+                    uri_override_enforce_mode: Unspecified,
+                },
+            ),
+            http_method: Put,
+            header_overrides: [
+                HeaderOverride {
+                    header: Some(
+                        Header {
+                            key: "X-Custom",
+                            value: "created",
+                        },
+                    ),
+                },
+            ],
+            authorization_header: Some(
+                OidcToken(
+                    OidcToken {
+                        service_account_email: "{service_account}",
+                        audience: "https://example.com/audience",
+                    },
+                ),
+            ),
+        },
+    ),
+    Some(
+        StackdriverLoggingConfig {
+            sampling_ratio: 0.5,
+        },
+    ),
+)
+http_target.uri_override.port -> (
+    Some(
+        HttpTarget {
+            uri_override: Some(
+                UriOverride {
+                    scheme: None,
+                    host: Some(
+                        "example.net",
+                    ),
+                    port: Some(
+                        8080,
+                    ),
+                    path_override: Some(
+                        PathOverride {
+                            path: "/path",
+                        },
+                    ),
+                    query_override: None,
+                    uri_override_enforce_mode: Unspecified,
+                },
+            ),
+            http_method: Put,
+            header_overrides: [
+                HeaderOverride {
+                    header: Some(
+                        Header {
+                            key: "X-Custom",
+                            value: "created",
+                        },
+                    ),
+                },
+            ],
+            authorization_header: Some(
+                OidcToken(
+                    OidcToken {
+                        service_account_email: "{service_account}",
+                        audience: "https://example.com/audience",
+                    },
+                ),
+            ),
+        },
+    ),
+    Some(
+        StackdriverLoggingConfig {
+            sampling_ratio: 0.5,
+        },
+    ),
+)
+http_target.uri_override.path_override -> (
+    Some(
+        HttpTarget {
+            uri_override: Some(
+                UriOverride {
+                    scheme: None,
+                    host: Some(
+                        "example.net",
+                    ),
+                    port: None,
+                    path_override: None,
+                    query_override: None,
+                    uri_override_enforce_mode: Unspecified,
+                },
+            ),
+            http_method: Put,
+            header_overrides: [
+                HeaderOverride {
+                    header: Some(
+                        Header {
+                            key: "X-Custom",
+                            value: "created",
+                        },
+                    ),
+                },
+            ],
+            authorization_header: Some(
+                OidcToken(
+                    OidcToken {
+                        service_account_email: "{service_account}",
+                        audience: "https://example.com/audience",
+                    },
+                ),
+            ),
+        },
+    ),
+    Some(
+        StackdriverLoggingConfig {
+            sampling_ratio: 0.5,
+        },
+    ),
+)
+http_target.uri_override.path_override.path -> (
+    Some(
+        HttpTarget {
+            uri_override: Some(
+                UriOverride {
+                    scheme: None,
+                    host: Some(
+                        "example.net",
+                    ),
+                    port: None,
+                    path_override: Some(
+                        PathOverride {
+                            path: "",
+                        },
+                    ),
+                    query_override: None,
+                    uri_override_enforce_mode: Unspecified,
+                },
+            ),
+            http_method: Put,
+            header_overrides: [
+                HeaderOverride {
+                    header: Some(
+                        Header {
+                            key: "X-Custom",
+                            value: "created",
+                        },
+                    ),
+                },
+            ],
+            authorization_header: Some(
+                OidcToken(
+                    OidcToken {
+                        service_account_email: "{service_account}",
+                        audience: "https://example.com/audience",
+                    },
+                ),
+            ),
+        },
+    ),
+    Some(
+        StackdriverLoggingConfig {
+            sampling_ratio: 0.5,
+        },
+    ),
+)
+http_target.uri_override.query_override.query_params -> (
+    Some(
+        HttpTarget {
+            uri_override: Some(
+                UriOverride {
+                    scheme: None,
+                    host: Some(
+                        "example.net",
+                    ),
+                    port: None,
+                    path_override: Some(
+                        PathOverride {
+                            path: "/path",
+                        },
+                    ),
+                    query_override: Some(
+                        QueryOverride {
+                            query_params: "u=1",
+                        },
+                    ),
+                    uri_override_enforce_mode: Unspecified,
+                },
+            ),
+            http_method: Put,
+            header_overrides: [
+                HeaderOverride {
+                    header: Some(
+                        Header {
+                            key: "X-Custom",
+                            value: "created",
+                        },
+                    ),
+                },
+            ],
+            authorization_header: Some(
+                OidcToken(
+                    OidcToken {
+                        service_account_email: "{service_account}",
+                        audience: "https://example.com/audience",
+                    },
+                ),
+            ),
+        },
+    ),
+    Some(
+        StackdriverLoggingConfig {
+            sampling_ratio: 0.5,
+        },
+    ),
+)
+http_target.uri_override.uri_override_enforce_mode -> (
+    Some(
+        HttpTarget {
+            uri_override: Some(
+                UriOverride {
+                    scheme: None,
+                    host: Some(
+                        "example.net",
+                    ),
+                    port: None,
+                    path_override: Some(
+                        PathOverride {
+                            path: "/path",
+                        },
+                    ),
+                    query_override: None,
+                    uri_override_enforce_mode: Unspecified,
+                },
+            ),
+            http_method: Put,
+            header_overrides: [
+                HeaderOverride {
+                    header: Some(
+                        Header {
+                            key: "X-Custom",
+                            value: "created",
+                        },
+                    ),
+                },
+            ],
+            authorization_header: Some(
+                OidcToken(
+                    OidcToken {
+                        service_account_email: "{service_account}",
+                        audience: "https://example.com/audience",
+                    },
+                ),
+            ),
+        },
+    ),
+    Some(
+        StackdriverLoggingConfig {
+            sampling_ratio: 0.5,
+        },
+    ),
+)
+http_target.http_method -> (
+    Some(
+        HttpTarget {
+            uri_override: Some(
+                UriOverride {
+                    scheme: None,
+                    host: Some(
+                        "example.net",
+                    ),
+                    port: None,
+                    path_override: Some(
+                        PathOverride {
+                            path: "/path",
+                        },
+                    ),
+                    query_override: None,
+                    uri_override_enforce_mode: Unspecified,
+                },
+            ),
+            http_method: Get,
+            header_overrides: [
+                HeaderOverride {
+                    header: Some(
+                        Header {
+                            key: "X-Custom",
+                            value: "created",
+                        },
+                    ),
+                },
+            ],
+            authorization_header: Some(
+                OidcToken(
+                    OidcToken {
+                        service_account_email: "{service_account}",
+                        audience: "https://example.com/audience",
+                    },
+                ),
+            ),
+        },
+    ),
+    Some(
+        StackdriverLoggingConfig {
+            sampling_ratio: 0.5,
+        },
+    ),
+)
+http_target.header_overrides -> (
+    Some(
+        HttpTarget {
+            uri_override: Some(
+                UriOverride {
+                    scheme: None,
+                    host: Some(
+                        "example.net",
+                    ),
+                    port: None,
+                    path_override: Some(
+                        PathOverride {
+                            path: "/path",
+                        },
+                    ),
+                    query_override: None,
+                    uri_override_enforce_mode: Unspecified,
+                },
+            ),
+            http_method: Put,
+            header_overrides: [
+                HeaderOverride {
+                    header: Some(
+                        Header {
+                            key: "X-Other",
+                            value: "updated",
+                        },
+                    ),
+                },
+            ],
+            authorization_header: Some(
+                OidcToken(
+                    OidcToken {
+                        service_account_email: "{service_account}",
+                        audience: "https://example.com/audience",
+                    },
+                ),
+            ),
+        },
+    ),
+    Some(
+        StackdriverLoggingConfig {
+            sampling_ratio: 0.5,
+        },
+    ),
+)
+http_target.oidc_token -> (
+    Some(
+        HttpTarget {
+            uri_override: Some(
+                UriOverride {
+                    scheme: None,
+                    host: Some(
+                        "example.net",
+                    ),
+                    port: None,
+                    path_override: Some(
+                        PathOverride {
+                            path: "/path",
+                        },
+                    ),
+                    query_override: None,
+                    uri_override_enforce_mode: Unspecified,
+                },
+            ),
+            http_method: Put,
+            header_overrides: [
+                HeaderOverride {
+                    header: Some(
+                        Header {
+                            key: "X-Custom",
+                            value: "created",
+                        },
+                    ),
+                },
+            ],
+            authorization_header: None,
+        },
+    ),
+    Some(
+        StackdriverLoggingConfig {
+            sampling_ratio: 0.5,
+        },
+    ),
+)
+http_target.oidc_token.audience -> (
+    Some(
+        HttpTarget {
+            uri_override: Some(
+                UriOverride {
+                    scheme: None,
+                    host: Some(
+                        "example.net",
+                    ),
+                    port: None,
+                    path_override: Some(
+                        PathOverride {
+                            path: "/path",
+                        },
+                    ),
+                    query_override: None,
+                    uri_override_enforce_mode: Unspecified,
+                },
+            ),
+            http_method: Put,
+            header_overrides: [
+                HeaderOverride {
+                    header: Some(
+                        Header {
+                            key: "X-Custom",
+                            value: "created",
+                        },
+                    ),
+                },
+            ],
+            authorization_header: Some(
+                OidcToken(
+                    OidcToken {
+                        service_account_email: "{service_account}",
+                        audience: "",
+                    },
+                ),
+            ),
+        },
+    ),
+    Some(
+        StackdriverLoggingConfig {
+            sampling_ratio: 0.5,
+        },
+    ),
+)
+http_target.oauth_token -> (
+    Some(
+        HttpTarget {
+            uri_override: Some(
+                UriOverride {
+                    scheme: None,
+                    host: Some(
+                        "example.net",
+                    ),
+                    port: None,
+                    path_override: Some(
+                        PathOverride {
+                            path: "/path",
+                        },
+                    ),
+                    query_override: None,
+                    uri_override_enforce_mode: Unspecified,
+                },
+            ),
+            http_method: Put,
+            header_overrides: [
+                HeaderOverride {
+                    header: Some(
+                        Header {
+                            key: "X-Custom",
+                            value: "created",
+                        },
+                    ),
+                },
+            ],
+            authorization_header: Some(
+                OauthToken(
+                    OAuthToken {
+                        service_account_email: "{service_account}",
+                        scope: "https://www.googleapis.com/auth/userinfo.email",
+                    },
+                ),
+            ),
+        },
+    ),
+    Some(
+        StackdriverLoggingConfig {
+            sampling_ratio: 0.5,
+        },
+    ),
+)
+http_target.oauth_token.scope -> (
+    Some(
+        HttpTarget {
+            uri_override: Some(
+                UriOverride {
+                    scheme: None,
+                    host: Some(
+                        "example.net",
+                    ),
+                    port: None,
+                    path_override: Some(
+                        PathOverride {
+                            path: "/path",
+                        },
+                    ),
+                    query_override: None,
+                    uri_override_enforce_mode: Unspecified,
+                },
+            ),
+            http_method: Put,
+            header_overrides: [
+                HeaderOverride {
+                    header: Some(
+                        Header {
+                            key: "X-Custom",
+                            value: "created",
+                        },
+                    ),
+                },
+            ],
+            authorization_header: Some(
+                OauthToken(
+                    OAuthToken {
+                        service_account_email: "",
+                        scope: "https://www.googleapis.com/auth/userinfo.email",
+                    },
+                ),
+            ),
+        },
+    ),
+    Some(
+        StackdriverLoggingConfig {
+            sampling_ratio: 0.5,
+        },
+    ),
+)
+stackdriver_logging_config -> (
+    Some(
+        HttpTarget {
+            uri_override: Some(
+                UriOverride {
+                    scheme: None,
+                    host: Some(
+                        "example.net",
+                    ),
+                    port: None,
+                    path_override: Some(
+                        PathOverride {
+                            path: "/path",
+                        },
+                    ),
+                    query_override: None,
+                    uri_override_enforce_mode: Unspecified,
+                },
+            ),
+            http_method: Put,
+            header_overrides: [
+                HeaderOverride {
+                    header: Some(
+                        Header {
+                            key: "X-Custom",
+                            value: "created",
+                        },
+                    ),
+                },
+            ],
+            authorization_header: Some(
+                OidcToken(
+                    OidcToken {
+                        service_account_email: "{service_account}",
+                        audience: "https://example.com/audience",
+                    },
+                ),
+            ),
+        },
+    ),
+    Some(
+        StackdriverLoggingConfig {
+            sampling_ratio: 0.25,
+        },
+    ),
+)
+stackdriver_logging_config.sampling_ratio -> (
+    Some(
+        HttpTarget {
+            uri_override: Some(
+                UriOverride {
+                    scheme: None,
+                    host: Some(
+                        "example.net",
+                    ),
+                    port: None,
+                    path_override: Some(
+                        PathOverride {
+                            path: "/path",
+                        },
+                    ),
+                    query_override: None,
+                    uri_override_enforce_mode: Unspecified,
+                },
+            ),
+            http_method: Put,
+            header_overrides: [
+                HeaderOverride {
+                    header: Some(
+                        Header {
+                            key: "X-Custom",
+                            value: "created",
+                        },
+                    ),
+                },
+            ],
+            authorization_header: Some(
+                OidcToken(
+                    OidcToken {
+                        service_account_email: "{service_account}",
+                        audience: "https://example.com/audience",
+                    },
+                ),
+            ),
+        },
+    ),
+    Some(
+        StackdriverLoggingConfig {
+            sampling_ratio: 0.25,
+        },
+    ),
+)
+http_target removed -> (
+    None,
+    Some(
+        StackdriverLoggingConfig {
+            sampling_ratio: 0.5,
+        },
+    ),
+)

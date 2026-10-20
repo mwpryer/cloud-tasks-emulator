@@ -6,10 +6,59 @@ invalid queue id -> InvalidArgument: Queue ID "not_valid" can contain only lette
 unknown mask path on unknown queue -> InvalidArgument: Invalid mask: bogus
 unknown mask path -> InvalidArgument: Invalid mask: bogus
 unknown nested mask path -> InvalidArgument: Invalid mask: rate_limits.bogus
+unknown http_target mask path -> InvalidArgument: Invalid mask: http_target.bogus
 mask path below a scalar -> InvalidArgument: Invalid mask: rate_limits.max_dispatches_per_second.bogus
 camel case mask path -> InvalidArgument: Invalid mask: rateLimits.maxDispatchesPerSecond
 comma-separated mask paths -> InvalidArgument: Invalid mask: rate_limits.max_dispatches_per_second,retry_config.max_attempts
 mask path with space -> InvalidArgument: Invalid mask:  state
 empty mask path -> InvalidArgument: Invalid mask: 
 rate 501 -> InvalidArgument: RateLimits.maxDispatchesPerSecond must be less than or equal to 500.
+invalid http_target outside mask -> InvalidArgument: Error in parsing HttpTarget. Invalid Host.
+uri override emptied by mask -> InvalidArgument: Error in parsing HttpTarget. Invalid uri_override.
+oidc email emptied by mask -> Queue {
+    name: "projects/{project}/locations/{location}/queues/{run}-update-invalid",
+    app_engine_routing_override: None,
+    http_target: Some(
+        HttpTarget {
+            uri_override: None,
+            http_method: Unspecified,
+            header_overrides: [],
+            authorization_header: None,
+        },
+    ),
+    rate_limits: Some(
+        RateLimits {
+            max_dispatches_per_second: 10.0,
+            max_burst_size: 10,
+            max_concurrent_dispatches: 5,
+        },
+    ),
+    retry_config: Some(
+        RetryConfig {
+            max_attempts: 5,
+            max_retry_duration: Some(
+                Duration {
+                    seconds: 60,
+                    nanos: 0,
+                },
+            ),
+            min_backoff: Some(
+                Duration {
+                    seconds: 1,
+                    nanos: 0,
+                },
+            ),
+            max_backoff: Some(
+                Duration {
+                    seconds: 10,
+                    nanos: 0,
+                },
+            ),
+            max_doublings: 3,
+        },
+    ),
+    state: Running,
+    purge_time: None,
+    stackdriver_logging_config: None,
+}
 min backoff above stored max backoff -> InvalidArgument: RetryConfig.minBackoff must be less than or equal to RetryConfig.maxBackoff.

@@ -16,8 +16,9 @@ use crate::proto::google::iam::v1 as iam;
 use crate::proto::google::longrunning::Operation;
 use crate::proto::google::rpc;
 use crate::state::{
-    Attempt, AuthorizationHeader, Emulator, HttpMethod, HttpRequest, Queue, QueueState, RateLimits,
-    RetryConfig, Task,
+    AppEngineHttpRequest, AppEngineRouting, Attempt, AuthorizationHeader, DEFAULT_DEADLINE,
+    DEFAULT_SCOPE, Emulator, EnforceMode, HttpMethod, HttpRequest, HttpTarget, Payload, Queue,
+    QueueState, RateLimits, RetryConfig, Scheme, Task, UriOverride,
 };
 
 const QUEUE_NOT_FOUND: &str = "Queue does not exist. If you just created the queue, wait at least a minute for the queue to initialize.";
@@ -26,6 +27,24 @@ const QUEUE_RECENTLY_DELETED: &str =
 const TASK_RECENTLY_REMOVED: &str = "The task cannot be created because a task with this name existed too recently. For more information about task de-duplication see https://cloud.google.com/tasks/docs/reference/rest/v2/projects.locations.queues.tasks/create#body.request_body.FIELDS.task.";
 const TASK_GONE: &str = "The task no longer exists, though a task with this name existed recently. The task either successfully completed or was deleted.";
 const NOT_FOUND: &str = "Requested entity was not found.";
+/// Dropped from task headers and rejected in queue header overrides, along with `RESERVED_PREFIXES`
+const RESERVED_HEADERS: [&str; 14] = [
+    "accept-encoding",
+    "connection",
+    "content-length",
+    "from",
+    "host",
+    "keep-alive",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "transfer-encoding",
+    "upgrade",
+    "user-agent",
+    "via",
+    "x-forwarded-for",
+];
+const RESERVED_PREFIXES: [&str; 2] = ["x-google", "x-appengine"];
 /// Largest encoded task, 1 MiB less the 5 bytes Cloud Tasks stores beyond the proto
 const MAX_TASK_SIZE: usize = 1024 * 1024 - 5;
 
@@ -120,16 +139,25 @@ impl CloudTasks for CloudTasksService {
                 queue.name, request.parent
             )));
         }
-        if queue.app_engine_routing_override.is_some()
-            || queue.http_target.is_some()
-            || queue.stackdriver_logging_config.is_some()
-        {
-            return Err(Status::unimplemented(
-                "Queue app_engine_routing_override, http_target and stackdriver_logging_config are not supported yet",
-            ));
+        if queue.app_engine_routing_override.is_some() && self.emulator.app_engine.is_none() {
+            return Err(no_app_engine(&queue.name));
         }
         let rate_limits = rate_limits(queue.rate_limits.unwrap_or_default())?;
         let retry_config = retry_config(queue.retry_config.unwrap_or_default())?;
+        if let Some(target) = &queue.http_target {
+            check_http_target(target)?;
+        }
+        let app_engine_routing_override = queue
+            .app_engine_routing_override
+            .map(app_engine_routing)
+            .transpose()?;
+        // A queue holds one target, and Cloud Tasks silently drops the HTTP one
+        let http_target = queue
+            .http_target
+            .filter(|_| app_engine_routing_override.is_none())
+            .map(http_target)
+            .transpose()?;
+        let log_sampling_ratio = log_sampling_ratio(queue.stackdriver_logging_config)?;
 
         let now = SystemTime::now();
         let mut state = self.emulator.state.lock().unwrap();
@@ -139,7 +167,15 @@ impl CloudTasks for CloudTasksService {
         if state.deleted_queues.contains(&queue.name, now) {
             return Err(Status::failed_precondition(QUEUE_RECENTLY_DELETED));
         }
-        let queue = Queue::new(queue.name, rate_limits, retry_config, now);
+        let queue = Queue::new(
+            queue.name,
+            rate_limits,
+            retry_config,
+            http_target,
+            app_engine_routing_override,
+            log_sampling_ratio,
+            now,
+        );
         let response = queue_to_proto(&queue);
         state.queues.insert(queue.name.clone(), queue);
         Ok(Response::new(response))
@@ -153,13 +189,12 @@ impl CloudTasks for CloudTasksService {
         // Cloud Tasks reads a missing queue as one with an empty name
         let update = request.queue.unwrap_or_default();
         resource(&update.name, names::QUEUE, "cloudtasks.queues.update")?;
-        if update.app_engine_routing_override.is_some()
-            || update.http_target.is_some()
-            || update.stackdriver_logging_config.is_some()
-        {
-            return Err(Status::unimplemented(
-                "Queue app_engine_routing_override, http_target and stackdriver_logging_config are not supported yet",
-            ));
+        if update.app_engine_routing_override.is_some() && self.emulator.app_engine.is_none() {
+            return Err(no_app_engine(&update.name));
+        }
+        // Cloud Tasks checks the requested target even outside the mask
+        if let Some(target) = &update.http_target {
+            check_http_target(target)?;
         }
 
         let now = SystemTime::now();
@@ -184,12 +219,33 @@ impl CloudTasks for CloudTasksService {
         };
         let rate_limits = rate_limits(merged.rate_limits.unwrap_or_default())?;
         let retry_config = retry_config(merged.retry_config.unwrap_or_default())?;
-        let queue = state
-            .queues
-            .entry(merged.name.clone())
-            .or_insert_with(|| Queue::new(merged.name, rate_limits, retry_config, now));
+        let app_engine_routing_override = merged
+            .app_engine_routing_override
+            .map(app_engine_routing)
+            .transpose()?;
+        // A queue holds one target, and Cloud Tasks silently drops the HTTP one
+        let http_target = merged
+            .http_target
+            .filter(|_| app_engine_routing_override.is_none())
+            .map(http_target)
+            .transpose()?;
+        let log_sampling_ratio = log_sampling_ratio(merged.stackdriver_logging_config)?;
+        let queue = state.queues.entry(merged.name.clone()).or_insert_with(|| {
+            Queue::new(
+                merged.name,
+                rate_limits,
+                retry_config,
+                http_target.clone(),
+                app_engine_routing_override.clone(),
+                log_sampling_ratio,
+                now,
+            )
+        });
         queue.rate_limits = rate_limits;
         queue.retry_config = retry_config;
+        queue.http_target = http_target;
+        queue.app_engine_routing_override = app_engine_routing_override;
+        queue.log_sampling_ratio = log_sampling_ratio;
         let response = queue_to_proto(queue);
         drop(state);
         self.emulator.wake.notify_one();
@@ -371,31 +427,36 @@ impl CloudTasks for CloudTasksService {
             }
             task.name
         };
-        let http_request = match task.message_type {
-            Some(pb::task::MessageType::HttpRequest(http_request)) => {
-                self::http_request(http_request)?
-            }
-            Some(pb::task::MessageType::AppEngineHttpRequest(_)) => {
-                return Err(Status::unimplemented(
-                    "App Engine tasks are not supported yet",
-                ));
+        let mut payload = match task.message_type {
+            Some(pb::task::MessageType::HttpRequest(http)) => Payload::Http(http_request(http)?),
+            Some(pb::task::MessageType::AppEngineHttpRequest(app_engine)) => {
+                if self.emulator.app_engine.is_none() {
+                    return Err(no_app_engine(&request.parent));
+                }
+                Payload::AppEngine(app_engine_http_request(app_engine)?)
             }
             None => return Err(Status::invalid_argument("Task.payload_type is not set.")),
         };
         let task_retry_config = task.retry_config.map(retry_config).transpose()?;
-        let dispatch_deadline = match task.dispatch_deadline {
-            None => Duration::from_secs(600),
-            Some(deadline) => Duration::try_from(deadline)
-                .ok()
-                // Cloud Tasks keeps milliseconds
-                .map(|deadline| Duration::from_millis(deadline.as_millis() as u64))
-                .filter(|deadline| {
-                    (Duration::from_secs(15)..=Duration::from_secs(30 * 60)).contains(deadline)
-                })
-                .ok_or_else(|| {
-                    Status::invalid_argument("Task.dispatchDeadline must be between [15s, 30m].")
-                })?,
+        let (max_deadline, range) = match payload {
+            Payload::Http(_) => (Duration::from_secs(30 * 60), "[15s, 30m]"),
+            Payload::AppEngine(_) => (Duration::from_secs(24 * 60 * 60 + 15), "[15s, 24h15s]"),
         };
+        let dispatch_deadline = task
+            .dispatch_deadline
+            .map(|deadline| {
+                Duration::try_from(deadline)
+                    .ok()
+                    // Cloud Tasks keeps milliseconds
+                    .map(|deadline| Duration::from_millis(deadline.as_millis() as u64))
+                    .filter(|deadline| (Duration::from_secs(15)..=max_deadline).contains(deadline))
+                    .ok_or_else(|| {
+                        Status::invalid_argument(format!(
+                            "Task.dispatchDeadline must be between {range}."
+                        ))
+                    })
+            })
+            .transpose()?;
         let now = SystemTime::now();
         let schedule_time = match task.schedule_time {
             None => now,
@@ -432,6 +493,27 @@ impl CloudTasks for CloudTasksService {
             .queues
             .get_mut(&request.parent)
             .ok_or_else(|| Status::not_found(QUEUE_NOT_FOUND))?;
+        if let Payload::Http(http_request) = &mut payload {
+            // The queue's token replaces the task's before the URL check, which never sees the replaced one
+            if let Some(header) = queue
+                .http_target
+                .as_ref()
+                .and_then(|target| target.authorization_header.clone())
+            {
+                http_request.authorization_header = Some(header);
+            }
+            // Checks only the host, allowing the http URLs Cloud Tasks rejects tokens for, so local handlers get tokens
+            if let Some(AuthorizationHeader::OAuthToken { .. }) = http_request.authorization_header
+                && !reqwest::Url::parse(&http_request.url).is_ok_and(|url| {
+                    url.host_str()
+                        .is_some_and(|host| host.ends_with(".googleapis.com"))
+                })
+            {
+                return Err(Status::invalid_argument(
+                    r#"Invalid url for HttpRequest.oauth_token. The hostname in the url must end with ".googleapis.com""#,
+                ));
+            }
+        }
         if queue.tasks.contains_key(&name) {
             return Err(Status::already_exists("Requested entity already exists"));
         }
@@ -440,7 +522,7 @@ impl CloudTasks for CloudTasksService {
         }
         let task = Task::new(
             name,
-            http_request,
+            payload,
             task_retry_config,
             schedule_time,
             dispatch_deadline,
@@ -591,56 +673,264 @@ fn masked(
     update: pb::Queue,
     paths: &[String],
 ) -> Result<pb::Queue, Status> {
-    let rate_limits = update.rate_limits.unwrap_or_default();
-    let retry_config = update.retry_config.unwrap_or_default();
     for path in paths {
-        match path.as_str() {
-            "rate_limits" => current.rate_limits = update.rate_limits,
-            "rate_limits.max_dispatches_per_second" => {
-                current
-                    .rate_limits
-                    .get_or_insert_default()
-                    .max_dispatches_per_second = rate_limits.max_dispatches_per_second;
-            }
-            "rate_limits.max_concurrent_dispatches" => {
-                current
-                    .rate_limits
-                    .get_or_insert_default()
-                    .max_concurrent_dispatches = rate_limits.max_concurrent_dispatches;
-            }
-            "retry_config" => current.retry_config = update.retry_config,
-            "retry_config.max_attempts" => {
-                current.retry_config.get_or_insert_default().max_attempts =
-                    retry_config.max_attempts;
-            }
-            "retry_config.max_retry_duration" => {
-                current
-                    .retry_config
-                    .get_or_insert_default()
-                    .max_retry_duration = retry_config.max_retry_duration;
-            }
-            "retry_config.min_backoff" => {
-                current.retry_config.get_or_insert_default().min_backoff = retry_config.min_backoff;
-            }
-            "retry_config.max_backoff" => {
-                current.retry_config.get_or_insert_default().max_backoff = retry_config.max_backoff;
-            }
-            "retry_config.max_doublings" => {
-                current.retry_config.get_or_insert_default().max_doublings =
-                    retry_config.max_doublings;
-            }
-            // Output only, or fields of later layers that the request cannot set
-            "name"
-            | "state"
-            | "purge_time"
-            | "rate_limits.max_burst_size"
-            | "app_engine_routing_override"
-            | "http_target"
-            | "stackdriver_logging_config" => {}
-            _ => return Err(Status::invalid_argument(format!("Invalid mask: {path}"))),
-        }
+        merge_queue(&mut current, &update, path)
+            .ok_or_else(|| Status::invalid_argument(format!("Invalid mask: {path}")))?;
     }
     Ok(current)
+}
+
+fn split_path(path: &str) -> (&str, Option<&str>) {
+    path.split_once('.')
+        .map_or((path, None), |(field, rest)| (field, Some(rest)))
+}
+
+/// None for a path below a scalar
+fn merge_leaf<T: Clone>(current: &mut T, update: &T, rest: Option<&str>) -> Option<()> {
+    if rest.is_some() {
+        return None;
+    }
+    current.clone_from(update);
+    Some(())
+}
+
+/// Replaces the whole message, or merges below it when either side has it
+fn merge_message<T: Clone + Default>(
+    current: &mut Option<T>,
+    update: &Option<T>,
+    rest: Option<&str>,
+    merge: impl Fn(&mut T, &T, &str) -> Option<()>,
+) -> Option<()> {
+    let Some(rest) = rest else {
+        current.clone_from(update);
+        return Some(());
+    };
+    // Merges even when neither side has the message, so its path is still checked
+    let mut merged = current.clone().unwrap_or_default();
+    merge(&mut merged, &update.clone().unwrap_or_default(), rest)?;
+    if current.is_some() || update.is_some() {
+        *current = Some(merged);
+    }
+    Some(())
+}
+
+/// Merges one member of a oneof, which leaves the oneof unchanged when neither side holds that member
+fn merge_member<O, T: Clone + Default>(
+    current: &mut Option<O>,
+    update: &Option<O>,
+    rest: Option<&str>,
+    member: impl Fn(&O) -> Option<&T>,
+    wrap: impl Fn(T) -> O,
+    merge: impl Fn(&mut T, &T, &str) -> Option<()>,
+) -> Option<()> {
+    let held = current.as_ref().and_then(&member).is_some();
+    let mut merged = current.as_ref().and_then(&member).cloned();
+    merge_message(
+        &mut merged,
+        &update.as_ref().and_then(&member).cloned(),
+        rest,
+        merge,
+    )?;
+    match merged {
+        Some(merged) => *current = Some(wrap(merged)),
+        None if held => *current = None,
+        None => {}
+    }
+    Some(())
+}
+
+fn merge_queue(current: &mut pb::Queue, update: &pb::Queue, path: &str) -> Option<()> {
+    let (field, rest) = split_path(path);
+    match field {
+        "rate_limits" => merge_message(
+            &mut current.rate_limits,
+            &update.rate_limits,
+            rest,
+            |current, update, path| {
+                let (field, rest) = split_path(path);
+                match field {
+                    "max_dispatches_per_second" => merge_leaf(
+                        &mut current.max_dispatches_per_second,
+                        &update.max_dispatches_per_second,
+                        rest,
+                    ),
+                    "max_burst_size" => {
+                        merge_leaf(&mut current.max_burst_size, &update.max_burst_size, rest)
+                    }
+                    "max_concurrent_dispatches" => merge_leaf(
+                        &mut current.max_concurrent_dispatches,
+                        &update.max_concurrent_dispatches,
+                        rest,
+                    ),
+                    _ => None,
+                }
+            },
+        ),
+        "retry_config" => merge_message(
+            &mut current.retry_config,
+            &update.retry_config,
+            rest,
+            |current, update, path| {
+                let (field, rest) = split_path(path);
+                match field {
+                    "max_attempts" => {
+                        merge_leaf(&mut current.max_attempts, &update.max_attempts, rest)
+                    }
+                    "max_retry_duration" => merge_leaf(
+                        &mut current.max_retry_duration,
+                        &update.max_retry_duration,
+                        rest,
+                    ),
+                    "min_backoff" => {
+                        merge_leaf(&mut current.min_backoff, &update.min_backoff, rest)
+                    }
+                    "max_backoff" => {
+                        merge_leaf(&mut current.max_backoff, &update.max_backoff, rest)
+                    }
+                    "max_doublings" => {
+                        merge_leaf(&mut current.max_doublings, &update.max_doublings, rest)
+                    }
+                    _ => None,
+                }
+            },
+        ),
+        "http_target" => merge_message(
+            &mut current.http_target,
+            &update.http_target,
+            rest,
+            merge_http_target,
+        ),
+        "stackdriver_logging_config" => merge_message(
+            &mut current.stackdriver_logging_config,
+            &update.stackdriver_logging_config,
+            rest,
+            |current, update, path| match split_path(path) {
+                ("sampling_ratio", rest) => {
+                    merge_leaf(&mut current.sampling_ratio, &update.sampling_ratio, rest)
+                }
+                _ => None,
+            },
+        ),
+        "app_engine_routing_override" => merge_message(
+            &mut current.app_engine_routing_override,
+            &update.app_engine_routing_override,
+            rest,
+            |current, update, path| {
+                let (field, rest) = split_path(path);
+                match field {
+                    "service" => merge_leaf(&mut current.service, &update.service, rest),
+                    "version" => merge_leaf(&mut current.version, &update.version, rest),
+                    "instance" => merge_leaf(&mut current.instance, &update.instance, rest),
+                    "host" => merge_leaf(&mut current.host, &update.host, rest),
+                    _ => None,
+                }
+            },
+        ),
+        // Output only
+        "name" | "state" | "purge_time" if rest.is_none() => Some(()),
+        _ => None,
+    }
+}
+
+fn merge_http_target(
+    current: &mut pb::HttpTarget,
+    update: &pb::HttpTarget,
+    path: &str,
+) -> Option<()> {
+    use pb::http_target::AuthorizationHeader as Header;
+    let (field, rest) = split_path(path);
+    match field {
+        "uri_override" => merge_message(
+            &mut current.uri_override,
+            &update.uri_override,
+            rest,
+            |current, update, path| {
+                let (field, rest) = split_path(path);
+                match field {
+                    "scheme" => merge_leaf(&mut current.scheme, &update.scheme, rest),
+                    "host" => merge_leaf(&mut current.host, &update.host, rest),
+                    "port" => merge_leaf(&mut current.port, &update.port, rest),
+                    "path_override" => merge_message(
+                        &mut current.path_override,
+                        &update.path_override,
+                        rest,
+                        |current, update, path| match split_path(path) {
+                            ("path", rest) => merge_leaf(&mut current.path, &update.path, rest),
+                            _ => None,
+                        },
+                    ),
+                    "query_override" => merge_message(
+                        &mut current.query_override,
+                        &update.query_override,
+                        rest,
+                        |current, update, path| match split_path(path) {
+                            ("query_params", rest) => {
+                                merge_leaf(&mut current.query_params, &update.query_params, rest)
+                            }
+                            _ => None,
+                        },
+                    ),
+                    "uri_override_enforce_mode" => merge_leaf(
+                        &mut current.uri_override_enforce_mode,
+                        &update.uri_override_enforce_mode,
+                        rest,
+                    ),
+                    _ => None,
+                }
+            },
+        ),
+        "http_method" => merge_leaf(&mut current.http_method, &update.http_method, rest),
+        "header_overrides" => merge_leaf(
+            &mut current.header_overrides,
+            &update.header_overrides,
+            rest,
+        ),
+        "oauth_token" => merge_member(
+            &mut current.authorization_header,
+            &update.authorization_header,
+            rest,
+            |header| match header {
+                Header::OauthToken(token) => Some(token),
+                Header::OidcToken(_) => None,
+            },
+            Header::OauthToken,
+            |current, update, path| {
+                let (field, rest) = split_path(path);
+                match field {
+                    "service_account_email" => merge_leaf(
+                        &mut current.service_account_email,
+                        &update.service_account_email,
+                        rest,
+                    ),
+                    "scope" => merge_leaf(&mut current.scope, &update.scope, rest),
+                    _ => None,
+                }
+            },
+        ),
+        "oidc_token" => merge_member(
+            &mut current.authorization_header,
+            &update.authorization_header,
+            rest,
+            |header| match header {
+                Header::OidcToken(token) => Some(token),
+                Header::OauthToken(_) => None,
+            },
+            Header::OidcToken,
+            |current, update, path| {
+                let (field, rest) = split_path(path);
+                match field {
+                    "service_account_email" => merge_leaf(
+                        &mut current.service_account_email,
+                        &update.service_account_email,
+                        rest,
+                    ),
+                    "audience" => merge_leaf(&mut current.audience, &update.audience, rest),
+                    _ => None,
+                }
+            },
+        ),
+        _ => None,
+    }
 }
 
 /// Formats a time as Cloud Tasks reports it, in Pacific time with the shortest fraction
@@ -809,46 +1099,163 @@ fn http_request(request: pb::HttpRequest) -> Result<HttpRequest, Status> {
     }
     let authorization_header = request
         .authorization_header
-        .map(|header| authorization_header(header, &request.url))
+        .map(|header| {
+            let header = match header {
+                pb::http_request::AuthorizationHeader::OauthToken(token) => oauth_token(token),
+                pb::http_request::AuthorizationHeader::OidcToken(token) => oidc_token(token),
+            };
+            service_account(&header)?;
+            Ok::<_, Status>(header)
+        })
         .transpose()?;
-    let http_method = match pb::HttpMethod::try_from(request.http_method) {
-        // Cloud Tasks stores an unknown method as POST
-        Ok(pb::HttpMethod::Unspecified | pb::HttpMethod::Post) | Err(_) => HttpMethod::Post,
-        Ok(pb::HttpMethod::Get) => HttpMethod::Get,
-        Ok(pb::HttpMethod::Head) => HttpMethod::Head,
-        Ok(pb::HttpMethod::Put) => HttpMethod::Put,
-        Ok(pb::HttpMethod::Delete) => HttpMethod::Delete,
-        Ok(pb::HttpMethod::Patch) => HttpMethod::Patch,
-        Ok(pb::HttpMethod::Options) => HttpMethod::Options,
-    };
-    if !request.body.is_empty()
-        && !matches!(
-            http_method,
-            HttpMethod::Post | HttpMethod::Put | HttpMethod::Patch
-        )
-    {
+    // Cloud Tasks stores an unknown method as POST
+    let http_method = pb::HttpMethod::try_from(request.http_method)
+        .ok()
+        .and_then(http_method)
+        .unwrap_or(HttpMethod::Post);
+    if !request.body.is_empty() && !http_method.allows_body() {
         return Err(Status::invalid_argument(
             "Body can only be set if the http_method is POST, PUT, or PATCH.",
         ));
     }
+    let mut headers = stored_headers(request.headers);
+    headers.retain(|name, _| !name.eq_ignore_ascii_case("user-agent"));
+    headers.insert("User-Agent".to_owned(), "Google-Cloud-Tasks".to_owned());
     Ok(HttpRequest {
         url: request.url,
         http_method,
-        headers: stored_headers(request.headers),
+        headers,
         body: request.body,
         authorization_header,
     })
 }
 
-/// Fills the defaults Cloud Tasks stores, but allows the http URLs it rejects so local handlers get tokens
-fn authorization_header(
-    header: pb::http_request::AuthorizationHeader,
-    url: &str,
-) -> Result<AuthorizationHeader, Status> {
-    let service_account_email = match &header {
-        pb::http_request::AuthorizationHeader::OauthToken(token) => &token.service_account_email,
-        pb::http_request::AuthorizationHeader::OidcToken(token) => &token.service_account_email,
+fn app_engine_http_request(
+    request: pb::AppEngineHttpRequest,
+) -> Result<AppEngineHttpRequest, Status> {
+    let relative_uri = match request.relative_uri.as_str() {
+        "" => "/".to_owned(),
+        _ => request.relative_uri,
     };
+    if !relative_uri.starts_with('/') || relative_uri.contains(' ') || relative_uri.len() > 2083 {
+        return Err(Status::invalid_argument(
+            "Invalid relative uri. The relative uri must begin with '/'. No spaces are allowed and the maximum length allowed is 2083 characters.",
+        ));
+    }
+    // Cloud Tasks stores an unknown method as POST
+    let http_method = pb::HttpMethod::try_from(request.http_method)
+        .ok()
+        .and_then(http_method)
+        .unwrap_or(HttpMethod::Post);
+    if !request.body.is_empty() && !http_method.allows_body() {
+        return Err(Status::invalid_argument(
+            "Body can only be set if the http_method is POST, PUT, or PATCH.",
+        ));
+    }
+    const USER_AGENT: &str = "AppEngine-Google; (+http://code.google.com/appengine)";
+    let mut headers = stored_headers(request.headers);
+    match headers
+        .iter_mut()
+        .find(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+    {
+        Some((_, agent)) => *agent = format!("{agent} {USER_AGENT}"),
+        None => {
+            headers.insert("User-Agent".to_owned(), USER_AGENT.to_owned());
+        }
+    }
+    if !request.body.is_empty() {
+        headers.insert("Content-Length".to_owned(), request.body.len().to_string());
+        if !headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("content-type"))
+        {
+            headers.insert(
+                "Content-Type".to_owned(),
+                "application/octet-stream".to_owned(),
+            );
+        }
+    }
+    Ok(AppEngineHttpRequest {
+        http_method,
+        routing: app_engine_routing(request.app_engine_routing.unwrap_or_default())?,
+        relative_uri,
+        headers,
+        body: request.body,
+    })
+}
+
+/// Ignores the host, which is output only
+fn app_engine_routing(routing: pb::AppEngineRouting) -> Result<AppEngineRouting, Status> {
+    let set = |value: String| Some(value).filter(|value| !value.is_empty());
+    let routing = AppEngineRouting {
+        service: set(routing.service),
+        version: set(routing.version),
+        instance: set(routing.instance),
+    };
+    if routing.instance.is_some() && routing.service.is_none() && routing.version.is_none() {
+        return Err(Status::invalid_argument(
+            "If instance is set then service or version must also be set. For more information, see https://cloud.google.com/appengine/docs/standard/python/how-requests-are-routed#targeted_routing",
+        ));
+    }
+    Ok(routing)
+}
+
+/// For the project in a queue or task name, as Cloud Tasks answers when the project has no app
+fn no_app_engine(name: &str) -> Status {
+    let project = names::project(name);
+    Status::not_found(format!(
+        "The project {project} does not contain an App Engine application. Please visit https://console.developers.google.com/appengine?project={project} to add an App Engine application."
+    ))
+}
+
+/// The instance, version and service before the app's domain, which the emulator takes to be `<project>.appspot.com`
+fn app_engine_host(routing: &AppEngineRouting, name: &str) -> String {
+    [&routing.instance, &routing.version, &routing.service]
+        .into_iter()
+        .flatten()
+        .cloned()
+        .chain([format!("{}.appspot.com", names::project(name))])
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// None for unspecified
+fn http_method(method: pb::HttpMethod) -> Option<HttpMethod> {
+    Some(match method {
+        pb::HttpMethod::Unspecified => return None,
+        pb::HttpMethod::Post => HttpMethod::Post,
+        pb::HttpMethod::Get => HttpMethod::Get,
+        pb::HttpMethod::Head => HttpMethod::Head,
+        pb::HttpMethod::Put => HttpMethod::Put,
+        pb::HttpMethod::Delete => HttpMethod::Delete,
+        pb::HttpMethod::Patch => HttpMethod::Patch,
+        pb::HttpMethod::Options => HttpMethod::Options,
+    })
+}
+
+fn oauth_token(token: pb::OAuthToken) -> AuthorizationHeader {
+    AuthorizationHeader::OAuthToken {
+        service_account_email: token.service_account_email,
+        scope: Some(token.scope).filter(|scope| !scope.is_empty()),
+    }
+}
+
+fn oidc_token(token: pb::OidcToken) -> AuthorizationHeader {
+    AuthorizationHeader::OidcToken {
+        service_account_email: token.service_account_email,
+        audience: Some(token.audience).filter(|audience| !audience.is_empty()),
+    }
+}
+
+fn service_account(header: &AuthorizationHeader) -> Result<(), Status> {
+    let (AuthorizationHeader::OAuthToken {
+        service_account_email,
+        ..
+    }
+    | AuthorizationHeader::OidcToken {
+        service_account_email,
+        ..
+    }) = header;
     if service_account_email.is_empty() {
         return Err(Status::invalid_argument(
             "service_account_email must be set.",
@@ -864,55 +1271,132 @@ fn authorization_header(
             "Request contains an invalid argument.",
         ));
     }
-    Ok(match header {
-        pb::http_request::AuthorizationHeader::OauthToken(token) => {
-            if !reqwest::Url::parse(url).is_ok_and(|url| {
-                url.host_str()
-                    .is_some_and(|host| host.ends_with(".googleapis.com"))
-            }) {
-                return Err(Status::invalid_argument(
-                    r#"Invalid url for HttpRequest.oauth_token. The hostname in the url must end with ".googleapis.com""#,
-                ));
+    Ok(())
+}
+
+/// Checks a requested target in full, as Cloud Tasks skips the token check once a mask merges it
+fn check_http_target(target: &pb::HttpTarget) -> Result<(), Status> {
+    let target = http_target(target.clone())?;
+    target
+        .authorization_header
+        .as_ref()
+        .map_or(Ok(()), service_account)
+}
+
+fn http_target(target: pb::HttpTarget) -> Result<HttpTarget, Status> {
+    let parse_error =
+        |detail: &str| Status::invalid_argument(format!("Error in parsing HttpTarget. {detail}"));
+    let uri_override = target
+        .uri_override
+        .map(|uri| {
+            if uri.scheme.is_none()
+                && uri.host.is_none()
+                && uri.port.is_none()
+                && uri.path_override.is_none()
+                && uri.query_override.is_none()
+            {
+                return Err(parse_error("Invalid uri_override."));
             }
-            AuthorizationHeader::OAuthToken {
-                service_account_email: token.service_account_email,
-                scope: if token.scope.is_empty() {
-                    "https://www.googleapis.com/auth/cloud-platform".to_owned()
-                } else {
-                    token.scope
-                },
+            let scheme = uri
+                .scheme
+                .map(|scheme| match pb::uri_override::Scheme::try_from(scheme) {
+                    Ok(pb::uri_override::Scheme::Unspecified) => Ok(Scheme::Unspecified),
+                    Ok(pb::uri_override::Scheme::Http) => Ok(Scheme::Http),
+                    Ok(pb::uri_override::Scheme::Https) => Ok(Scheme::Https),
+                    Err(_) => Err(parse_error("")),
+                })
+                .transpose()?;
+            if let Some(host) = &uri.host
+                // Only a bare host, which parses back to itself
+                && !reqwest::Url::parse(&format!("http://{host}/")).is_ok_and(|url| {
+                    url.host_str()
+                        .is_some_and(|parsed| parsed.eq_ignore_ascii_case(host))
+                        && url.port().is_none()
+                        && url.path() == "/"
+                })
+            {
+                return Err(parse_error("Invalid Host."));
             }
-        }
-        pb::http_request::AuthorizationHeader::OidcToken(token) => AuthorizationHeader::OidcToken {
-            service_account_email: token.service_account_email,
-            audience: if token.audience.is_empty() {
-                url.to_owned()
-            } else {
-                token.audience
-            },
-        },
+            let port = uri
+                .port
+                .map(u64::try_from)
+                .transpose()
+                .map_err(|_| parse_error("Port number should be a positive integer."))?;
+            let enforce_mode = match pb::uri_override::UriOverrideEnforceMode::try_from(
+                uri.uri_override_enforce_mode,
+            ) {
+                Ok(pb::uri_override::UriOverrideEnforceMode::Unspecified) => None,
+                Ok(pb::uri_override::UriOverrideEnforceMode::IfNotExists) => {
+                    Some(EnforceMode::IfNotExists)
+                }
+                Ok(pb::uri_override::UriOverrideEnforceMode::Always) => Some(EnforceMode::Always),
+                Err(_) => return Err(parse_error("")),
+            };
+            Ok(UriOverride {
+                scheme,
+                host: uri.host,
+                port,
+                path: uri.path_override.map(|path| path.path),
+                query: uri.query_override.map(|query| query.query_params),
+                enforce_mode,
+            })
+        })
+        .transpose()?;
+    let http_method = match pb::HttpMethod::try_from(target.http_method) {
+        Ok(method) => http_method(method),
+        Err(_) => return Err(parse_error("")),
+    };
+    let header_overrides: Vec<(String, String)> = target
+        .header_overrides
+        .into_iter()
+        .filter_map(|header_override| header_override.header)
+        .map(|header| (header.key, header.value))
+        .collect();
+    let invalid: Vec<&str> = header_overrides
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .filter(|name| {
+            let lowercase = name.to_ascii_lowercase();
+            name.is_empty()
+                || !name.chars().all(|c| c.is_ascii_graphic() && c != ':')
+                || RESERVED_HEADERS.contains(&lowercase.as_str())
+                || RESERVED_PREFIXES
+                    .iter()
+                    .chain(&["x-cloudtasks-"])
+                    .any(|prefix| lowercase.starts_with(prefix))
+        })
+        .collect();
+    if !invalid.is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "Error in parsing HttpTarget.headers. Header name cannot be empty or start with reserved prefixes. Invalid headers found: {}",
+            invalid.join(", ")
+        )));
+    }
+    Ok(HttpTarget {
+        uri_override,
+        http_method,
+        header_overrides,
+        authorization_header: target.authorization_header.map(|header| match header {
+            pb::http_target::AuthorizationHeader::OauthToken(token) => oauth_token(token),
+            pb::http_target::AuthorizationHeader::OidcToken(token) => oidc_token(token),
+        }),
     })
 }
 
-/// Drops and rewrites headers as Cloud Tasks does when it stores a task, never rejecting one
+/// Zero logs nothing, and is how Cloud Tasks reads a missing config
+fn log_sampling_ratio(config: Option<pb::StackdriverLoggingConfig>) -> Result<f64, Status> {
+    let ratio = config.map_or(0.0, |config| config.sampling_ratio);
+    if !(0.0..=1.0).contains(&ratio) {
+        return Err(Status::invalid_argument(
+            "sampling_ratio must be between 0.0 and 1.0.",
+        ));
+    }
+    Ok(ratio)
+}
+
+/// Drops and rewrites headers as Cloud Tasks does when it stores a task, never rejecting one, but leaves User-Agent to the caller
 fn stored_headers(headers: BTreeMap<String, String>) -> BTreeMap<String, String> {
-    const DROPPED: [&str; 14] = [
-        "accept-encoding",
-        "connection",
-        "content-length",
-        "from",
-        "host",
-        "keep-alive",
-        "proxy-authorization",
-        "proxy-connection",
-        "te",
-        "transfer-encoding",
-        "upgrade",
-        "user-agent",
-        "via",
-        "x-forwarded-for",
-    ];
-    let mut stored: BTreeMap<String, String> = headers
+    headers
         .into_iter()
         .filter_map(|(name, value)| {
             let lowercase = name.to_ascii_lowercase();
@@ -922,9 +1406,10 @@ fn stored_headers(headers: BTreeMap<String, String>) -> BTreeMap<String, String>
                 .next()
                 .expect("split yields at least one part")
                 .replace(['\r', '\n'], "_");
-            let kept = !DROPPED.contains(&lowercase.as_str())
-                && !lowercase.starts_with("x-google")
-                && !lowercase.starts_with("x-appengine")
+            let kept = (lowercase == "user-agent" || !RESERVED_HEADERS.contains(&lowercase.as_str()))
+                && !RESERVED_PREFIXES
+                    .iter()
+                    .any(|prefix| lowercase.starts_with(prefix))
                 && !name.is_empty()
                 && name.chars().all(|c| c.is_ascii_graphic() && c != ':')
                 && !value.is_empty()
@@ -933,9 +1418,7 @@ fn stored_headers(headers: BTreeMap<String, String>) -> BTreeMap<String, String>
                 && name.len() + value.len() <= 8188;
             kept.then_some((name, value))
         })
-        .collect();
-    stored.insert("User-Agent".to_owned(), "Google-Cloud-Tasks".to_owned());
-    stored
+        .collect()
 }
 
 /// Basic for an unknown view too, which create and get then echo as unspecified
@@ -980,7 +1463,91 @@ fn queue_to_proto(queue: &Queue) -> pb::Queue {
         }
         .into(),
         purge_time: queue.purge_time.map(timestamp),
-        ..Default::default()
+        http_target: queue.http_target.as_ref().map(|target| pb::HttpTarget {
+            uri_override: target.uri_override.as_ref().map(|uri| pb::UriOverride {
+                scheme: uri.scheme.map(|scheme| {
+                    match scheme {
+                        Scheme::Unspecified => pb::uri_override::Scheme::Unspecified,
+                        Scheme::Http => pb::uri_override::Scheme::Http,
+                        Scheme::Https => pb::uri_override::Scheme::Https,
+                    }
+                    .into()
+                }),
+                host: uri.host.clone(),
+                port: uri.port.map(|port| port as i64),
+                path_override: uri.path.clone().map(|path| pb::PathOverride { path }),
+                query_override: uri
+                    .query
+                    .clone()
+                    .map(|query_params| pb::QueryOverride { query_params }),
+                uri_override_enforce_mode: match uri.enforce_mode {
+                    None => pb::uri_override::UriOverrideEnforceMode::Unspecified,
+                    Some(EnforceMode::IfNotExists) => {
+                        pb::uri_override::UriOverrideEnforceMode::IfNotExists
+                    }
+                    Some(EnforceMode::Always) => pb::uri_override::UriOverrideEnforceMode::Always,
+                }
+                .into(),
+            }),
+            http_method: target
+                .http_method
+                .map_or(pb::HttpMethod::Unspecified, http_method_to_proto)
+                .into(),
+            header_overrides: target
+                .header_overrides
+                .iter()
+                .map(|(key, value)| pb::http_target::HeaderOverride {
+                    header: Some(pb::http_target::Header {
+                        key: key.clone(),
+                        value: value.clone(),
+                    }),
+                })
+                .collect(),
+            authorization_header: target
+                .authorization_header
+                .clone()
+                .map(|header| match header {
+                    AuthorizationHeader::OAuthToken {
+                        service_account_email,
+                        scope,
+                    } => pb::http_target::AuthorizationHeader::OauthToken(pb::OAuthToken {
+                        service_account_email,
+                        scope: scope.unwrap_or_default(),
+                    }),
+                    AuthorizationHeader::OidcToken {
+                        service_account_email,
+                        audience,
+                    } => pb::http_target::AuthorizationHeader::OidcToken(pb::OidcToken {
+                        service_account_email,
+                        audience: audience.unwrap_or_default(),
+                    }),
+                }),
+        }),
+        app_engine_routing_override: queue.app_engine_routing_override.as_ref().map(|routing| {
+            pb::AppEngineRouting {
+                service: routing.service.clone().unwrap_or_default(),
+                version: routing.version.clone().unwrap_or_default(),
+                instance: routing.instance.clone().unwrap_or_default(),
+                host: app_engine_host(routing, &queue.name),
+            }
+        }),
+        stackdriver_logging_config: (queue.log_sampling_ratio != 0.0).then_some(
+            pb::StackdriverLoggingConfig {
+                sampling_ratio: queue.log_sampling_ratio,
+            },
+        ),
+    }
+}
+
+fn http_method_to_proto(method: HttpMethod) -> pb::HttpMethod {
+    match method {
+        HttpMethod::Post => pb::HttpMethod::Post,
+        HttpMethod::Get => pb::HttpMethod::Get,
+        HttpMethod::Head => pb::HttpMethod::Head,
+        HttpMethod::Put => pb::HttpMethod::Put,
+        HttpMethod::Delete => pb::HttpMethod::Delete,
+        HttpMethod::Patch => pb::HttpMethod::Patch,
+        HttpMethod::Options => pb::HttpMethod::Options,
     }
 }
 
@@ -995,57 +1562,84 @@ fn retry_config_to_proto(retry_config: &RetryConfig) -> pb::RetryConfig {
 }
 
 fn task_to_proto(task: &Task, view: pb::task::View) -> pb::Task {
-    let request = &task.http_request;
-    let http_method = match request.http_method {
-        HttpMethod::Post => pb::HttpMethod::Post,
-        HttpMethod::Get => pb::HttpMethod::Get,
-        HttpMethod::Head => pb::HttpMethod::Head,
-        HttpMethod::Put => pb::HttpMethod::Put,
-        HttpMethod::Delete => pb::HttpMethod::Delete,
-        HttpMethod::Patch => pb::HttpMethod::Patch,
-        HttpMethod::Options => pb::HttpMethod::Options,
-    };
     let create_time = task
         .create_time
         .duration_since(SystemTime::UNIX_EPOCH)
         .expect("times are after the epoch");
+    let body = |body: &Vec<u8>| {
+        if view == pb::task::View::Full {
+            body.clone()
+        } else {
+            Vec::new()
+        }
+    };
+    let (message_type, dispatch_deadline) = match &task.payload {
+        Payload::Http(request) => (
+            pb::task::MessageType::HttpRequest(pb::HttpRequest {
+                url: request.url.clone(),
+                http_method: http_method_to_proto(request.http_method).into(),
+                headers: request.headers.clone(),
+                body: body(&request.body),
+                authorization_header: request.authorization_header.clone().map(
+                    |header| match header {
+                        AuthorizationHeader::OAuthToken {
+                            service_account_email,
+                            scope,
+                        } => pb::http_request::AuthorizationHeader::OauthToken(pb::OAuthToken {
+                            service_account_email,
+                            scope: scope.unwrap_or_else(|| DEFAULT_SCOPE.to_owned()),
+                        }),
+                        AuthorizationHeader::OidcToken {
+                            service_account_email,
+                            audience,
+                        } => pb::http_request::AuthorizationHeader::OidcToken(pb::OidcToken {
+                            service_account_email,
+                            audience: audience.unwrap_or_else(|| request.url.clone()),
+                        }),
+                    },
+                ),
+            }),
+            Some(task.dispatch_deadline.unwrap_or(DEFAULT_DEADLINE)),
+        ),
+        Payload::AppEngine(request) => {
+            let routing = &request.routing;
+            // Cloud Tasks keeps only the host, and reads its labels back as version and service or as all three
+            let labels: Vec<&str> = [&routing.instance, &routing.version, &routing.service]
+                .into_iter()
+                .flatten()
+                .flat_map(|value| value.split('.'))
+                .collect();
+            let (instance, version, service) = match labels[..] {
+                [version, service] => ("", version, service),
+                [instance, version, service] => (instance, version, service),
+                _ => ("", "", ""),
+            };
+            (
+                pb::task::MessageType::AppEngineHttpRequest(pb::AppEngineHttpRequest {
+                    http_method: http_method_to_proto(request.http_method).into(),
+                    app_engine_routing: Some(pb::AppEngineRouting {
+                        service: service.to_owned(),
+                        version: version.to_owned(),
+                        instance: instance.to_owned(),
+                        host: app_engine_host(routing, &task.name),
+                    }),
+                    relative_uri: request.relative_uri.clone(),
+                    headers: request.headers.clone(),
+                    body: body(&request.body),
+                }),
+                task.dispatch_deadline,
+            )
+        }
+    };
     pb::Task {
         name: task.name.clone(),
-        message_type: Some(pb::task::MessageType::HttpRequest(pb::HttpRequest {
-            url: request.url.clone(),
-            http_method: http_method.into(),
-            headers: request.headers.clone(),
-            body: if view == pb::task::View::Full {
-                request.body.clone()
-            } else {
-                Vec::new()
-            },
-            authorization_header: request
-                .authorization_header
-                .clone()
-                .map(|header| match header {
-                    AuthorizationHeader::OAuthToken {
-                        service_account_email,
-                        scope,
-                    } => pb::http_request::AuthorizationHeader::OauthToken(pb::OAuthToken {
-                        service_account_email,
-                        scope,
-                    }),
-                    AuthorizationHeader::OidcToken {
-                        service_account_email,
-                        audience,
-                    } => pb::http_request::AuthorizationHeader::OidcToken(pb::OidcToken {
-                        service_account_email,
-                        audience,
-                    }),
-                }),
-        })),
+        message_type: Some(message_type),
         schedule_time: Some(timestamp(task.schedule_time)),
         create_time: Some(Timestamp {
             seconds: create_time.as_secs() as i64,
             nanos: 0,
         }),
-        dispatch_deadline: Some(proto_duration(task.dispatch_deadline)),
+        dispatch_deadline: dispatch_deadline.map(proto_duration),
         dispatch_count: task.dispatch_count as i32,
         response_count: task.response_count as i32,
         first_attempt: task.first_attempt.map(|dispatch_time| pb::Attempt {

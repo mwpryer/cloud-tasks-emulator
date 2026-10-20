@@ -3,8 +3,8 @@ mod support;
 use std::time::{Duration, SystemTime};
 
 use cloud_tasks_emulator::proto::google::cloud::tasks::v2::{
-    CreateQueueRequest, CreateTaskRequest, HttpRequest, OidcToken, Queue, RetryConfig, Task,
-    http_request, task,
+    AppEngineHttpRequest, AppEngineRouting, CreateQueueRequest, CreateTaskRequest, HttpMethod,
+    HttpRequest, OidcToken, Queue, RetryConfig, Task, http_request, task,
 };
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
@@ -35,6 +35,25 @@ fn create(url: &str) -> CreateTaskRequest {
             ..Default::default()
         }),
         response_view: task::View::Unspecified.into(),
+    }
+}
+
+fn create_app_engine(request: AppEngineHttpRequest) -> CreateTaskRequest {
+    CreateTaskRequest {
+        parent: "projects/p/locations/l/queues/q".to_owned(),
+        task: Some(Task {
+            name: "projects/p/locations/l/queues/q/tasks/t".to_owned(),
+            message_type: Some(task::MessageType::AppEngineHttpRequest(request)),
+            ..Default::default()
+        }),
+        response_view: task::View::Unspecified.into(),
+    }
+}
+
+fn relative(relative_uri: &str) -> AppEngineHttpRequest {
+    AppEngineHttpRequest {
+        relative_uri: relative_uri.to_owned(),
+        ..Default::default()
     }
 }
 
@@ -106,7 +125,7 @@ async fn first_retry_waits_min_backoff() {
 
 #[tokio::test]
 async fn oidc_token_verifies_with_discovered_keys() {
-    let (mut client, url) = support::start_emulator_with_url().await;
+    let (mut client, url) = support::start_emulator_with(None).await;
     let receiver = support::Receiver::start().await;
     client.create_queue(queue(None)).await.unwrap();
     let request = CreateTaskRequest {
@@ -154,4 +173,110 @@ async fn oidc_token_verifies_with_discovered_keys() {
         claims.unwrap().claims["email"],
         "tasks@p.iam.gserviceaccount.com"
     );
+}
+
+#[tokio::test]
+async fn app_engine_task_goes_to_app_engine_url() {
+    let receiver = support::Receiver::start().await;
+    let (mut client, _) = support::start_emulator_with(Some(&receiver.url)).await;
+    client.create_queue(queue(None)).await.unwrap();
+    let request = create_app_engine(AppEngineHttpRequest {
+        http_method: HttpMethod::Put.into(),
+        app_engine_routing: Some(AppEngineRouting {
+            service: "worker".to_owned(),
+            ..Default::default()
+        }),
+        relative_uri: "/t/200?x=1".to_owned(),
+        headers: [("X-Custom".to_owned(), "value".to_owned())].into(),
+        body: b"hi".to_vec(),
+    });
+
+    client.create_task(request).await.unwrap();
+
+    let received = &receiver.wait_for("t", 1).await[0];
+    let header = |name: &str| received.headers[name].to_str().unwrap();
+    assert_eq!(
+        (
+            received.method.as_str(),
+            received.path.as_str(),
+            received.query.as_deref(),
+            [
+                header("x-appengine-queuename"),
+                header("x-appengine-taskname"),
+                header("x-appengine-taskretrycount"),
+                header("x-appengine-taskexecutioncount"),
+                header("user-agent"),
+                header("content-type"),
+                header("x-custom"),
+            ],
+            &received.body[..],
+        ),
+        (
+            "PUT",
+            "/t/200",
+            Some("x=1"),
+            [
+                "q",
+                "t",
+                "0",
+                "0",
+                "AppEngine-Google; (+http://code.google.com/appengine)",
+                "application/octet-stream",
+                "value",
+            ],
+            &b"hi"[..],
+        )
+    );
+}
+
+#[tokio::test]
+async fn app_engine_task_does_not_follow_redirects() {
+    let receiver = support::Receiver::start().await;
+    let (mut client, _) = support::start_emulator_with(Some(&receiver.url)).await;
+    // An hour's backoff keeps the task from a second attempt
+    client
+        .create_queue(queue(Some(RetryConfig {
+            min_backoff: Some(prost_types::Duration {
+                seconds: 3600,
+                nanos: 0,
+            }),
+            ..Default::default()
+        })))
+        .await
+        .unwrap();
+    client
+        .create_task(create_app_engine(relative("/t/redirect")))
+        .await
+        .unwrap();
+
+    support::poll_task(
+        &mut client,
+        "projects/p/locations/l/queues/q/tasks/t",
+        |task| {
+            task.dispatch_count == 1
+                && task
+                    .last_attempt
+                    .as_ref()
+                    .unwrap()
+                    .response_status
+                    .is_some()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(receiver.received("t").len(), 1);
+}
+
+#[tokio::test]
+async fn app_engine_task_needs_app_engine_url() {
+    let mut client = support::start_emulator().await;
+    client.create_queue(queue(None)).await.unwrap();
+
+    let status = client
+        .create_task(create_app_engine(relative("/work")))
+        .await
+        .unwrap_err();
+
+    assert_eq!(status.code(), Code::NotFound);
 }

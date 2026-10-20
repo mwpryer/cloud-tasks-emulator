@@ -1,0 +1,20 @@
+14s -> InvalidArgument: Task.dispatchDeadline must be between [15s, 24h15s].
+15s -> Some(
+    Duration {
+        seconds: 15,
+        nanos: 0,
+    },
+)
+24h -> Some(
+    Duration {
+        seconds: 86400,
+        nanos: 0,
+    },
+)
+24h15s -> Some(
+    Duration {
+        seconds: 86415,
+        nanos: 0,
+    },
+)
+24h16s -> InvalidArgument: Task.dispatchDeadline must be between [15s, 24h15s].

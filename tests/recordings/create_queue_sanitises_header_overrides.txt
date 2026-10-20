@@ -1,0 +1,115 @@
+override without header -> Some(
+    HttpTarget {
+        uri_override: None,
+        http_method: Unspecified,
+        header_overrides: [],
+        authorization_header: None,
+    },
+)
+empty key -> InvalidArgument: Error in parsing HttpTarget.headers. Header name cannot be empty or start with reserved prefixes. Invalid headers found: 
+empty value -> Some(
+    HttpTarget {
+        uri_override: None,
+        http_method: Unspecified,
+        header_overrides: [
+            HeaderOverride {
+                header: Some(
+                    Header {
+                        key: "X-Custom",
+                        value: "",
+                    },
+                ),
+            },
+        ],
+        authorization_header: None,
+    },
+)
+key with colon -> InvalidArgument: Error in parsing HttpTarget.headers. Header name cannot be empty or start with reserved prefixes. Invalid headers found: X:Custom
+value with line break -> Some(
+    HttpTarget {
+        uri_override: None,
+        http_method: Unspecified,
+        header_overrides: [
+            HeaderOverride {
+                header: Some(
+                    Header {
+                        key: "X-Custom",
+                        value: "a\r\nb",
+                    },
+                ),
+            },
+        ],
+        authorization_header: None,
+    },
+)
+duplicate keys -> Some(
+    HttpTarget {
+        uri_override: None,
+        http_method: Unspecified,
+        header_overrides: [
+            HeaderOverride {
+                header: Some(
+                    Header {
+                        key: "X-Custom",
+                        value: "first",
+                    },
+                ),
+            },
+            HeaderOverride {
+                header: Some(
+                    Header {
+                        key: "x-custom",
+                        value: "second",
+                    },
+                ),
+            },
+        ],
+        authorization_header: None,
+    },
+)
+Host -> InvalidArgument: Error in parsing HttpTarget.headers. Header name cannot be empty or start with reserved prefixes. Invalid headers found: Host
+lowercase host -> InvalidArgument: Error in parsing HttpTarget.headers. Header name cannot be empty or start with reserved prefixes. Invalid headers found: host
+User-Agent -> InvalidArgument: Error in parsing HttpTarget.headers. Header name cannot be empty or start with reserved prefixes. Invalid headers found: User-Agent
+Content-Length -> InvalidArgument: Error in parsing HttpTarget.headers. Header name cannot be empty or start with reserved prefixes. Invalid headers found: Content-Length
+Content-Type -> Some(
+    HttpTarget {
+        uri_override: None,
+        http_method: Unspecified,
+        header_overrides: [
+            HeaderOverride {
+                header: Some(
+                    Header {
+                        key: "Content-Type",
+                        value: "text/plain",
+                    },
+                ),
+            },
+        ],
+        authorization_header: None,
+    },
+)
+Authorization -> Some(
+    HttpTarget {
+        uri_override: None,
+        http_method: Unspecified,
+        header_overrides: [
+            HeaderOverride {
+                header: Some(
+                    Header {
+                        key: "Authorization",
+                        value: "Bearer token",
+                    },
+                ),
+            },
+        ],
+        authorization_header: None,
+    },
+)
+Connection -> InvalidArgument: Error in parsing HttpTarget.headers. Header name cannot be empty or start with reserved prefixes. Invalid headers found: Connection
+Transfer-Encoding -> InvalidArgument: Error in parsing HttpTarget.headers. Header name cannot be empty or start with reserved prefixes. Invalid headers found: Transfer-Encoding
+X-Forwarded-For -> InvalidArgument: Error in parsing HttpTarget.headers. Header name cannot be empty or start with reserved prefixes. Invalid headers found: X-Forwarded-For
+X-Google-Custom -> InvalidArgument: Error in parsing HttpTarget.headers. Header name cannot be empty or start with reserved prefixes. Invalid headers found: X-Google-Custom
+X-AppEngine-Custom -> InvalidArgument: Error in parsing HttpTarget.headers. Header name cannot be empty or start with reserved prefixes. Invalid headers found: X-AppEngine-Custom
+X-CloudTasks-TaskName -> InvalidArgument: Error in parsing HttpTarget.headers. Header name cannot be empty or start with reserved prefixes. Invalid headers found: X-CloudTasks-TaskName
+X-CloudTasks-Custom -> InvalidArgument: Error in parsing HttpTarget.headers. Header name cannot be empty or start with reserved prefixes. Invalid headers found: X-CloudTasks-Custom
+two reserved headers -> InvalidArgument: Error in parsing HttpTarget.headers. Header name cannot be empty or start with reserved prefixes. Invalid headers found: User-Agent, Host

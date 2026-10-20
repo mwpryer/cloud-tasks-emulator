@@ -14,11 +14,13 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use cloud_tasks_emulator::proto::google::cloud::tasks::v2::cloud_tasks_client::CloudTasksClient;
 use cloud_tasks_emulator::proto::google::cloud::tasks::v2::{
-    CreateQueueRequest, CreateTaskRequest, DeleteQueueRequest, DeleteTaskRequest, GetQueueRequest,
-    GetTaskRequest, HttpMethod, HttpRequest, ListQueuesRequest, ListQueuesResponse,
-    ListTasksRequest, ListTasksResponse, OAuthToken, OidcToken, PauseQueueRequest,
-    PurgeQueueRequest, Queue, RateLimits, ResumeQueueRequest, RetryConfig, RunTaskRequest, Task,
-    UpdateQueueRequest, http_request, queue, task,
+    AppEngineHttpRequest, AppEngineRouting, CreateQueueRequest, CreateTaskRequest,
+    DeleteQueueRequest, DeleteTaskRequest, GetQueueRequest, GetTaskRequest, HttpMethod,
+    HttpRequest, HttpTarget, ListQueuesRequest, ListQueuesResponse, ListTasksRequest,
+    ListTasksResponse, OAuthToken, OidcToken, PathOverride, PauseQueueRequest, PurgeQueueRequest,
+    QueryOverride, Queue, RateLimits, ResumeQueueRequest, RetryConfig, RunTaskRequest,
+    StackdriverLoggingConfig, Task, UpdateQueueRequest, UriOverride, http_request, http_target,
+    queue, task, uri_override,
 };
 use prost_types::{Duration, FieldMask, Timestamp};
 use serde_json::Value;
@@ -35,16 +37,18 @@ const RECORDINGS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/recordings"
 
 #[tokio::test]
 async fn emulator_matches_recordings() {
-    let (client, url) = support::start_emulator_with_url().await;
-    let target = Target::new(
+    let receiver = Receiver::start().await;
+    let (client, url) = support::start_emulator_with(Some(&receiver.url)).await;
+    let mut target = Target::new(
         client,
         MetadataMap::new(),
         "emulator-project",
         "emulator-location",
         "tasks@emulator-project.iam.gserviceaccount.com",
         &url,
-        Receiver::start().await,
+        receiver,
     );
+    target.discover_app_domain().await;
 
     let results: Vec<_> = run_cases(&target)
         .await
@@ -96,6 +100,7 @@ async fn record() {
         receiver,
     );
 
+    target.discover_app_domain().await;
     let results = run_cases(&target).await;
     // Deletes by the run's prefix, so a case that panicked leaks nothing
     let prefix = target.queue_name("");
@@ -277,6 +282,29 @@ impl Target {
             schedule_time: Some(self.tomorrow),
             ..Default::default()
         }
+    }
+
+    fn app_engine_task(&self, request: AppEngineHttpRequest) -> Task {
+        Task {
+            message_type: Some(task::MessageType::AppEngineHttpRequest(request)),
+            schedule_time: Some(self.tomorrow),
+            ..Default::default()
+        }
+    }
+
+    /// Learns the app's domain, which an App Engine task without routing reports as its host
+    async fn discover_app_domain(&mut self) {
+        let queue = self.queue("app-domain").await;
+        let request = CreateTaskRequest {
+            parent: queue,
+            task: Some(self.app_engine_task(AppEngineHttpRequest::default())),
+            response_view: task::View::Unspecified.into(),
+        };
+        let task = self.create_task(request).await.unwrap();
+        let Some(task::MessageType::AppEngineHttpRequest(request)) = task.message_type else {
+            panic!("{task:?} is an App Engine task");
+        };
+        self.placeholder(request.app_engine_routing.unwrap().host, "{app_domain}");
     }
 
     /// Replaces `value` with `placeholder` in this case's transcript
@@ -569,6 +597,24 @@ cases!(
     create_task_returns_oauth_token,
     create_task_rejects_invalid_tokens,
     dispatch_sends_oidc_token,
+    create_queue_limits_sampling_ratio,
+    create_queue_returns_http_target,
+    create_queue_rejects_invalid_http_target,
+    create_queue_sanitises_header_overrides,
+    update_queue_changes_http_target,
+    create_task_takes_queue_token,
+    dispatch_applies_http_target,
+    dispatch_applies_http_target_to_existing_tasks,
+    list_queues_filters_by_target,
+    create_task_returns_app_engine_request,
+    create_task_parses_app_engine_routing,
+    create_task_sanitises_app_engine_headers,
+    create_task_rejects_invalid_app_engine_requests,
+    create_task_limits_app_engine_deadline,
+    create_task_ignores_queue_targets_for_app_engine,
+    create_queue_keeps_one_target,
+    create_queue_returns_routing_override,
+    update_queue_changes_routing_override,
 );
 
 fn http(url: &str) -> HttpRequest {
@@ -2189,15 +2235,7 @@ async fn update_queue_ignores_output_only_fields(t: &mut Target) {
         })
         .await
         .unwrap();
-    for path in [
-        "name",
-        "state",
-        "purge_time",
-        "rate_limits.max_burst_size",
-        "app_engine_routing_override",
-        "http_target",
-        "stackdriver_logging_config",
-    ] {
+    for path in ["name", "state", "purge_time", "rate_limits.max_burst_size"] {
         let request = UpdateQueueRequest {
             queue: Some(Queue {
                 name: name.clone(),
@@ -2301,6 +2339,10 @@ async fn update_queue_rejects_invalid_requests(t: &mut Target) {
             update(&["rate_limits.bogus"], Queue::default()),
         ),
         (
+            "unknown http_target mask path",
+            update(&["http_target.bogus"], Queue::default()),
+        ),
+        (
             "mask path below a scalar",
             update(
                 &["rate_limits.max_dispatches_per_second.bogus"],
@@ -2330,6 +2372,51 @@ async fn update_queue_rejects_invalid_requests(t: &mut Target) {
                 Queue {
                     rate_limits: Some(RateLimits {
                         max_dispatches_per_second: 501.0,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ),
+        ),
+        (
+            "invalid http_target outside mask",
+            update(
+                &["rate_limits"],
+                Queue {
+                    http_target: Some(HttpTarget {
+                        uri_override: Some(UriOverride {
+                            host: Some(String::new()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ),
+        ),
+        (
+            "uri override emptied by mask",
+            update(
+                &["http_target.uri_override.host"],
+                Queue {
+                    http_target: Some(HttpTarget {
+                        uri_override: Some(UriOverride {
+                            port: Some(8080),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ),
+        ),
+        (
+            "oidc email emptied by mask",
+            update(
+                &["http_target.oidc_token.service_account_email"],
+                Queue {
+                    http_target: Some(HttpTarget {
+                        authorization_header: queue_oauth(&t.service_account, ""),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -3370,5 +3457,1305 @@ async fn dispatch_sends_oidc_token(t: &mut Target) {
             })
             .collect();
         t.record(key, Ok::<_, Status>(tokens));
+    }
+}
+
+async fn create_queue_limits_sampling_ratio(t: &mut Target) {
+    for (label, sampling_ratio) in [
+        ("0", 0.0),
+        ("0.25", 0.25),
+        ("1", 1.0),
+        ("1.5", 1.5),
+        ("-0.5", -0.5),
+        ("NaN", f64::NAN),
+    ] {
+        let request = CreateQueueRequest {
+            parent: t.parent.clone(),
+            queue: Some(Queue {
+                name: t.queue_name(&format!("sampling-{}", label.replace(['.', '-'], ""))),
+                stackdriver_logging_config: Some(StackdriverLoggingConfig { sampling_ratio }),
+                ..Default::default()
+            }),
+        };
+
+        let result = t.create_queue(request).await;
+
+        t.record(label, result.map(|queue| queue.stackdriver_logging_config));
+    }
+}
+
+fn header_override(key: &str, value: &str) -> http_target::HeaderOverride {
+    http_target::HeaderOverride {
+        header: Some(http_target::Header {
+            key: key.to_owned(),
+            value: value.to_owned(),
+        }),
+    }
+}
+
+fn queue_oidc(service_account: &str, audience: &str) -> Option<http_target::AuthorizationHeader> {
+    Some(http_target::AuthorizationHeader::OidcToken(OidcToken {
+        service_account_email: service_account.to_owned(),
+        audience: audience.to_owned(),
+    }))
+}
+
+fn queue_oauth(service_account: &str, scope: &str) -> Option<http_target::AuthorizationHeader> {
+    Some(http_target::AuthorizationHeader::OauthToken(OAuthToken {
+        service_account_email: service_account.to_owned(),
+        scope: scope.to_owned(),
+    }))
+}
+
+/// Creates a queue for each target and records what it stored
+async fn record_http_targets(t: &mut Target, prefix: &str, targets: Vec<(&str, HttpTarget)>) {
+    for (label, http_target) in targets {
+        let request = CreateQueueRequest {
+            parent: t.parent.clone(),
+            queue: Some(Queue {
+                name: t.queue_name(&format!(
+                    "{prefix}-{}",
+                    label.replace(|c: char| !c.is_ascii_alphanumeric(), "-")
+                )),
+                http_target: Some(http_target),
+                ..Default::default()
+            }),
+        };
+
+        let result = t.create_queue(request).await;
+
+        t.record(label, result.map(|queue| queue.http_target));
+    }
+}
+
+async fn create_queue_returns_http_target(t: &mut Target) {
+    let account = t.service_account.clone();
+    let targets = vec![
+        (
+            "every field",
+            HttpTarget {
+                uri_override: Some(UriOverride {
+                    scheme: Some(uri_override::Scheme::Http.into()),
+                    host: Some("example.net".to_owned()),
+                    port: Some(8080),
+                    path_override: Some(PathOverride {
+                        path: "/path".to_owned(),
+                    }),
+                    query_override: Some(QueryOverride {
+                        query_params: "a=1&b=2".to_owned(),
+                    }),
+                    uri_override_enforce_mode: uri_override::UriOverrideEnforceMode::IfNotExists
+                        .into(),
+                }),
+                http_method: HttpMethod::Put.into(),
+                header_overrides: vec![
+                    header_override("X-Custom", "queue"),
+                    header_override("Content-Type", "text/plain"),
+                ],
+                authorization_header: queue_oidc(&account, "https://example.com/audience"),
+            },
+        ),
+        ("no fields", HttpTarget::default()),
+        (
+            "empty uri override",
+            HttpTarget {
+                uri_override: Some(UriOverride::default()),
+                ..Default::default()
+            },
+        ),
+        (
+            "uri override clearing port, path and query",
+            HttpTarget {
+                uri_override: Some(UriOverride {
+                    port: Some(0),
+                    path_override: Some(PathOverride::default()),
+                    query_override: Some(QueryOverride::default()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ),
+        (
+            "always enforced",
+            HttpTarget {
+                uri_override: Some(UriOverride {
+                    host: Some("example.net".to_owned()),
+                    uri_override_enforce_mode: uri_override::UriOverrideEnforceMode::Always.into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ),
+        (
+            "unspecified scheme",
+            HttpTarget {
+                uri_override: Some(UriOverride {
+                    scheme: Some(uri_override::Scheme::Unspecified.into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ),
+        (
+            "oidc without audience",
+            HttpTarget {
+                authorization_header: queue_oidc(&account, ""),
+                ..Default::default()
+            },
+        ),
+        (
+            "oauth with scope",
+            HttpTarget {
+                authorization_header: queue_oauth(
+                    &account,
+                    "https://www.googleapis.com/auth/userinfo.email",
+                ),
+                ..Default::default()
+            },
+        ),
+        (
+            "oauth without scope",
+            HttpTarget {
+                authorization_header: queue_oauth(&account, ""),
+                ..Default::default()
+            },
+        ),
+    ];
+
+    record_http_targets(t, "target", targets).await;
+}
+
+async fn create_queue_rejects_invalid_http_target(t: &mut Target) {
+    let account = t.service_account.clone();
+    let uri = |uri_override: UriOverride| HttpTarget {
+        uri_override: Some(uri_override),
+        ..Default::default()
+    };
+    let host = |host: &str| {
+        uri(UriOverride {
+            host: Some(host.to_owned()),
+            ..Default::default()
+        })
+    };
+    let path = |path: &str| {
+        uri(UriOverride {
+            path_override: Some(PathOverride {
+                path: path.to_owned(),
+            }),
+            ..Default::default()
+        })
+    };
+    let token = |authorization_header| HttpTarget {
+        authorization_header,
+        ..Default::default()
+    };
+    let targets = vec![
+        ("empty host", host("")),
+        ("host with scheme", host("https://example.net")),
+        ("host with port", host("example.net:8080")),
+        ("host with path", host("example.net/path")),
+        (
+            "port -1",
+            uri(UriOverride {
+                port: Some(-1),
+                ..Default::default()
+            }),
+        ),
+        (
+            "port 65536",
+            uri(UriOverride {
+                port: Some(65536),
+                ..Default::default()
+            }),
+        ),
+        ("path without slash", path("path")),
+        ("path with space", path("/a b")),
+        (
+            "query with question mark",
+            uri(UriOverride {
+                query_override: Some(QueryOverride {
+                    query_params: "?a=1".to_owned(),
+                }),
+                ..Default::default()
+            }),
+        ),
+        (
+            "unknown scheme",
+            uri(UriOverride {
+                scheme: Some(9),
+                ..Default::default()
+            }),
+        ),
+        (
+            "unknown enforce mode",
+            uri(UriOverride {
+                host: Some("example.net".to_owned()),
+                uri_override_enforce_mode: 9,
+                ..Default::default()
+            }),
+        ),
+        (
+            "unknown http method",
+            HttpTarget {
+                http_method: 99,
+                ..Default::default()
+            },
+        ),
+        (
+            "oidc without email",
+            token(queue_oidc("", "https://example.com/audience")),
+        ),
+        (
+            "oidc with malformed email",
+            token(queue_oidc("not-an-email", "https://example.com/audience")),
+        ),
+        (
+            "oidc with audience without scheme",
+            token(queue_oidc(&account, "audience")),
+        ),
+        ("oauth without email", token(queue_oauth("", ""))),
+        (
+            "oauth with malformed email",
+            token(queue_oauth("not-an-email", "")),
+        ),
+        (
+            "oauth with scope without scheme",
+            token(queue_oauth(&account, "scope")),
+        ),
+    ];
+
+    record_http_targets(t, "invalid", targets).await;
+}
+
+async fn create_queue_sanitises_header_overrides(t: &mut Target) {
+    let headers = |overrides: Vec<http_target::HeaderOverride>| HttpTarget {
+        header_overrides: overrides,
+        ..Default::default()
+    };
+    let targets = vec![
+        (
+            "override without header",
+            headers(vec![http_target::HeaderOverride { header: None }]),
+        ),
+        ("empty key", headers(vec![header_override("", "value")])),
+        (
+            "empty value",
+            headers(vec![header_override("X-Custom", "")]),
+        ),
+        (
+            "key with colon",
+            headers(vec![header_override("X:Custom", "value")]),
+        ),
+        (
+            "value with line break",
+            headers(vec![header_override("X-Custom", "a\r\nb")]),
+        ),
+        (
+            "duplicate keys",
+            headers(vec![
+                header_override("X-Custom", "first"),
+                header_override("x-custom", "second"),
+            ]),
+        ),
+        (
+            "Host",
+            headers(vec![header_override("Host", "example.net")]),
+        ),
+        (
+            "lowercase host",
+            headers(vec![header_override("host", "example.net")]),
+        ),
+        (
+            "User-Agent",
+            headers(vec![header_override("User-Agent", "agent")]),
+        ),
+        (
+            "Content-Length",
+            headers(vec![header_override("Content-Length", "5")]),
+        ),
+        (
+            "Content-Type",
+            headers(vec![header_override("Content-Type", "text/plain")]),
+        ),
+        (
+            "Authorization",
+            headers(vec![header_override("Authorization", "Bearer token")]),
+        ),
+        (
+            "Connection",
+            headers(vec![header_override("Connection", "close")]),
+        ),
+        (
+            "Transfer-Encoding",
+            headers(vec![header_override("Transfer-Encoding", "chunked")]),
+        ),
+        (
+            "X-Forwarded-For",
+            headers(vec![header_override("X-Forwarded-For", "127.0.0.1")]),
+        ),
+        (
+            "X-Google-Custom",
+            headers(vec![header_override("X-Google-Custom", "value")]),
+        ),
+        (
+            "X-AppEngine-Custom",
+            headers(vec![header_override("X-AppEngine-Custom", "value")]),
+        ),
+        (
+            "X-CloudTasks-TaskName",
+            headers(vec![header_override("X-CloudTasks-TaskName", "spoofed")]),
+        ),
+        (
+            "X-CloudTasks-Custom",
+            headers(vec![header_override("X-CloudTasks-Custom", "value")]),
+        ),
+    ];
+
+    record_http_targets(t, "headers", targets).await;
+
+    // Real Cloud Tasks lists invalid headers in varying order
+    let result = retry_until!(
+        t.create_queue(CreateQueueRequest {
+            parent: t.parent.clone(),
+            queue: Some(Queue {
+                name: t.queue_name("headers-two-reserved"),
+                http_target: Some(headers(vec![
+                    header_override("User-Agent", "agent"),
+                    header_override("Host", "example.net"),
+                ])),
+                ..Default::default()
+            }),
+        }),
+        |result: &Result<Queue, Status>| result
+            .as_ref()
+            .is_err_and(|status| status.message().ends_with("User-Agent, Host"))
+    );
+    t.record(
+        "two reserved headers",
+        result.map(|queue| queue.http_target),
+    );
+}
+
+async fn update_queue_changes_http_target(t: &mut Target) {
+    let account = t.service_account.clone();
+    let created = Queue {
+        http_target: Some(HttpTarget {
+            uri_override: Some(UriOverride {
+                host: Some("example.net".to_owned()),
+                path_override: Some(PathOverride {
+                    path: "/path".to_owned(),
+                }),
+                ..Default::default()
+            }),
+            http_method: HttpMethod::Put.into(),
+            header_overrides: vec![header_override("X-Custom", "created")],
+            authorization_header: queue_oidc(&account, "https://example.com/audience"),
+        }),
+        stackdriver_logging_config: Some(StackdriverLoggingConfig {
+            sampling_ratio: 0.5,
+        }),
+        ..Default::default()
+    };
+    let update = Queue {
+        http_target: Some(HttpTarget {
+            uri_override: Some(UriOverride {
+                scheme: Some(uri_override::Scheme::Https.into()),
+                port: Some(8080),
+                query_override: Some(QueryOverride {
+                    query_params: "u=1".to_owned(),
+                }),
+                ..Default::default()
+            }),
+            http_method: HttpMethod::Get.into(),
+            header_overrides: vec![header_override("X-Other", "updated")],
+            authorization_header: queue_oauth(
+                &account,
+                "https://www.googleapis.com/auth/userinfo.email",
+            ),
+        }),
+        stackdriver_logging_config: Some(StackdriverLoggingConfig {
+            sampling_ratio: 0.25,
+        }),
+        ..Default::default()
+    };
+    for (path, update) in [
+        ("http_target", update.clone()),
+        ("http_target.uri_override", update.clone()),
+        ("http_target.uri_override.scheme", update.clone()),
+        ("http_target.uri_override.host", update.clone()),
+        ("http_target.uri_override.port", update.clone()),
+        ("http_target.uri_override.path_override", update.clone()),
+        (
+            "http_target.uri_override.path_override.path",
+            update.clone(),
+        ),
+        (
+            "http_target.uri_override.query_override.query_params",
+            update.clone(),
+        ),
+        (
+            "http_target.uri_override.uri_override_enforce_mode",
+            update.clone(),
+        ),
+        ("http_target.http_method", update.clone()),
+        ("http_target.header_overrides", update.clone()),
+        ("http_target.oidc_token", update.clone()),
+        ("http_target.oidc_token.audience", update.clone()),
+        ("http_target.oauth_token", update.clone()),
+        ("http_target.oauth_token.scope", update.clone()),
+        ("stackdriver_logging_config", update.clone()),
+        ("stackdriver_logging_config.sampling_ratio", update.clone()),
+        ("http_target removed", Queue::default()),
+    ] {
+        let name = t
+            .queue_with(
+                &format!("update-{}", path.replace(['.', '_', ' '], "-")),
+                created.clone(),
+            )
+            .await;
+        let request = UpdateQueueRequest {
+            queue: Some(Queue { name, ..update }),
+            update_mask: mask(&[path.split(' ').next().unwrap()]),
+        };
+
+        let result = t.update_queue(request).await;
+
+        t.record(
+            path,
+            result.map(|queue| (queue.http_target, queue.stackdriver_logging_config)),
+        );
+    }
+}
+
+async fn create_task_takes_queue_token(t: &mut Target) {
+    let account = t.service_account.clone();
+    let token = |authorization_header| HttpTarget {
+        authorization_header,
+        ..Default::default()
+    };
+    for (label, http_target, http_request) in [
+        (
+            "oidc replaces task oauth",
+            token(queue_oidc(&account, "https://example.com/audience")),
+            HttpRequest {
+                authorization_header: oauth(&account, ""),
+                ..with_headers(&[("Authorization", "Bearer token")])
+            },
+        ),
+        (
+            "oidc replaces invalid task token",
+            token(queue_oidc(&account, "https://example.com/audience")),
+            HttpRequest {
+                authorization_header: oidc("", ""),
+                ..http("https://example.com/work")
+            },
+        ),
+        (
+            "oidc without audience",
+            token(queue_oidc(&account, "")),
+            http("https://example.com/work?query"),
+        ),
+        (
+            "oidc without audience under uri override",
+            HttpTarget {
+                uri_override: Some(UriOverride {
+                    host: Some("example.net".to_owned()),
+                    path_override: Some(PathOverride {
+                        path: "/path".to_owned(),
+                    }),
+                    ..Default::default()
+                }),
+                authorization_header: queue_oidc(&account, ""),
+                ..Default::default()
+            },
+            http("https://example.com/work"),
+        ),
+        (
+            "oauth without scope",
+            token(queue_oauth(&account, "")),
+            http("https://example.googleapis.com/work"),
+        ),
+        (
+            "oauth to other host",
+            token(queue_oauth(&account, "")),
+            http("https://example.com/work"),
+        ),
+        (
+            "no queue token keeps task token",
+            HttpTarget {
+                http_method: HttpMethod::Put.into(),
+                ..Default::default()
+            },
+            HttpRequest {
+                authorization_header: oidc(&account, "https://example.com/audience"),
+                ..http("https://example.com/work")
+            },
+        ),
+        (
+            "get override keeps task method and body",
+            HttpTarget {
+                http_method: HttpMethod::Get.into(),
+                ..Default::default()
+            },
+            HttpRequest {
+                body: b"hi".to_vec(),
+                ..http("https://example.com/work")
+            },
+        ),
+    ] {
+        let queue = t
+            .queue_with(
+                &format!("task-{}", label.replace(' ', "-")),
+                Queue {
+                    http_target: Some(http_target),
+                    ..Default::default()
+                },
+            )
+            .await;
+        let request = CreateTaskRequest {
+            parent: queue,
+            task: Some(t.task("", http_request)),
+            response_view: task::View::Full.into(),
+        };
+
+        let result = t.create_task(request).await;
+
+        t.record(label, result.map(|task| task.message_type));
+    }
+}
+
+/// Points the task URL at the receiver's `path`
+fn to_receiver(t: &Target, path: &str) -> UriOverride {
+    let url = reqwest::Url::parse(&t.receiver.url).unwrap();
+    UriOverride {
+        scheme: Some(
+            match url.scheme() {
+                "http" => uri_override::Scheme::Http,
+                _ => uri_override::Scheme::Https,
+            }
+            .into(),
+        ),
+        host: Some(url.host_str().unwrap().to_owned()),
+        port: url.port().map(i64::from),
+        path_override: Some(PathOverride {
+            path: path.to_owned(),
+        }),
+        ..Default::default()
+    }
+}
+
+/// What a handler sees of a request, with any token as its decoded claims
+fn handled(t: &mut Target, request: &Received) -> impl Debug + use<> {
+    let headers: BTreeMap<_, _> = request
+        .headers
+        .iter()
+        .filter(|(name, _)| {
+            ["content-type", "user-agent", "x-custom", "x-other"].contains(&name.as_str())
+        })
+        .map(|(name, value)| (name.to_string(), value.to_str().unwrap().to_owned()))
+        .collect();
+    let tokens: Vec<_> = request
+        .headers
+        .get_all("authorization")
+        .iter()
+        .map(|value| {
+            let (scheme, token) = value.to_str().unwrap().split_once(' ').unwrap();
+            (scheme.to_owned(), decode_jwt(t, token).1)
+        })
+        .collect();
+    (
+        request.method.clone(),
+        request.path.clone(),
+        request.query.clone(),
+        headers,
+        String::from_utf8_lossy(&request.body).into_owned(),
+        tokens,
+    )
+}
+
+async fn dispatch_applies_http_target(t: &mut Target) {
+    let account = t.service_account.clone();
+    let always = t
+        .queue_with(
+            "target-always",
+            Queue {
+                http_target: Some(HttpTarget {
+                    uri_override: Some(UriOverride {
+                        query_override: Some(QueryOverride {
+                            query_params: "q=1".to_owned(),
+                        }),
+                        ..to_receiver(t, "/target-always/overridden/200")
+                    }),
+                    http_method: HttpMethod::Put.into(),
+                    header_overrides: vec![
+                        header_override("X-Custom", "queue"),
+                        header_override("X-Other", "queue"),
+                    ],
+                    authorization_header: queue_oidc(&account, "https://example.com/audience"),
+                }),
+                ..Default::default()
+            },
+        )
+        .await;
+    let if_not_exists = t
+        .queue_with(
+            "target-if-not-exists",
+            Queue {
+                http_target: Some(HttpTarget {
+                    uri_override: Some(UriOverride {
+                        path_override: Some(PathOverride {
+                            path: "/target-if-not-exists/overridden/200".to_owned(),
+                        }),
+                        query_override: Some(QueryOverride {
+                            query_params: "q=1".to_owned(),
+                        }),
+                        uri_override_enforce_mode:
+                            uri_override::UriOverrideEnforceMode::IfNotExists.into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await;
+    let get = t
+        .queue_with(
+            "target-get",
+            Queue {
+                http_target: Some(HttpTarget {
+                    http_method: HttpMethod::Get.into(),
+                    ..Default::default()
+                }),
+                // An hour's backoff keeps a failed task, and its last attempt
+                retry_config: Some(RetryConfig {
+                    max_attempts: 2,
+                    min_backoff: seconds(3600),
+                    max_backoff: seconds(3600),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await;
+    for (queue, id, http_request) in [
+        (
+            &always,
+            "with-headers",
+            HttpRequest {
+                http_method: HttpMethod::Post.into(),
+                headers: BTreeMap::from([
+                    ("X-Custom".to_owned(), "task".to_owned()),
+                    ("Content-Type".to_owned(), "text/plain".to_owned()),
+                ]),
+                body: b"hi".to_vec(),
+                ..http("https://example.com/target-always/kept/200?b=2")
+            },
+        ),
+        (
+            &always,
+            "without-headers",
+            http("https://example.com/target-always/kept/200"),
+        ),
+        (
+            &if_not_exists,
+            "t",
+            http(&t.receiver.url_for("target-if-not-exists/kept", "200")),
+        ),
+        (
+            &get,
+            "with-body",
+            HttpRequest {
+                body: b"hi".to_vec(),
+                ..http(&t.receiver.url_for("target-get", "200"))
+            },
+        ),
+        (
+            &get,
+            "without-body",
+            HttpRequest {
+                headers: BTreeMap::from([("Content-Type".to_owned(), "text/plain".to_owned())]),
+                ..http(&t.receiver.url_for("target-get", "200"))
+            },
+        ),
+    ] {
+        let request = CreateTaskRequest {
+            parent: queue.clone(),
+            task: Some(Task {
+                name: format!("{queue}/tasks/{id}"),
+                message_type: Some(task::MessageType::HttpRequest(http_request)),
+                ..Default::default()
+            }),
+            response_view: task::View::Unspecified.into(),
+        };
+        t.create_task(request).await.unwrap();
+    }
+
+    for (key, count) in [
+        ("target-always", 2),
+        ("target-if-not-exists", 1),
+        ("target-get", 1),
+    ] {
+        let mut requests = t.receiver.wait_for(key, count).await;
+        requests.sort_by_key(|request| request.headers["x-cloudtasks-taskname"].clone());
+        for request in &requests {
+            let label = format!("{key} {:?}", request.headers["x-cloudtasks-taskname"]);
+            let request = handled(t, request);
+            t.record(&label, Ok::<_, Status>(request));
+        }
+    }
+    let with_body = t
+        .poll_task(&format!("{get}/tasks/with-body"), |result| {
+            result.as_ref().is_ok_and(|task| {
+                task.last_attempt
+                    .as_ref()
+                    .is_some_and(|attempt| attempt.response_status.is_some())
+            })
+        })
+        .await;
+    t.record(
+        "target-get with body",
+        with_body.map(|task| task.last_attempt.unwrap().response_status),
+    );
+}
+
+async fn dispatch_applies_http_target_to_existing_tasks(t: &mut Target) {
+    let account = t.service_account.clone();
+    let queue = t
+        .queue_with(
+            "target-existing",
+            Queue {
+                retry_config: Some(RetryConfig {
+                    max_attempts: -1,
+                    min_backoff: seconds(1),
+                    max_backoff: seconds(5),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await;
+    t.pause_queue(PauseQueueRequest {
+        name: queue.clone(),
+    })
+    .await
+    .unwrap();
+    t.create_task(CreateTaskRequest {
+        parent: queue.clone(),
+        task: Some(due_task(
+            &format!("{queue}/tasks/t"),
+            "https://unreachable.invalid/target-existing/kept/200".to_owned(),
+        )),
+        response_view: task::View::Unspecified.into(),
+    })
+    .await
+    .unwrap();
+    t.update_queue(UpdateQueueRequest {
+        queue: Some(Queue {
+            name: queue.clone(),
+            http_target: Some(HttpTarget {
+                uri_override: Some(to_receiver(t, "/target-existing/overridden/200")),
+                authorization_header: queue_oidc(&account, "https://example.com/audience"),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        update_mask: mask(&["http_target"]),
+    })
+    .await
+    .unwrap();
+
+    t.resume_queue(ResumeQueueRequest {
+        name: queue.clone(),
+    })
+    .await
+    .unwrap();
+
+    // Real Cloud Tasks takes minutes to apply an update, so earlier attempts fail on the old URL
+    let request = tokio::time::timeout(std::time::Duration::from_secs(300), async {
+        loop {
+            if let Some(request) = t.receiver.received("target-existing").pop() {
+                return request;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    })
+    .await
+    .expect("real Cloud Tasks applies the update in time");
+    let request = handled(t, &request);
+    t.record("request", Ok::<_, Status>(request));
+}
+
+async fn list_queues_filters_by_target(t: &mut Target) {
+    let account = t.service_account.clone();
+    t.queue_with(
+        "target-filter-full",
+        Queue {
+            http_target: Some(HttpTarget {
+                uri_override: Some(UriOverride {
+                    host: Some("example.net".to_owned()),
+                    port: Some(8080),
+                    path_override: Some(PathOverride {
+                        path: "/path".to_owned(),
+                    }),
+                    ..Default::default()
+                }),
+                http_method: HttpMethod::Put.into(),
+                header_overrides: vec![header_override("X-Custom", "queue")],
+                authorization_header: queue_oidc(&account, "https://example.com/audience"),
+            }),
+            stackdriver_logging_config: Some(StackdriverLoggingConfig {
+                sampling_ratio: 0.5,
+            }),
+            ..Default::default()
+        },
+    )
+    .await;
+    t.queue_with(
+        "target-filter-routed",
+        Queue {
+            app_engine_routing_override: routing("worker", "v1", ""),
+            ..Default::default()
+        },
+    )
+    .await;
+    t.queue_with(
+        "target-filter-empty",
+        Queue {
+            http_target: Some(HttpTarget::default()),
+            ..Default::default()
+        },
+    )
+    .await;
+    t.queue("target-filter-none").await;
+    for filter in [
+        "http_target: *",
+        "http_target.http_method = PUT",
+        "http_target.http_method: put",
+        "http_target.http_method = HTTP_METHOD_UNSPECIFIED",
+        "http_target.http_method > POST",
+        "http_target.uri_override: *",
+        "http_target.uri_override.host: example",
+        "http_target.uri_override.host: *",
+        "http_target.uri_override.port = 8080",
+        "http_target.uri_override.scheme = HTTPS",
+        "http_target.uri_override.scheme = SCHEME_UNSPECIFIED",
+        "http_target.uri_override.uri_override_enforce_mode = URI_OVERRIDE_ENFORCE_MODE_UNSPECIFIED",
+        "http_target.uri_override.path_override: *",
+        "http_target.uri_override.path_override.path: path",
+        "http_target.header_overrides: *",
+        "http_target.header_overrides.header.key: X-Custom",
+        "http_target.oidc_token: *",
+        "http_target.oidc_token.audience: example",
+        "http_target.oauth_token: *",
+        "stackdriver_logging_config: *",
+        "stackdriver_logging_config.sampling_ratio > 0.1",
+        "stackdriver_logging_config.sampling_ratio = 0",
+        "app_engine_routing_override: *",
+        "app_engine_routing_override.service: worker",
+        "app_engine_routing_override.instance: *",
+        "app_engine_routing_override.host: worker",
+    ] {
+        let result = filtered_queue_names(t, filter, "-target-filter-").await;
+
+        t.record(filter, result);
+    }
+}
+
+fn routing(service: &str, version: &str, instance: &str) -> Option<AppEngineRouting> {
+    Some(AppEngineRouting {
+        service: service.to_owned(),
+        version: version.to_owned(),
+        instance: instance.to_owned(),
+        host: String::new(),
+    })
+}
+
+fn app_engine_request(message_type: Option<task::MessageType>) -> AppEngineHttpRequest {
+    match message_type {
+        Some(task::MessageType::AppEngineHttpRequest(request)) => request,
+        message_type => panic!("{message_type:?} is an App Engine request"),
+    }
+}
+
+async fn create_task_returns_app_engine_request(t: &mut Target) {
+    let queue = t.queue("app-engine").await;
+    let every_field = AppEngineHttpRequest {
+        http_method: HttpMethod::Put.into(),
+        app_engine_routing: routing("svc", "ver", "inst"),
+        relative_uri: "/work?x=1".to_owned(),
+        headers: BTreeMap::from([
+            ("X-Custom".to_owned(), "value".to_owned()),
+            ("Content-Type".to_owned(), "application/json".to_owned()),
+            ("User-Agent".to_owned(), "agent".to_owned()),
+        ]),
+        body: b"hi".to_vec(),
+    };
+    for (label, view, request) in [
+        ("every field", task::View::Full, every_field.clone()),
+        ("basic view", task::View::Basic, every_field),
+        (
+            "no fields",
+            task::View::Full,
+            AppEngineHttpRequest::default(),
+        ),
+        (
+            "body without content type",
+            task::View::Full,
+            AppEngineHttpRequest {
+                body: b"hi".to_vec(),
+                ..Default::default()
+            },
+        ),
+    ] {
+        let request = CreateTaskRequest {
+            parent: queue.clone(),
+            task: Some(t.app_engine_task(request)),
+            response_view: view.into(),
+        };
+
+        let result = t.create_task(request).await;
+
+        t.record(
+            label,
+            result.map(|task| (task.message_type, task.dispatch_deadline)),
+        );
+    }
+}
+
+async fn create_task_parses_app_engine_routing(t: &mut Target) {
+    let queue = t.queue("app-engine-routing").await;
+    for (label, app_engine_routing) in [
+        ("service", routing("svc", "", "")),
+        ("version", routing("", "ver", "")),
+        ("instance", routing("", "", "inst")),
+        ("service and version", routing("svc", "ver", "")),
+        ("service and instance", routing("svc", "", "inst")),
+        ("version and instance", routing("", "ver", "inst")),
+        ("every field", routing("svc", "ver", "inst")),
+        (
+            "host",
+            Some(AppEngineRouting {
+                host: "example.com".to_owned(),
+                ..Default::default()
+            }),
+        ),
+    ] {
+        let request = CreateTaskRequest {
+            parent: queue.clone(),
+            task: Some(t.app_engine_task(AppEngineHttpRequest {
+                app_engine_routing,
+                ..Default::default()
+            })),
+            response_view: task::View::Unspecified.into(),
+        };
+
+        let result = t.create_task(request).await;
+
+        t.record(
+            label,
+            result.map(|task| app_engine_request(task.message_type).app_engine_routing),
+        );
+    }
+}
+
+async fn create_task_sanitises_app_engine_headers(t: &mut Target) {
+    let queue = t.queue("app-engine-headers").await;
+    for (name, value) in [
+        ("Host", "example.net"),
+        ("X-Google-Custom", "value"),
+        ("X-AppEngine-Custom", "value"),
+        ("X-CloudTasks-TaskName", "spoofed"),
+        ("Connection", "close"),
+        ("Accept-Encoding", "gzip"),
+        ("X-Forwarded-For", "127.0.0.1"),
+        ("Content-Length", "5"),
+        ("user-agent", "agent"),
+        ("content-type", "text/plain"),
+        ("X-Empty", ""),
+        ("X-Line-Break", "a\r\nb"),
+    ] {
+        let request = CreateTaskRequest {
+            parent: queue.clone(),
+            task: Some(t.app_engine_task(AppEngineHttpRequest {
+                headers: BTreeMap::from([(name.to_owned(), value.to_owned())]),
+                body: b"hi".to_vec(),
+                ..Default::default()
+            })),
+            response_view: task::View::Unspecified.into(),
+        };
+
+        let result = t.create_task(request).await;
+
+        t.record(
+            name,
+            result.map(|task| app_engine_request(task.message_type).headers),
+        );
+    }
+}
+
+async fn create_task_rejects_invalid_app_engine_requests(t: &mut Target) {
+    let queue = t.queue("app-engine-invalid").await;
+    let uri = |relative_uri: &str| AppEngineHttpRequest {
+        relative_uri: relative_uri.to_owned(),
+        ..Default::default()
+    };
+    let with_body = |http_method: HttpMethod| AppEngineHttpRequest {
+        http_method: http_method.into(),
+        body: b"hi".to_vec(),
+        ..Default::default()
+    };
+    let routed = |app_engine_routing| AppEngineHttpRequest {
+        app_engine_routing,
+        ..Default::default()
+    };
+    for (label, request) in [
+        ("relative uri without slash", uri("work")),
+        ("relative uri with space", uri("/a b")),
+        ("relative uri with fragment", uri("/work#part")),
+        (
+            "relative uri of 2083 characters",
+            uri(&format!("/{}", "a".repeat(2082))),
+        ),
+        (
+            "relative uri of 2084 characters",
+            uri(&format!("/{}", "a".repeat(2083))),
+        ),
+        (
+            "unknown method",
+            AppEngineHttpRequest {
+                http_method: 99,
+                ..Default::default()
+            },
+        ),
+        ("GET with body", with_body(HttpMethod::Get)),
+        ("PATCH with body", with_body(HttpMethod::Patch)),
+        ("DELETE with body", with_body(HttpMethod::Delete)),
+        (
+            "service with underscore",
+            routed(routing("not_valid", "", "")),
+        ),
+        ("service with dot", routed(routing("a.b", "", ""))),
+        ("uppercase version", routed(routing("svc", "V1", ""))),
+    ] {
+        let request = CreateTaskRequest {
+            parent: queue.clone(),
+            task: Some(t.app_engine_task(request)),
+            response_view: task::View::Unspecified.into(),
+        };
+
+        let result = t.create_task(request).await;
+
+        t.record(
+            label,
+            result.map(|task| {
+                let request = app_engine_request(task.message_type);
+                (
+                    request.relative_uri.len(),
+                    request.relative_uri.chars().take(20).collect::<String>(),
+                    request.http_method,
+                    request.app_engine_routing,
+                )
+            }),
+        );
+    }
+}
+
+async fn create_task_limits_app_engine_deadline(t: &mut Target) {
+    let queue = t.queue("app-engine-deadline").await;
+    for (label, deadline) in [
+        ("14s", seconds(14)),
+        ("15s", seconds(15)),
+        ("24h", seconds(24 * 60 * 60)),
+        ("24h15s", seconds(24 * 60 * 60 + 15)),
+        ("24h16s", seconds(24 * 60 * 60 + 16)),
+    ] {
+        let request = CreateTaskRequest {
+            parent: queue.clone(),
+            task: Some(Task {
+                dispatch_deadline: deadline,
+                ..t.app_engine_task(AppEngineHttpRequest::default())
+            }),
+            response_view: task::View::Unspecified.into(),
+        };
+
+        let result = t.create_task(request).await;
+
+        t.record(label, result.map(|task| task.dispatch_deadline));
+    }
+}
+
+async fn create_task_ignores_queue_targets_for_app_engine(t: &mut Target) {
+    let account = t.service_account.clone();
+    let routed = t
+        .queue_with(
+            "app-engine-routed",
+            Queue {
+                app_engine_routing_override: routing("worker", "v1", ""),
+                ..Default::default()
+            },
+        )
+        .await;
+    let targeted = t
+        .queue_with(
+            "app-engine-targeted",
+            Queue {
+                http_target: Some(HttpTarget {
+                    http_method: HttpMethod::Put.into(),
+                    header_overrides: vec![header_override("X-Custom", "queue")],
+                    authorization_header: queue_oidc(&account, "https://example.com/audience"),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await;
+    for (label, queue) in [("routing override", routed), ("http target", targeted)] {
+        let request = CreateTaskRequest {
+            parent: queue,
+            task: Some(t.app_engine_task(AppEngineHttpRequest {
+                app_engine_routing: routing("svc", "ver", ""),
+                ..Default::default()
+            })),
+            response_view: task::View::Full.into(),
+        };
+
+        let result = t.create_task(request).await;
+
+        t.record(label, result.map(|task| task.message_type));
+    }
+}
+
+async fn create_queue_keeps_one_target(t: &mut Target) {
+    let http_target = Some(HttpTarget {
+        http_method: HttpMethod::Put.into(),
+        ..Default::default()
+    });
+    let both = t
+        .create_queue(CreateQueueRequest {
+            parent: t.parent.clone(),
+            queue: Some(Queue {
+                name: t.queue_name("one-target-both"),
+                app_engine_routing_override: routing("worker", "", ""),
+                http_target: http_target.clone(),
+                ..Default::default()
+            }),
+        })
+        .await;
+    let routed = t
+        .queue_with(
+            "one-target-routed",
+            Queue {
+                app_engine_routing_override: routing("worker", "", ""),
+                ..Default::default()
+            },
+        )
+        .await;
+    let targeted = t
+        .queue_with(
+            "one-target-targeted",
+            Queue {
+                http_target: http_target.clone(),
+                ..Default::default()
+            },
+        )
+        .await;
+    let target_added = t
+        .update_queue(UpdateQueueRequest {
+            queue: Some(Queue {
+                name: routed,
+                http_target,
+                ..Default::default()
+            }),
+            update_mask: mask(&["http_target"]),
+        })
+        .await;
+    let routing_added = t
+        .update_queue(UpdateQueueRequest {
+            queue: Some(Queue {
+                name: targeted,
+                app_engine_routing_override: routing("worker", "", ""),
+                ..Default::default()
+            }),
+            update_mask: mask(&["app_engine_routing_override"]),
+        })
+        .await;
+
+    for (label, result) in [
+        ("create with both", both),
+        ("http target added to routed queue", target_added),
+        ("routing override added to targeted queue", routing_added),
+    ] {
+        t.record(
+            label,
+            result.map(|queue| (queue.app_engine_routing_override, queue.http_target)),
+        );
+    }
+}
+
+async fn create_queue_returns_routing_override(t: &mut Target) {
+    for (label, app_engine_routing_override) in [
+        ("service", routing("worker", "", "")),
+        ("version", routing("", "v1", "")),
+        ("instance", routing("", "", "inst")),
+        ("service and version", routing("worker", "v1", "")),
+        ("every field", routing("worker", "v1", "inst")),
+        ("no fields", Some(AppEngineRouting::default())),
+        (
+            "host",
+            Some(AppEngineRouting {
+                host: "example.com".to_owned(),
+                ..Default::default()
+            }),
+        ),
+        ("service with underscore", routing("not_valid", "", "")),
+        ("service with dot", routing("a.b", "", "")),
+    ] {
+        let request = CreateQueueRequest {
+            parent: t.parent.clone(),
+            queue: Some(Queue {
+                name: t.queue_name(&format!("routing-{}", label.replace(' ', "-"))),
+                app_engine_routing_override,
+                ..Default::default()
+            }),
+        };
+
+        let result = t.create_queue(request).await;
+
+        t.record(label, result.map(|queue| queue.app_engine_routing_override));
+    }
+}
+
+async fn update_queue_changes_routing_override(t: &mut Target) {
+    let created = Queue {
+        app_engine_routing_override: routing("worker", "v1", ""),
+        ..Default::default()
+    };
+    let update = Queue {
+        app_engine_routing_override: routing("other", "", "inst"),
+        ..Default::default()
+    };
+    for (path, update) in [
+        ("app_engine_routing_override", update.clone()),
+        ("app_engine_routing_override.service", update.clone()),
+        ("app_engine_routing_override.version", update.clone()),
+        ("app_engine_routing_override.instance", update.clone()),
+        ("app_engine_routing_override.host", update.clone()),
+        ("app_engine_routing_override removed", Queue::default()),
+    ] {
+        let name = t
+            .queue_with(
+                &format!("update-{}", path.replace(['.', '_', ' '], "-")),
+                created.clone(),
+            )
+            .await;
+        let request = UpdateQueueRequest {
+            queue: Some(Queue { name, ..update }),
+            update_mask: mask(&[path.split(' ').next().unwrap()]),
+        };
+
+        let result = t.update_queue(request).await;
+
+        t.record(path, result.map(|queue| queue.app_engine_routing_override));
     }
 }

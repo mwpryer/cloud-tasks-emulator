@@ -32,3 +32,9 @@ pub(crate) fn is_task_id(id: &str) -> bool {
 pub(crate) fn last_segment(name: &str) -> &str {
     name.rsplit_once('/').map_or(name, |(_, id)| id)
 }
+
+pub(crate) fn project(name: &str) -> &str {
+    name.split('/')
+        .nth(1)
+        .expect("names start with projects/<id>")
+}

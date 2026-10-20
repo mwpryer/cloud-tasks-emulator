@@ -4,8 +4,8 @@ use std::time::{Duration, SystemTime};
 
 use cloud_tasks_emulator::proto::google::cloud::tasks::v2::cloud_tasks_client::CloudTasksClient;
 use cloud_tasks_emulator::proto::google::cloud::tasks::v2::{
-    CreateQueueRequest, CreateTaskRequest, DeleteTaskRequest, GetTaskRequest, HttpRequest,
-    ListTasksRequest, Queue, Task, task,
+    AppEngineHttpRequest, AppEngineRouting, CreateQueueRequest, CreateTaskRequest,
+    DeleteTaskRequest, GetTaskRequest, HttpRequest, ListTasksRequest, Queue, Task, task,
 };
 use prost_types::Timestamp;
 use tonic::Code;
@@ -117,4 +117,47 @@ async fn delete_task_removes_task() {
         .unwrap_err();
 
     assert_eq!(status.code(), Code::NotFound);
+}
+
+#[tokio::test]
+async fn app_engine_host_ends_with_appspot_domain() {
+    let (mut client, _) = support::start_emulator_with(Some("http://127.0.0.1:8080")).await;
+    client
+        .create_queue(CreateQueueRequest {
+            parent: "projects/p/locations/l".to_owned(),
+            queue: Some(Queue {
+                name: "projects/p/locations/l/queues/q".to_owned(),
+                ..Default::default()
+            }),
+        })
+        .await
+        .unwrap();
+    let request = CreateTaskRequest {
+        parent: "projects/p/locations/l/queues/q".to_owned(),
+        task: Some(Task {
+            message_type: Some(task::MessageType::AppEngineHttpRequest(
+                AppEngineHttpRequest {
+                    app_engine_routing: Some(AppEngineRouting {
+                        service: "worker".to_owned(),
+                        version: "v1".to_owned(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )),
+            schedule_time: Some(tomorrow()),
+            ..Default::default()
+        }),
+        response_view: task::View::Unspecified.into(),
+    };
+
+    let task = client.create_task(request).await.unwrap().into_inner();
+
+    let Some(task::MessageType::AppEngineHttpRequest(request)) = task.message_type else {
+        panic!("{task:?} is an App Engine task");
+    };
+    assert_eq!(
+        request.app_engine_routing.unwrap().host,
+        "v1.worker.p.appspot.com"
+    );
 }

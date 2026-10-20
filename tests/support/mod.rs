@@ -14,15 +14,20 @@ use tokio::net::TcpListener;
 use tonic::Status;
 use tonic::transport::Channel;
 
+/// Starts an emulator whose projects have no App Engine app
 pub async fn start_emulator() -> CloudTasksClient<Channel> {
-    start_emulator_with_url().await.0
+    start_emulator_with(None).await.0
 }
 
-/// Starts an emulator whose OIDC issuer is its own URL
-pub async fn start_emulator_with_url() -> (CloudTasksClient<Channel>, String) {
+/// Starts an emulator whose OIDC issuer is its own URL, returned with the client
+pub async fn start_emulator_with(app_engine: Option<&str>) -> (CloudTasksClient<Channel>, String) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(cloud_tasks_emulator::serve(listener, url.clone()));
+    tokio::spawn(cloud_tasks_emulator::serve(
+        listener,
+        url.clone(),
+        app_engine.map(str::to_owned),
+    ));
     let client = CloudTasksClient::connect(url.clone()).await.unwrap();
     (client, url)
 }
@@ -36,6 +41,7 @@ pub struct Receiver {
 #[derive(Clone)]
 pub struct Received {
     pub path: String,
+    pub query: Option<String>,
     pub time: SystemTime,
     pub method: Method,
     pub headers: HeaderMap,
@@ -100,6 +106,7 @@ async fn respond(
             .count();
         requests.push(Received {
             path: path.clone(),
+            query: uri.query().map(str::to_owned),
             time: SystemTime::now(),
             method,
             headers,

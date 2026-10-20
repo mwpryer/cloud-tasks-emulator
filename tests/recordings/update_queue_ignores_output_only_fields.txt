@@ -2,6 +2,3 @@ name -> true
 state -> true
 purge_time -> true
 rate_limits.max_burst_size -> true
-app_engine_routing_override -> true
-http_target -> true
-stackdriver_logging_config -> true

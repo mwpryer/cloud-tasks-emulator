@@ -1,4 +1,35 @@
 no names -> InvalidArgument: Request contains an invalid argument.
 1001 names -> InvalidArgument: A maximum of 1000 tasks can be handled in a batch, but 1001 were requested.
-empty parent -> InvalidArgument: Invalid resource field value in the request.
-parent not in a project -> PermissionDenied: Permission denied on resource project not-a-valid-name.
+empty parent -> InvalidArgument: Invalid resource field value in the request. [
+    ErrorInfo {
+        reason: "RESOURCE_PROJECT_INVALID",
+        domain: "googleapis.com",
+        metadata: {
+            "method": "google.cloud.tasks.v2.CloudTasks.BatchDeleteTasks",
+            "service": "cloudtasks.googleapis.com",
+        },
+    },
+]
+parent not in a project -> PermissionDenied: Permission denied on resource project not-a-valid-name. [
+    ErrorInfo {
+        reason: "CONSUMER_INVALID",
+        domain: "googleapis.com",
+        metadata: {
+            "consumer": "projects/not-a-valid-name",
+            "containerInfo": "not-a-valid-name",
+            "service": "cloudtasks.googleapis.com",
+        },
+    },
+    LocalizedMessage {
+        locale: "en-US",
+        message: "Permission denied on resource project not-a-valid-name.",
+    },
+    Help {
+        links: [
+            Link {
+                description: "Google developers console",
+                url: "https://console.developers.google.com",
+            },
+        ],
+    },
+]

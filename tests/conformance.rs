@@ -334,7 +334,20 @@ impl Target {
     fn record(&mut self, label: &str, result: Result<impl Debug, Status>) {
         let entry = match result {
             Ok(value) => format!("{value:#?}"),
-            Err(status) => format!("{:?}: {}", status.code(), status.message()),
+            Err(status) => {
+                let entry = format!("{:?}: {}", status.code(), status.message());
+                let details: Vec<Box<dyn Debug>> = rpc::Status::decode(status.details())
+                    .unwrap()
+                    .details
+                    .iter()
+                    .map(detail)
+                    .collect();
+                if details.is_empty() {
+                    entry
+                } else {
+                    format!("{entry} {details:#?}")
+                }
+            }
         };
         self.transcript += &format!("{label} -> {entry}\n");
     }
@@ -693,6 +706,20 @@ fn decode<M: Message + Default, R: Message + Default>(operation: Operation) -> D
 fn unpack<M: Message + Default>(any: Any) -> (String, M) {
     let message = M::decode(any.value.as_slice()).unwrap();
     (any.type_url, message)
+}
+
+fn detail(any: &Any) -> Box<dyn Debug> {
+    let value = any.value.as_slice();
+    match any.type_url.as_str() {
+        "type.googleapis.com/google.rpc.ErrorInfo" => {
+            Box::new(rpc::ErrorInfo::decode(value).unwrap())
+        }
+        "type.googleapis.com/google.rpc.Help" => Box::new(rpc::Help::decode(value).unwrap()),
+        "type.googleapis.com/google.rpc.LocalizedMessage" => {
+            Box::new(rpc::LocalizedMessage::decode(value).unwrap())
+        }
+        url => panic!("{url} is a known detail type"),
+    }
 }
 
 /// Repeats `call` each second until `done` holds, for answers real Cloud Tasks varies between requests
@@ -5577,7 +5604,7 @@ async fn set_iam_policy_checks_etag(t: &mut Target) {
     let cut = |result: Result<Etagged, Status>, at: &str| {
         result.map_err(|status| {
             let (message, _) = status.message().split_once(at).unwrap();
-            Status::new(status.code(), message)
+            Status::with_details(status.code(), message, status.details().to_vec().into())
         })
     };
     t.record("current etag", current.map(|policy| policy.etag));

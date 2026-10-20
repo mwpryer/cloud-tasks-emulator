@@ -1,8 +1,57 @@
-no queue -> InvalidArgument: Invalid resource field value in the request.
-empty name -> InvalidArgument: Invalid resource field value in the request.
-name not in a project -> PermissionDenied: Permission denied on resource project not-a-valid-name.
+no queue -> InvalidArgument: Invalid resource field value in the request. [
+    ErrorInfo {
+        reason: "RESOURCE_PROJECT_INVALID",
+        domain: "googleapis.com",
+        metadata: {
+            "method": "google.cloud.tasks.v2.CloudTasks.UpdateQueue",
+            "service": "cloudtasks.googleapis.com",
+        },
+    },
+]
+empty name -> InvalidArgument: Invalid resource field value in the request. [
+    ErrorInfo {
+        reason: "RESOURCE_PROJECT_INVALID",
+        domain: "googleapis.com",
+        metadata: {
+            "method": "google.cloud.tasks.v2.CloudTasks.UpdateQueue",
+            "service": "cloudtasks.googleapis.com",
+        },
+    },
+]
+name not in a project -> PermissionDenied: Permission denied on resource project not-a-valid-name. [
+    ErrorInfo {
+        reason: "CONSUMER_INVALID",
+        domain: "googleapis.com",
+        metadata: {
+            "consumer": "projects/not-a-valid-name",
+            "containerInfo": "not-a-valid-name",
+            "service": "cloudtasks.googleapis.com",
+        },
+    },
+    LocalizedMessage {
+        locale: "en-US",
+        message: "Permission denied on resource project not-a-valid-name.",
+    },
+    Help {
+        links: [
+            Link {
+                description: "Google developers console",
+                url: "https://console.developers.google.com",
+            },
+        ],
+    },
+]
 name without queue id -> PermissionDenied: The principal (user or service account) lacks IAM permission "cloudtasks.queues.update" for the resource "projects/{project}/locations/{location}/queues" (or the resource may not exist).
-invalid queue id -> InvalidArgument: Queue ID "not_valid" can contain only letters ([A-Za-z]), numbers ([0-9]), or hyphens (-). Queue ID must be between 1 and 100 characters.
+invalid queue id -> InvalidArgument: Queue ID "not_valid" can contain only letters ([A-Za-z]), numbers ([0-9]), or hyphens (-). Queue ID must be between 1 and 100 characters. [
+    Help {
+        links: [
+            Link {
+                description: "Definition of queue ID",
+                url: "https://cloud.google.com/tasks/docs/reference/rest/v2/projects.locations.queues#Queue.FIELDS.name",
+            },
+        ],
+    },
+]
 unknown mask path on unknown queue -> InvalidArgument: Invalid mask: bogus
 unknown mask path -> InvalidArgument: Invalid mask: bogus
 unknown nested mask path -> InvalidArgument: Invalid mask: rate_limits.bogus
@@ -13,8 +62,24 @@ comma-separated mask paths -> InvalidArgument: Invalid mask: rate_limits.max_dis
 mask path with space -> InvalidArgument: Invalid mask:  state
 empty mask path -> InvalidArgument: Invalid mask: 
 rate 501 -> InvalidArgument: RateLimits.maxDispatchesPerSecond must be less than or equal to 500.
-invalid http_target outside mask -> InvalidArgument: Error in parsing HttpTarget. Invalid Host.
-uri override emptied by mask -> InvalidArgument: Error in parsing HttpTarget. Invalid uri_override.
+invalid http_target outside mask -> InvalidArgument: Error in parsing HttpTarget. Invalid Host. [
+    ErrorInfo {
+        reason: "INVALID_INPUT_ON_HTTP_TARGET_OVERRIDE",
+        domain: "cloudtasks.googleapis.com",
+        metadata: {
+            "invalid_field": "Invalid Host.",
+        },
+    },
+]
+uri override emptied by mask -> InvalidArgument: Error in parsing HttpTarget. Invalid uri_override. [
+    ErrorInfo {
+        reason: "INVALID_INPUT_ON_HTTP_TARGET_OVERRIDE",
+        domain: "cloudtasks.googleapis.com",
+        metadata: {
+            "invalid_field": "Invalid uri_override.",
+        },
+    },
+]
 oidc email emptied by mask -> Queue {
     name: "projects/{project}/locations/{location}/queues/{run}-update-invalid",
     app_engine_routing_override: None,

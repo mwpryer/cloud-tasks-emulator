@@ -1,8 +1,48 @@
-empty host -> InvalidArgument: Error in parsing HttpTarget. Invalid Host.
-host with scheme -> InvalidArgument: Error in parsing HttpTarget. Invalid Host.
-host with port -> InvalidArgument: Error in parsing HttpTarget. Invalid Host.
-host with path -> InvalidArgument: Error in parsing HttpTarget. Invalid Host.
-port -1 -> InvalidArgument: Error in parsing HttpTarget. Port number should be a positive integer.
+empty host -> InvalidArgument: Error in parsing HttpTarget. Invalid Host. [
+    ErrorInfo {
+        reason: "INVALID_INPUT_ON_HTTP_TARGET_OVERRIDE",
+        domain: "cloudtasks.googleapis.com",
+        metadata: {
+            "invalid_field": "Invalid Host.",
+        },
+    },
+]
+host with scheme -> InvalidArgument: Error in parsing HttpTarget. Invalid Host. [
+    ErrorInfo {
+        reason: "INVALID_INPUT_ON_HTTP_TARGET_OVERRIDE",
+        domain: "cloudtasks.googleapis.com",
+        metadata: {
+            "invalid_field": "Invalid Host.",
+        },
+    },
+]
+host with port -> InvalidArgument: Error in parsing HttpTarget. Invalid Host. [
+    ErrorInfo {
+        reason: "INVALID_INPUT_ON_HTTP_TARGET_OVERRIDE",
+        domain: "cloudtasks.googleapis.com",
+        metadata: {
+            "invalid_field": "Invalid Host.",
+        },
+    },
+]
+host with path -> InvalidArgument: Error in parsing HttpTarget. Invalid Host. [
+    ErrorInfo {
+        reason: "INVALID_INPUT_ON_HTTP_TARGET_OVERRIDE",
+        domain: "cloudtasks.googleapis.com",
+        metadata: {
+            "invalid_field": "Invalid Host.",
+        },
+    },
+]
+port -1 -> InvalidArgument: Error in parsing HttpTarget. Port number should be a positive integer. [
+    ErrorInfo {
+        reason: "INVALID_INPUT_ON_HTTP_TARGET_OVERRIDE",
+        domain: "cloudtasks.googleapis.com",
+        metadata: {
+            "invalid_field": "Port number should be a positive integer.",
+        },
+    },
+]
 port 65536 -> Some(
     HttpTarget {
         uri_override: Some(
@@ -85,9 +125,33 @@ query with question mark -> Some(
         authorization_header: None,
     },
 )
-unknown scheme -> InvalidArgument: Error in parsing HttpTarget. 
-unknown enforce mode -> InvalidArgument: Error in parsing HttpTarget. 
-unknown http method -> InvalidArgument: Error in parsing HttpTarget. 
+unknown scheme -> InvalidArgument: Error in parsing HttpTarget.  [
+    ErrorInfo {
+        reason: "INVALID_INPUT_ON_HTTP_TARGET_OVERRIDE",
+        domain: "cloudtasks.googleapis.com",
+        metadata: {
+            "invalid_field": "",
+        },
+    },
+]
+unknown enforce mode -> InvalidArgument: Error in parsing HttpTarget.  [
+    ErrorInfo {
+        reason: "INVALID_INPUT_ON_HTTP_TARGET_OVERRIDE",
+        domain: "cloudtasks.googleapis.com",
+        metadata: {
+            "invalid_field": "",
+        },
+    },
+]
+unknown http method -> InvalidArgument: Error in parsing HttpTarget.  [
+    ErrorInfo {
+        reason: "INVALID_INPUT_ON_HTTP_TARGET_OVERRIDE",
+        domain: "cloudtasks.googleapis.com",
+        metadata: {
+            "invalid_field": "",
+        },
+    },
+]
 oidc without email -> InvalidArgument: service_account_email must be set.
 oidc with malformed email -> InvalidArgument: Request contains an invalid argument.
 oidc with audience without scheme -> Some(

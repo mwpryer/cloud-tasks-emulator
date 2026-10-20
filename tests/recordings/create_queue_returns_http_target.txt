@@ -61,7 +61,15 @@ no fields -> Some(
         authorization_header: None,
     },
 )
-empty uri override -> InvalidArgument: Error in parsing HttpTarget. Invalid uri_override.
+empty uri override -> InvalidArgument: Error in parsing HttpTarget. Invalid uri_override. [
+    ErrorInfo {
+        reason: "INVALID_INPUT_ON_HTTP_TARGET_OVERRIDE",
+        domain: "cloudtasks.googleapis.com",
+        metadata: {
+            "invalid_field": "Invalid uri_override.",
+        },
+    },
+]
 uri override clearing port, path and query -> Some(
     HttpTarget {
         uri_override: Some(

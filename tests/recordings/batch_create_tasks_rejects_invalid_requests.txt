@@ -3,7 +3,47 @@ no requests -> InvalidArgument: Request must contain at least one task.
 request for another queue -> InvalidArgument: All tasks in a batch request must target the same queue. Found task for queue projects/{project}/locations/{location}/queues/{run}-batch-other in batch request for queue projects/{project}/locations/{location}/queues/{run}-batch-invalid.
 request without parent -> InvalidArgument: All tasks in a batch request must target the same queue. Found task for queue  in batch request for queue projects/{project}/locations/{location}/queues/{run}-batch-invalid.
 duplicate task names -> InvalidArgument: Duplicate task name in the batch request: projects/{project}/locations/{location}/queues/{run}-batch-invalid/tasks/t
-invalid task id -> InvalidArgument: Task ID "not valid" can contain only letters ([A-Za-z]), numbers ([0-9]), hyphens (-), or underscores (_). Task ID must between 1 and 500 characters.
+invalid task id -> InvalidArgument: Task ID "not valid" can contain only letters ([A-Za-z]), numbers ([0-9]), hyphens (-), or underscores (_). Task ID must between 1 and 500 characters. [
+    Help {
+        links: [
+            Link {
+                description: "Definition of task ID",
+                url: "https://cloud.google.com/tasks/docs/reference/rest/v2/projects.locations.queues.tasks#Task.FIELDS.name",
+            },
+        ],
+    },
+]
 task named in another queue -> InvalidArgument: The queue name from request ('projects/{project}/locations/{location}/queues/{run}-batch-invalid') must be the same as the queue name in the named task ('projects/{project}/locations/{location}/queues/{run}-batch-other').
-empty parent -> InvalidArgument: Invalid resource field value in the request.
-parent not in a project -> PermissionDenied: Permission denied on resource project not-a-valid-name.
+empty parent -> InvalidArgument: Invalid resource field value in the request. [
+    ErrorInfo {
+        reason: "RESOURCE_PROJECT_INVALID",
+        domain: "googleapis.com",
+        metadata: {
+            "method": "google.cloud.tasks.v2.CloudTasks.BatchCreateTasks",
+            "service": "cloudtasks.googleapis.com",
+        },
+    },
+]
+parent not in a project -> PermissionDenied: Permission denied on resource project not-a-valid-name. [
+    ErrorInfo {
+        reason: "CONSUMER_INVALID",
+        domain: "googleapis.com",
+        metadata: {
+            "consumer": "projects/not-a-valid-name",
+            "containerInfo": "not-a-valid-name",
+            "service": "cloudtasks.googleapis.com",
+        },
+    },
+    LocalizedMessage {
+        locale: "en-US",
+        message: "Permission denied on resource project not-a-valid-name.",
+    },
+    Help {
+        links: [
+            Link {
+                description: "Google developers console",
+                url: "https://console.developers.google.com",
+            },
+        ],
+    },
+]

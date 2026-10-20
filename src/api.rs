@@ -5,8 +5,8 @@ use std::time::{Duration, SystemTime};
 
 use jiff::fmt::strtime::BrokenDownTime;
 use prost::Message;
-use prost_types::Timestamp;
-use tonic::{Request, Response, Status};
+use prost_types::{Any, Timestamp};
+use tonic::{Code, Request, Response, Status};
 
 use crate::filter::{self, Filter};
 use crate::names;
@@ -28,6 +28,8 @@ const QUEUE_RECENTLY_DELETED: &str =
 const TASK_RECENTLY_REMOVED: &str = "The task cannot be created because a task with this name existed too recently. For more information about task de-duplication see https://cloud.google.com/tasks/docs/reference/rest/v2/projects.locations.queues.tasks/create#body.request_body.FIELDS.task.";
 const TASK_GONE: &str = "The task no longer exists, though a task with this name existed recently. The task either successfully completed or was deleted.";
 const NOT_FOUND: &str = "Requested entity was not found.";
+const QUEUE_NAME_DOCS: &str = "https://cloud.google.com/tasks/docs/reference/rest/v2/projects.locations.queues#Queue.FIELDS.name";
+const TASK_NAME_DOCS: &str = "https://cloud.google.com/tasks/docs/reference/rest/v2/projects.locations.queues.tasks#Task.FIELDS.name";
 /// Wording and code are guesses, as recording this needs a Cloud KMS key
 const CMEK_HEADER_OVERRIDES: &str =
     "Queues with HTTP Target Override headers cannot be created or updated while CMEK is enabled.";
@@ -216,7 +218,12 @@ impl CloudTasks for CloudTasksService {
         request: Request<pb::ListQueuesRequest>,
     ) -> Result<Response<pb::ListQueuesResponse>, Status> {
         let request = request.into_inner();
-        resource(&request.parent, names::LOCATION, "cloudtasks.queues.list")?;
+        resource(
+            &request.parent,
+            names::LOCATION,
+            "cloudtasks.queues.list",
+            "google.cloud.tasks.v2.CloudTasks.ListQueues",
+        )?;
         let filter = Filter::parse(&request.filter).map_err(|error| match error {
             filter::Error::Syntax(token) => Status::invalid_argument(format!(
                 "Failed to parse filter expression: syntax error at token '{token}'"
@@ -258,7 +265,12 @@ impl CloudTasks for CloudTasksService {
         request: Request<pb::GetQueueRequest>,
     ) -> Result<Response<pb::Queue>, Status> {
         let request = request.into_inner();
-        resource(&request.name, names::QUEUE, "cloudtasks.queues.get")?;
+        resource(
+            &request.name,
+            names::QUEUE,
+            "cloudtasks.queues.get",
+            "google.cloud.tasks.v2.CloudTasks.GetQueue",
+        )?;
         let state = self.emulator.state.lock().unwrap();
         let queue = state
             .queues
@@ -272,12 +284,19 @@ impl CloudTasks for CloudTasksService {
         request: Request<pb::CreateQueueRequest>,
     ) -> Result<Response<pb::Queue>, Status> {
         let request = request.into_inner();
-        resource(&request.parent, names::LOCATION, "cloudtasks.queues.create")?;
+        resource(
+            &request.parent,
+            names::LOCATION,
+            "cloudtasks.queues.create",
+            "google.cloud.tasks.v2.CloudTasks.CreateQueue",
+        )?;
         // Cloud Tasks reads a missing queue as one with an empty name
         let queue = request.queue.unwrap_or_default();
         let ids = names::ids(&queue.name, names::QUEUE).ok_or_else(|| {
-            Status::invalid_argument(
+            detailed(
+                Code::InvalidArgument,
                 r#"Queue name must be formatted: "projects/<PROJECT_ID>/locations/<LOCATION_ID>/queues/<QUEUE_ID>"."#,
+                vec![help("Definition of queue name", QUEUE_NAME_DOCS)],
             )
         })?;
         check_ids(&ids, names::QUEUE)?;
@@ -346,7 +365,12 @@ impl CloudTasks for CloudTasksService {
         let request = request.into_inner();
         // Cloud Tasks reads a missing queue as one with an empty name
         let update = request.queue.unwrap_or_default();
-        resource(&update.name, names::QUEUE, "cloudtasks.queues.update")?;
+        resource(
+            &update.name,
+            names::QUEUE,
+            "cloudtasks.queues.update",
+            "google.cloud.tasks.v2.CloudTasks.UpdateQueue",
+        )?;
         if update.app_engine_routing_override.is_some() && self.emulator.app_engine.is_none() {
             return Err(no_app_engine(&update.name));
         }
@@ -426,7 +450,12 @@ impl CloudTasks for CloudTasksService {
         request: Request<pb::DeleteQueueRequest>,
     ) -> Result<Response<()>, Status> {
         let request = request.into_inner();
-        resource(&request.name, names::QUEUE, "cloudtasks.queues.delete")?;
+        resource(
+            &request.name,
+            names::QUEUE,
+            "cloudtasks.queues.delete",
+            "google.cloud.tasks.v2.CloudTasks.DeleteQueue",
+        )?;
         let mut state = self.emulator.state.lock().unwrap();
         state
             .queues
@@ -441,7 +470,12 @@ impl CloudTasks for CloudTasksService {
         request: Request<pb::PurgeQueueRequest>,
     ) -> Result<Response<pb::Queue>, Status> {
         let request = request.into_inner();
-        resource(&request.name, names::QUEUE, "cloudtasks.queues.purge")?;
+        resource(
+            &request.name,
+            names::QUEUE,
+            "cloudtasks.queues.purge",
+            "google.cloud.tasks.v2.CloudTasks.PurgeQueue",
+        )?;
         let mut state = self.emulator.state.lock().unwrap();
         let queue = state
             .queues
@@ -456,7 +490,12 @@ impl CloudTasks for CloudTasksService {
         request: Request<pb::PauseQueueRequest>,
     ) -> Result<Response<pb::Queue>, Status> {
         let request = request.into_inner();
-        resource(&request.name, names::QUEUE, "cloudtasks.queues.pause")?;
+        resource(
+            &request.name,
+            names::QUEUE,
+            "cloudtasks.queues.pause",
+            "google.cloud.tasks.v2.CloudTasks.PauseQueue",
+        )?;
         let mut state = self.emulator.state.lock().unwrap();
         let queue = state
             .queues
@@ -471,7 +510,12 @@ impl CloudTasks for CloudTasksService {
         request: Request<pb::ResumeQueueRequest>,
     ) -> Result<Response<pb::Queue>, Status> {
         let request = request.into_inner();
-        resource(&request.name, names::QUEUE, "cloudtasks.queues.resume")?;
+        resource(
+            &request.name,
+            names::QUEUE,
+            "cloudtasks.queues.resume",
+            "google.cloud.tasks.v2.CloudTasks.ResumeQueue",
+        )?;
         let mut state = self.emulator.state.lock().unwrap();
         let queue = state
             .queues
@@ -489,7 +533,12 @@ impl CloudTasks for CloudTasksService {
         request: Request<iam::GetIamPolicyRequest>,
     ) -> Result<Response<iam::Policy>, Status> {
         let request = request.into_inner();
-        resource(&request.resource, names::QUEUE, "cloudtasks.queues.list")?;
+        resource(
+            &request.resource,
+            names::QUEUE,
+            "cloudtasks.queues.list",
+            "google.cloud.tasks.v2.CloudTasks.GetIamPolicy",
+        )?;
         let state = self.emulator.state.lock().unwrap();
         let queue = state
             .queues
@@ -503,7 +552,12 @@ impl CloudTasks for CloudTasksService {
         request: Request<iam::SetIamPolicyRequest>,
     ) -> Result<Response<iam::Policy>, Status> {
         let request = request.into_inner();
-        resource(&request.resource, names::QUEUE, "cloudtasks.queues.list")?;
+        resource(
+            &request.resource,
+            names::QUEUE,
+            "cloudtasks.queues.list",
+            "google.cloud.tasks.v2.CloudTasks.SetIamPolicy",
+        )?;
         // Cloud Tasks reads a missing policy as an empty one
         let policy = request.policy.unwrap_or_default();
         if policy.version > 3 {
@@ -577,7 +631,12 @@ impl CloudTasks for CloudTasksService {
         request: Request<iam::TestIamPermissionsRequest>,
     ) -> Result<Response<iam::TestIamPermissionsResponse>, Status> {
         let request = request.into_inner();
-        resource(&request.resource, names::QUEUE, "cloudtasks.queues.list")?;
+        resource(
+            &request.resource,
+            names::QUEUE,
+            "cloudtasks.queues.list",
+            "google.cloud.tasks.v2.CloudTasks.TestIamPermissions",
+        )?;
         if !self
             .emulator
             .state
@@ -618,7 +677,12 @@ impl CloudTasks for CloudTasksService {
         request: Request<pb::ListTasksRequest>,
     ) -> Result<Response<pb::ListTasksResponse>, Status> {
         let request = request.into_inner();
-        resource(&request.parent, names::QUEUE, "cloudtasks.tasks.list")?;
+        resource(
+            &request.parent,
+            names::QUEUE,
+            "cloudtasks.tasks.list",
+            "google.cloud.tasks.v2.CloudTasks.ListTasks",
+        )?;
         // Unlike create and get, list echoes an unknown view as basic
         let view = match response_view(request.response_view) {
             pb::task::View::Full => pb::task::View::Full,
@@ -650,7 +714,12 @@ impl CloudTasks for CloudTasksService {
         request: Request<pb::GetTaskRequest>,
     ) -> Result<Response<pb::Task>, Status> {
         let request = request.into_inner();
-        resource(&request.name, names::TASK, "cloudtasks.tasks.get")?;
+        resource(
+            &request.name,
+            names::TASK,
+            "cloudtasks.tasks.get",
+            "google.cloud.tasks.v2.CloudTasks.GetTask",
+        )?;
         let view = response_view(request.response_view);
         let mut state = self.emulator.state.lock().unwrap();
         let queue = state
@@ -680,7 +749,12 @@ impl CloudTasks for CloudTasksService {
         request: Request<pb::CreateTaskRequest>,
     ) -> Result<Response<pb::Task>, Status> {
         let request = request.into_inner();
-        resource(&request.parent, names::QUEUE, "cloudtasks.tasks.create")?;
+        resource(
+            &request.parent,
+            names::QUEUE,
+            "cloudtasks.tasks.create",
+            "google.cloud.tasks.v2.CloudTasks.CreateTask",
+        )?;
         // Cloud Tasks reads a missing task as one without a payload
         let task = request.task.unwrap_or_default();
         let name = task_name(&request.parent, &task.name)?;
@@ -702,7 +776,12 @@ impl CloudTasks for CloudTasksService {
         request: Request<pb::BatchCreateTasksRequest>,
     ) -> Result<Response<Operation>, Status> {
         let request = request.into_inner();
-        resource(&request.parent, names::QUEUE, "cloudtasks.tasks.create")?;
+        resource(
+            &request.parent,
+            names::QUEUE,
+            "cloudtasks.tasks.create",
+            "google.cloud.tasks.v2.CloudTasks.BatchCreateTasks",
+        )?;
         if request.requests.is_empty() {
             return Err(Status::invalid_argument(
                 "Request must contain at least one task.",
@@ -797,7 +876,12 @@ impl CloudTasks for CloudTasksService {
         request: Request<pb::DeleteTaskRequest>,
     ) -> Result<Response<()>, Status> {
         let request = request.into_inner();
-        resource(&request.name, names::TASK, "cloudtasks.tasks.delete")?;
+        resource(
+            &request.name,
+            names::TASK,
+            "cloudtasks.tasks.delete",
+            "google.cloud.tasks.v2.CloudTasks.DeleteTask",
+        )?;
         let mut state = self.emulator.state.lock().unwrap();
         state
             .queues
@@ -818,7 +902,12 @@ impl CloudTasks for CloudTasksService {
         request: Request<pb::BatchDeleteTasksRequest>,
     ) -> Result<Response<Operation>, Status> {
         let request = request.into_inner();
-        resource(&request.parent, names::QUEUE, "cloudtasks.tasks.delete")?;
+        resource(
+            &request.parent,
+            names::QUEUE,
+            "cloudtasks.tasks.delete",
+            "google.cloud.tasks.v2.CloudTasks.BatchDeleteTasks",
+        )?;
         if request.names.is_empty() {
             return Err(Status::invalid_argument(
                 "Request contains an invalid argument.",
@@ -912,7 +1001,12 @@ impl CloudTasks for CloudTasksService {
         request: Request<pb::RunTaskRequest>,
     ) -> Result<Response<pb::Task>, Status> {
         let request = request.into_inner();
-        resource(&request.name, names::TASK, "cloudtasks.tasks.run")?;
+        resource(
+            &request.name,
+            names::TASK,
+            "cloudtasks.tasks.run",
+            "google.cloud.tasks.v2.CloudTasks.RunTask",
+        )?;
         let view = response_view(request.response_view);
         let mut state = self.emulator.state.lock().unwrap();
         let task = state
@@ -947,7 +1041,10 @@ impl CloudTasks for CloudTasksService {
     ) -> Result<Response<pb::CmekConfig>, Status> {
         // Cloud Tasks reads a missing config as one with an empty name
         let config = request.into_inner().cmek_config.unwrap_or_default();
-        let location = cmek_location(&config.name)?;
+        let location = cmek_location(
+            &config.name,
+            "google.cloud.tasks.v2.CloudTasks.UpdateCmekConfig",
+        )?;
         let mut state = self.emulator.state.lock().unwrap();
         if config.kms_key.is_empty() {
             state.cmek_keys.remove(location);
@@ -962,8 +1059,14 @@ impl CloudTasks for CloudTasksService {
                     .as_ref()
                     .is_some_and(|target| !target.header_overrides.is_empty())
         }) {
-            return Err(Status::failed_precondition(
+            return Err(detailed(
+                Code::FailedPrecondition,
                 "CMEK cannot be enabled on any project that has one or more queues with HTTP Target Override headers or tasks ttl of more than 60 days.",
+                vec![error_info(
+                    "UNSATISFIED_PRECONDITION_FOR_CMEK",
+                    "cloudtasks.googleapis.com",
+                    &[],
+                )],
             ));
         }
         let key_ring = &["projects", "locations", "keyRings"];
@@ -1006,7 +1109,10 @@ impl CloudTasks for CloudTasksService {
         request: Request<pb::GetCmekConfigRequest>,
     ) -> Result<Response<pb::CmekConfig>, Status> {
         let request = request.into_inner();
-        let location = cmek_location(&request.name)?;
+        let location = cmek_location(
+            &request.name,
+            "google.cloud.tasks.v2.CloudTasks.GetCmekConfig",
+        )?;
         let state = self.emulator.state.lock().unwrap();
         let kms_key = state.cmek_keys.get(location).cloned().unwrap_or_default();
         Ok(Response::new(pb::CmekConfig {
@@ -1033,7 +1139,12 @@ impl Operations for OperationsService {
         request: Request<longrunning::GetOperationRequest>,
     ) -> Result<Response<Operation>, Status> {
         let request = request.into_inner();
-        resource(&request.name, names::OPERATION, "cloudtasks.operations.get")?;
+        resource(
+            &request.name,
+            names::OPERATION,
+            "cloudtasks.operations.get",
+            "google.longrunning.Operations.GetOperation",
+        )?;
         let state = self.emulator.state.lock().unwrap();
         let operation = state
             .operations
@@ -1072,8 +1183,13 @@ impl Operations for OperationsService {
 }
 
 /// Rejects a malformed name the way Google's front end does, then checks its IDs as Cloud Tasks does
-fn resource(name: &str, collections: &[&str], permission: &str) -> Result<(), Status> {
-    check_project(name)?;
+fn resource(
+    name: &str,
+    collections: &[&str],
+    permission: &str,
+    method: &str,
+) -> Result<(), Status> {
+    check_project(name, method)?;
     let ids = names::ids(name, collections).ok_or_else(|| {
         Status::permission_denied(format!(
             r#"The principal (user or service account) lacks IAM permission "{permission}" for the resource "{name}" (or the resource may not exist)."#
@@ -1082,24 +1198,93 @@ fn resource(name: &str, collections: &[&str], permission: &str) -> Result<(), St
     check_ids(&ids, collections)
 }
 
-/// Rejects an empty name or one outside a project, the way Google's front end does
-fn check_project(name: &str) -> Result<(), Status> {
+/// Rejects an empty name or one outside a project, the way Google's front end does for `method`
+fn check_project(name: &str, method: &str) -> Result<(), Status> {
     if name.is_empty() {
-        return Err(Status::invalid_argument(
+        return Err(detailed(
+            Code::InvalidArgument,
             "Invalid resource field value in the request.",
+            vec![error_info(
+                "RESOURCE_PROJECT_INVALID",
+                "googleapis.com",
+                &[("method", method), ("service", "cloudtasks.googleapis.com")],
+            )],
         ));
     }
     if !name.starts_with("projects/") {
-        return Err(Status::permission_denied(format!(
-            "Permission denied on resource project {name}."
-        )));
+        let message = format!("Permission denied on resource project {name}.");
+        let localized = rpc::LocalizedMessage {
+            locale: "en-US".to_owned(),
+            message: message.clone(),
+        };
+        return Err(detailed(
+            Code::PermissionDenied,
+            &message,
+            vec![
+                error_info(
+                    "CONSUMER_INVALID",
+                    "googleapis.com",
+                    &[
+                        ("consumer", &format!("projects/{name}")),
+                        ("containerInfo", name),
+                        ("service", "cloudtasks.googleapis.com"),
+                    ],
+                ),
+                Any {
+                    type_url: "type.googleapis.com/google.rpc.LocalizedMessage".to_owned(),
+                    value: localized.encode_to_vec(),
+                },
+                help(
+                    "Google developers console",
+                    "https://console.developers.google.com",
+                ),
+            ],
+        ));
     }
     Ok(())
 }
 
+/// A status with `details`, which clients read from the `grpc-status-details-bin` trailer
+fn detailed(code: Code, message: &str, details: Vec<Any>) -> Status {
+    let status = rpc::Status {
+        code: code as i32,
+        message: message.to_owned(),
+        details,
+    };
+    Status::with_details(code, message, status.encode_to_vec().into())
+}
+
+fn error_info(reason: &str, domain: &str, metadata: &[(&str, &str)]) -> Any {
+    let info = rpc::ErrorInfo {
+        reason: reason.to_owned(),
+        domain: domain.to_owned(),
+        metadata: metadata
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect(),
+    };
+    Any {
+        type_url: "type.googleapis.com/google.rpc.ErrorInfo".to_owned(),
+        value: info.encode_to_vec(),
+    }
+}
+
+fn help(description: &str, url: &str) -> Any {
+    let help = rpc::Help {
+        links: vec![rpc::help::Link {
+            description: description.to_owned(),
+            url: url.to_owned(),
+        }],
+    };
+    Any {
+        type_url: "type.googleapis.com/google.rpc.Help".to_owned(),
+        value: help.encode_to_vec(),
+    }
+}
+
 /// Checks a CMEK config name and returns its location's name
-fn cmek_location(name: &str) -> Result<&str, Status> {
-    check_project(name)?;
+fn cmek_location<'a>(name: &'a str, method: &str) -> Result<&'a str, Status> {
+    check_project(name, method)?;
     name.strip_suffix("/cmekConfig")
         .filter(|location| names::ids(location, names::LOCATION).is_some())
         .ok_or_else(|| {
@@ -1121,8 +1306,10 @@ fn task_name(parent: &str, name: &str) -> Result<String, Status> {
 
 fn check_task_name(name: &str) -> Result<(), Status> {
     let ids = names::ids(name, names::TASK).ok_or_else(|| {
-        Status::invalid_argument(
+        detailed(
+            Code::InvalidArgument,
             r#"Task name must be formatted: "projects/<PROJECT_ID>/locations/<LOCATION_ID>/queues/<QUEUE_ID>/tasks/<TASK_ID>"."#,
+            vec![help("Definition of task name", TASK_NAME_DOCS)],
         )
     })?;
     check_ids(&ids, names::TASK)
@@ -1159,19 +1346,27 @@ fn operation_name(state: &State, parent: &str, request_id: String) -> Result<Str
 /// Checks the queue, task and operation IDs among the IDs of a name in these collections
 fn check_ids(ids: &[&str], collections: &[&str]) -> Result<(), Status> {
     for (collection, id) in collections.iter().zip(ids) {
-        let message = match *collection {
-            "queues" if !names::is_queue_id(id) => format!(
-                "Queue ID \"{id}\" can contain only letters ([A-Za-z]), numbers ([0-9]), or hyphens (-). Queue ID must be between 1 and 100 characters."
+        let status = match *collection {
+            "queues" if !names::is_queue_id(id) => detailed(
+                Code::InvalidArgument,
+                &format!(
+                    "Queue ID \"{id}\" can contain only letters ([A-Za-z]), numbers ([0-9]), or hyphens (-). Queue ID must be between 1 and 100 characters."
+                ),
+                vec![help("Definition of queue ID", QUEUE_NAME_DOCS)],
             ),
-            "tasks" if !names::is_task_id(id) => format!(
-                "Task ID \"{id}\" can contain only letters ([A-Za-z]), numbers ([0-9]), hyphens (-), or underscores (_). Task ID must between 1 and 500 characters."
+            "tasks" if !names::is_task_id(id) => detailed(
+                Code::InvalidArgument,
+                &format!(
+                    "Task ID \"{id}\" can contain only letters ([A-Za-z]), numbers ([0-9]), hyphens (-), or underscores (_). Task ID must between 1 and 500 characters."
+                ),
+                vec![help("Definition of task ID", TASK_NAME_DOCS)],
             ),
-            "operations" if !names::is_operation_id(id) => format!(
+            "operations" if !names::is_operation_id(id) => Status::invalid_argument(format!(
                 "Operation ID \"{id}\" can contain only letters ([A-Za-z]), numbers ([0-9]), hyphens (-), or underscores (_). Operation ID must be between 1 and 100 characters."
-            ),
+            )),
             _ => continue,
         };
-        return Err(Status::invalid_argument(message));
+        return Err(status);
     }
     Ok(())
 }
@@ -1793,8 +1988,17 @@ fn check_http_target(target: &pb::HttpTarget) -> Result<(), Status> {
 }
 
 fn http_target(target: pb::HttpTarget) -> Result<HttpTarget, Status> {
-    let parse_error =
-        |detail: &str| Status::invalid_argument(format!("Error in parsing HttpTarget. {detail}"));
+    let parse_error = |detail: &str| {
+        detailed(
+            Code::InvalidArgument,
+            &format!("Error in parsing HttpTarget. {detail}"),
+            vec![error_info(
+                "INVALID_INPUT_ON_HTTP_TARGET_OVERRIDE",
+                "cloudtasks.googleapis.com",
+                &[("invalid_field", detail)],
+            )],
+        )
+    };
     let uri_override = target
         .uri_override
         .map(|uri| {

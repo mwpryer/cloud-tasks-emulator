@@ -1,5 +1,45 @@
 unknown queue -> NotFound: Queue does not exist. If you just created the queue, wait at least a minute for the queue to initialize.
-empty name -> InvalidArgument: Invalid resource field value in the request.
-name not in a project -> PermissionDenied: Permission denied on resource project not-a-valid-name.
+empty name -> InvalidArgument: Invalid resource field value in the request. [
+    ErrorInfo {
+        reason: "RESOURCE_PROJECT_INVALID",
+        domain: "googleapis.com",
+        metadata: {
+            "method": "google.cloud.tasks.v2.CloudTasks.PurgeQueue",
+            "service": "cloudtasks.googleapis.com",
+        },
+    },
+]
+name not in a project -> PermissionDenied: Permission denied on resource project not-a-valid-name. [
+    ErrorInfo {
+        reason: "CONSUMER_INVALID",
+        domain: "googleapis.com",
+        metadata: {
+            "consumer": "projects/not-a-valid-name",
+            "containerInfo": "not-a-valid-name",
+            "service": "cloudtasks.googleapis.com",
+        },
+    },
+    LocalizedMessage {
+        locale: "en-US",
+        message: "Permission denied on resource project not-a-valid-name.",
+    },
+    Help {
+        links: [
+            Link {
+                description: "Google developers console",
+                url: "https://console.developers.google.com",
+            },
+        ],
+    },
+]
 name without queue id -> PermissionDenied: The principal (user or service account) lacks IAM permission "cloudtasks.queues.purge" for the resource "projects/{project}/locations/{location}/queues" (or the resource may not exist).
-invalid queue id -> InvalidArgument: Queue ID "not_valid" can contain only letters ([A-Za-z]), numbers ([0-9]), or hyphens (-). Queue ID must be between 1 and 100 characters.
+invalid queue id -> InvalidArgument: Queue ID "not_valid" can contain only letters ([A-Za-z]), numbers ([0-9]), or hyphens (-). Queue ID must be between 1 and 100 characters. [
+    Help {
+        links: [
+            Link {
+                description: "Definition of queue ID",
+                url: "https://cloud.google.com/tasks/docs/reference/rest/v2/projects.locations.queues#Queue.FIELDS.name",
+            },
+        ],
+    },
+]

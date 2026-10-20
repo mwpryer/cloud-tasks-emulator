@@ -1,0 +1,42 @@
+scope -> Some(
+    HttpRequest(
+        HttpRequest {
+            url: "https://example.googleapis.com/work",
+            http_method: Post,
+            headers: {
+                "Authorization": "Bearer token",
+                "User-Agent": "Google-Cloud-Tasks",
+            },
+            body: [],
+            authorization_header: Some(
+                OauthToken(
+                    OAuthToken {
+                        service_account_email: "{service_account}",
+                        scope: "https://www.googleapis.com/auth/userinfo.email",
+                    },
+                ),
+            ),
+        },
+    ),
+)
+no scope -> Some(
+    HttpRequest(
+        HttpRequest {
+            url: "https://example.googleapis.com/work",
+            http_method: Post,
+            headers: {
+                "Authorization": "Bearer token",
+                "User-Agent": "Google-Cloud-Tasks",
+            },
+            body: [],
+            authorization_header: Some(
+                OauthToken(
+                    OAuthToken {
+                        service_account_email: "{service_account}",
+                        scope: "https://www.googleapis.com/auth/cloud-platform",
+                    },
+                ),
+            ),
+        },
+    ),
+)

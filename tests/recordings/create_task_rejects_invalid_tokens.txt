@@ -1,0 +1,49 @@
+oidc without email -> InvalidArgument: service_account_email must be set.
+oidc with malformed email -> InvalidArgument: Request contains an invalid argument.
+oidc with audience without scheme -> Some(
+    HttpRequest(
+        HttpRequest {
+            url: "https://example.com/work",
+            http_method: Post,
+            headers: {
+                "User-Agent": "Google-Cloud-Tasks",
+            },
+            body: [],
+            authorization_header: Some(
+                OidcToken(
+                    OidcToken {
+                        service_account_email: "{service_account}",
+                        audience: "audience",
+                    },
+                ),
+            ),
+        },
+    ),
+)
+oidc with email without domain -> InvalidArgument: Request contains an invalid argument.
+oidc with email without name -> InvalidArgument: Request contains an invalid argument.
+oidc with email with two @ -> InvalidArgument: Request contains an invalid argument.
+oauth without email -> InvalidArgument: service_account_email must be set.
+oauth with malformed email -> InvalidArgument: Request contains an invalid argument.
+oauth with scope without scheme -> Some(
+    HttpRequest(
+        HttpRequest {
+            url: "https://example.googleapis.com/work",
+            http_method: Post,
+            headers: {
+                "User-Agent": "Google-Cloud-Tasks",
+            },
+            body: [],
+            authorization_header: Some(
+                OauthToken(
+                    OAuthToken {
+                        service_account_email: "{service_account}",
+                        scope: "scope",
+                    },
+                ),
+            ),
+        },
+    ),
+)
+oauth to other host -> InvalidArgument: Invalid url for HttpRequest.oauth_token. The hostname in the url must end with ".googleapis.com"
+oauth to bare googleapis.com -> InvalidArgument: Invalid url for HttpRequest.oauth_token. The hostname in the url must end with ".googleapis.com"

@@ -3,14 +3,20 @@ use std::time::SystemTime;
 
 use reqwest::Method;
 
-use crate::state::{Delivery, Emulator, HttpMethod, Outcome};
+use crate::oidc::Issuer;
+use crate::state::{AuthorizationHeader, Delivery, Emulator, HttpMethod, Outcome};
 
-pub(crate) async fn run(emulator: Arc<Emulator>) {
+pub(crate) async fn run(emulator: Arc<Emulator>, issuer: Arc<Issuer>) {
     let client = reqwest::Client::new();
     loop {
         let (deliveries, wait) = emulator.state.lock().unwrap().start_due(SystemTime::now());
         for delivery in deliveries {
-            tokio::spawn(deliver(emulator.clone(), client.clone(), delivery));
+            tokio::spawn(deliver(
+                emulator.clone(),
+                issuer.clone(),
+                client.clone(),
+                delivery,
+            ));
         }
         match wait {
             Some(wait) => {
@@ -24,7 +30,12 @@ pub(crate) async fn run(emulator: Arc<Emulator>) {
     }
 }
 
-async fn deliver(emulator: Arc<Emulator>, client: reqwest::Client, delivery: Delivery) {
+async fn deliver(
+    emulator: Arc<Emulator>,
+    issuer: Arc<Issuer>,
+    client: reqwest::Client,
+    delivery: Delivery,
+) {
     let method = match delivery.http_method {
         HttpMethod::Post => Method::POST,
         HttpMethod::Get => Method::GET,
@@ -40,6 +51,19 @@ async fn deliver(emulator: Arc<Emulator>, client: reqwest::Client, delivery: Del
         .body(delivery.body.clone());
     for (name, value) in &delivery.headers {
         request = request.header(name, value);
+    }
+    if let Some(authorization_header) = &delivery.authorization_header {
+        let token = match authorization_header {
+            AuthorizationHeader::OAuthToken { .. } => {
+                // Opaque, as only Google APIs could check a real access token
+                format!("{:032x}", rand::random::<u128>())
+            }
+            AuthorizationHeader::OidcToken {
+                service_account_email,
+                audience,
+            } => issuer.id_token(service_account_email, audience, SystemTime::now()),
+        };
+        request = request.bearer_auth(token);
     }
     let outcome = match request.send().await {
         Ok(response) => Outcome::Status(response.status().as_u16()),

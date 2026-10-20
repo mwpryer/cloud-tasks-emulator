@@ -15,12 +15,16 @@ use tonic::Status;
 use tonic::transport::Channel;
 
 pub async fn start_emulator() -> CloudTasksClient<Channel> {
+    start_emulator_with_url().await.0
+}
+
+/// Starts an emulator whose OIDC issuer is its own URL
+pub async fn start_emulator_with_url() -> (CloudTasksClient<Channel>, String) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    tokio::spawn(cloud_tasks_emulator::serve(listener));
-    CloudTasksClient::connect(format!("http://{address}"))
-        .await
-        .unwrap()
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(cloud_tasks_emulator::serve(listener, url.clone()));
+    let client = CloudTasksClient::connect(url.clone()).await.unwrap();
+    (client, url)
 }
 
 #[derive(Clone)]

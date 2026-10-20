@@ -1,0 +1,42 @@
+audience -> Some(
+    HttpRequest(
+        HttpRequest {
+            url: "https://example.com/work",
+            http_method: Post,
+            headers: {
+                "Authorization": "Bearer token",
+                "User-Agent": "Google-Cloud-Tasks",
+            },
+            body: [],
+            authorization_header: Some(
+                OidcToken(
+                    OidcToken {
+                        service_account_email: "{service_account}",
+                        audience: "https://example.com/audience",
+                    },
+                ),
+            ),
+        },
+    ),
+)
+no audience -> Some(
+    HttpRequest(
+        HttpRequest {
+            url: "https://example.com/work",
+            http_method: Post,
+            headers: {
+                "Authorization": "Bearer token",
+                "User-Agent": "Google-Cloud-Tasks",
+            },
+            body: [],
+            authorization_header: Some(
+                OidcToken(
+                    OidcToken {
+                        service_account_email: "{service_account}",
+                        audience: "https://example.com/work",
+                    },
+                ),
+            ),
+        },
+    ),
+)

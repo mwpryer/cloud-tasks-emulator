@@ -1,11 +1,13 @@
 mod api;
 mod filter;
 mod names;
+mod oidc;
 mod scheduler;
 mod state;
 
 use std::sync::Arc;
 
+use axum::routing::get;
 use tokio::net::TcpListener;
 use tonic::transport::server::TcpIncoming;
 
@@ -40,10 +42,18 @@ pub mod proto {
     }
 }
 
-pub async fn serve(listener: TcpListener) -> Result<(), tonic::transport::Error> {
+/// Serves the API, and OIDC discovery for tokens issued as `issuer`, an origin such as `http://127.0.0.1:8123`
+pub async fn serve(listener: TcpListener, issuer: String) -> Result<(), tonic::transport::Error> {
     let emulator = Arc::new(state::Emulator::default());
-    tokio::spawn(scheduler::run(emulator.clone()));
+    let issuer = Arc::new(oidc::Issuer::new(issuer));
+    tokio::spawn(scheduler::run(emulator.clone(), issuer.clone()));
+    let discovery = axum::Router::new()
+        .route("/.well-known/openid-configuration", get(oidc::discovery))
+        .route("/jwks", get(oidc::jwks))
+        .with_state(issuer);
     tonic::transport::Server::builder()
+        .accept_http1(true)
+        .add_routes(discovery.into())
         .add_service(CloudTasksServer::new(api::CloudTasksService::new(emulator)))
         .serve_with_incoming(TcpIncoming::from(listener))
         .await

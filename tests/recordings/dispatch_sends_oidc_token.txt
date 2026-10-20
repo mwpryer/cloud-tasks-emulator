@@ -1,0 +1,42 @@
+oidc-audience -> [
+    (
+        "Bearer",
+        (
+            {
+                "alg": String("RS256"),
+                "kid": String("{kid}"),
+                "typ": String("JWT"),
+            },
+            {
+                "aud": String("https://example.com/audience"),
+                "azp": String("{service_account_id}"),
+                "email": String("{service_account}"),
+                "email_verified": Bool(true),
+                "exp - iat": Number(3600),
+                "iss": String("{issuer}"),
+                "sub": String("{service_account_id}"),
+            },
+        ),
+    ),
+]
+oidc-url -> [
+    (
+        "Bearer",
+        (
+            {
+                "alg": String("RS256"),
+                "kid": String("{kid}"),
+                "typ": String("JWT"),
+            },
+            {
+                "aud": String("{receiver}/oidc-url/200?query"),
+                "azp": String("{service_account_id}"),
+                "email": String("{service_account}"),
+                "email_verified": Bool(true),
+                "exp - iat": Number(3600),
+                "iss": String("{issuer}"),
+                "sub": String("{service_account_id}"),
+            },
+        ),
+    ),
+]

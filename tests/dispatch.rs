@@ -3,9 +3,13 @@ mod support;
 use std::time::{Duration, SystemTime};
 
 use cloud_tasks_emulator::proto::google::cloud::tasks::v2::{
-    CreateQueueRequest, CreateTaskRequest, HttpRequest, Queue, RetryConfig, Task, task,
+    CreateQueueRequest, CreateTaskRequest, HttpRequest, OidcToken, Queue, RetryConfig, Task,
+    http_request, task,
 };
+use jsonwebtoken::jwk::JwkSet;
+use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use prost_types::Timestamp;
+use serde_json::Value;
 use tonic::Code;
 
 fn queue(retry_config: Option<RetryConfig>) -> CreateQueueRequest {
@@ -97,5 +101,57 @@ async fn first_retry_waits_min_backoff() {
     assert_eq!(
         elapsed(task.last_attempt.unwrap().response_time, task.schedule_time),
         Duration::from_millis(100)
+    );
+}
+
+#[tokio::test]
+async fn oidc_token_verifies_with_discovered_keys() {
+    let (mut client, url) = support::start_emulator_with_url().await;
+    let receiver = support::Receiver::start().await;
+    client.create_queue(queue(None)).await.unwrap();
+    let request = CreateTaskRequest {
+        parent: "projects/p/locations/l/queues/q".to_owned(),
+        task: Some(Task {
+            message_type: Some(task::MessageType::HttpRequest(HttpRequest {
+                url: receiver.url_for("t", "200"),
+                authorization_header: Some(http_request::AuthorizationHeader::OidcToken(
+                    OidcToken {
+                        service_account_email: "tasks@p.iam.gserviceaccount.com".to_owned(),
+                        audience: "https://example.com/audience".to_owned(),
+                    },
+                )),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }),
+        response_view: task::View::Unspecified.into(),
+    };
+    client.create_task(request).await.unwrap();
+    let authorization = receiver.wait_for("t", 1).await[0].headers["authorization"].clone();
+    let token = authorization
+        .to_str()
+        .unwrap()
+        .strip_prefix("Bearer ")
+        .unwrap();
+    let get = async |url: &str| reqwest::get(url).await.unwrap().bytes().await.unwrap();
+    let discovery: Value =
+        serde_json::from_slice(&get(&format!("{url}/.well-known/openid-configuration")).await)
+            .unwrap();
+    let keys: JwkSet =
+        serde_json::from_slice(&get(discovery["jwks_uri"].as_str().unwrap()).await).unwrap();
+    let kid = jsonwebtoken::decode_header(token).unwrap().kid.unwrap();
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.set_issuer(&[&url]);
+    validation.set_audience(&["https://example.com/audience"]);
+
+    let claims = jsonwebtoken::decode::<Value>(
+        token,
+        &DecodingKey::from_jwk(keys.find(&kid).unwrap()).unwrap(),
+        &validation,
+    );
+
+    assert_eq!(
+        claims.unwrap().claims["email"],
+        "tasks@p.iam.gserviceaccount.com"
     );
 }

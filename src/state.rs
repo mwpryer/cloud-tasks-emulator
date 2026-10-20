@@ -90,6 +90,20 @@ pub(crate) struct HttpRequest {
     pub http_method: HttpMethod,
     pub headers: BTreeMap<String, String>,
     pub body: Vec<u8>,
+    pub authorization_header: Option<AuthorizationHeader>,
+}
+
+/// Token generated for each attempt, which replaces any stored Authorization header
+#[derive(Clone)]
+pub(crate) enum AuthorizationHeader {
+    OAuthToken {
+        service_account_email: String,
+        scope: String,
+    },
+    OidcToken {
+        service_account_email: String,
+        audience: String,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -139,6 +153,7 @@ pub(crate) struct Delivery {
     pub http_method: HttpMethod,
     pub url: String,
     pub headers: Vec<(String, String)>,
+    pub authorization_header: Option<AuthorizationHeader>,
     pub body: Vec<u8>,
     pub deadline: Duration,
 }
@@ -414,6 +429,8 @@ impl Task {
                 !injected
                     .iter()
                     .any(|(injected, _)| injected.eq_ignore_ascii_case(name))
+                    && !(self.http_request.authorization_header.is_some()
+                        && name.eq_ignore_ascii_case("authorization"))
             })
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect();
@@ -434,6 +451,7 @@ impl Task {
             http_method: self.http_request.http_method,
             url: self.http_request.url.clone(),
             headers,
+            authorization_header: self.http_request.authorization_header.clone(),
             body: self.http_request.body.clone(),
             deadline: self.dispatch_deadline,
         }

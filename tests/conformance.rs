@@ -1,5 +1,6 @@
 //! Compares the emulator with transcripts recorded from real Cloud Tasks in `tests/recordings`
-//! To record, install `cloudflared` and run `CLOUD_TASKS_PROJECT=<id> CLOUD_TASKS_LOCATION=<id> CLOUD_TASKS_TOKEN=$(gcloud auth print-access-token) cargo test --test conformance -- --ignored record`
+//! To record, install `cloudflared` and run `CLOUD_TASKS_PROJECT=<id> CLOUD_TASKS_LOCATION=<id> CLOUD_TASKS_SERVICE_ACCOUNT=<email> CLOUD_TASKS_TOKEN=$(gcloud auth print-access-token) cargo test --test conformance -- --ignored record`
+//! The caller needs permission to act as the service account, which must be in the project
 
 mod support;
 
@@ -9,14 +10,18 @@ use std::fs;
 use std::process::Stdio;
 use std::time::SystemTime;
 
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use cloud_tasks_emulator::proto::google::cloud::tasks::v2::cloud_tasks_client::CloudTasksClient;
 use cloud_tasks_emulator::proto::google::cloud::tasks::v2::{
     CreateQueueRequest, CreateTaskRequest, DeleteQueueRequest, DeleteTaskRequest, GetQueueRequest,
     GetTaskRequest, HttpMethod, HttpRequest, ListQueuesRequest, ListQueuesResponse,
-    ListTasksRequest, ListTasksResponse, PauseQueueRequest, PurgeQueueRequest, Queue, RateLimits,
-    ResumeQueueRequest, RetryConfig, RunTaskRequest, Task, UpdateQueueRequest, queue, task,
+    ListTasksRequest, ListTasksResponse, OAuthToken, OidcToken, PauseQueueRequest,
+    PurgeQueueRequest, Queue, RateLimits, ResumeQueueRequest, RetryConfig, RunTaskRequest, Task,
+    UpdateQueueRequest, http_request, queue, task,
 };
 use prost_types::{Duration, FieldMask, Timestamp};
+use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::task::JoinError;
@@ -30,11 +35,14 @@ const RECORDINGS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/recordings"
 
 #[tokio::test]
 async fn emulator_matches_recordings() {
+    let (client, url) = support::start_emulator_with_url().await;
     let target = Target::new(
-        support::start_emulator().await,
+        client,
         MetadataMap::new(),
         "emulator-project",
         "emulator-location",
+        "tasks@emulator-project.iam.gserviceaccount.com",
+        &url,
         Receiver::start().await,
     );
 
@@ -83,6 +91,8 @@ async fn record() {
         metadata,
         &env("CLOUD_TASKS_PROJECT"),
         &env("CLOUD_TASKS_LOCATION"),
+        &env("CLOUD_TASKS_SERVICE_ACCOUNT"),
+        "https://accounts.google.com",
         receiver,
     );
 
@@ -188,6 +198,8 @@ struct Target {
     metadata: MetadataMap,
     project: String,
     parent: String,
+    /// Email of the service account that tokens are generated for
+    service_account: String,
     /// Prefixes queue IDs, as real Cloud Tasks blocks a deleted queue's name for days
     run: String,
     /// A day out, so no task dispatches
@@ -203,6 +215,8 @@ impl Target {
         metadata: MetadataMap,
         project: &str,
         location: &str,
+        service_account: &str,
+        issuer: &str,
         receiver: Receiver,
     ) -> Self {
         let run = format!("r{:08x}", rand::random::<u32>());
@@ -212,12 +226,15 @@ impl Target {
             metadata,
             project: format!("projects/{project}"),
             parent: format!("projects/{project}/locations/{location}"),
+            service_account: service_account.to_owned(),
             placeholders: vec![
                 (receiver.url.clone(), "{receiver}"),
                 (project.to_owned(), "{project}"),
                 (location.to_owned(), "{location}"),
                 (run.clone(), "{run}"),
                 (tomorrow.to_string(), "{tomorrow}"),
+                (service_account.to_owned(), "{service_account}"),
+                (issuer.to_owned(), "{issuer}"),
             ],
             run,
             tomorrow: Timestamp {
@@ -548,6 +565,10 @@ cases!(
     retries_stop_once_both_limits_pass,
     retries_back_off_exponentially_then_linearly,
     retries_follow_task_retry_config,
+    create_task_returns_oidc_token,
+    create_task_returns_oauth_token,
+    create_task_rejects_invalid_tokens,
+    dispatch_sends_oidc_token,
 );
 
 fn http(url: &str) -> HttpRequest {
@@ -3059,9 +3080,11 @@ async fn delete_queue_blocks_name(t: &mut Target) {
         Result::is_err
     );
     let got = t.get_queue(GetQueueRequest { name: name.clone() }).await;
-    let deleted = t
-        .delete_queue(DeleteQueueRequest { name: name.clone() })
-        .await;
+    // Real Cloud Tasks sometimes accepts the delete again
+    let deleted = retry_until!(
+        t.delete_queue(DeleteQueueRequest { name: name.clone() }),
+        Result::is_err
+    );
     let paused = t
         .pause_queue(PauseQueueRequest { name: name.clone() })
         .await;
@@ -3153,5 +3176,199 @@ async fn create_task_moves_past_schedule_time_to_now(t: &mut Target) {
                 (0..=1).contains(&lag)
             }),
         );
+    }
+}
+
+fn oidc(service_account: &str, audience: &str) -> Option<http_request::AuthorizationHeader> {
+    Some(http_request::AuthorizationHeader::OidcToken(OidcToken {
+        service_account_email: service_account.to_owned(),
+        audience: audience.to_owned(),
+    }))
+}
+
+fn oauth(service_account: &str, scope: &str) -> Option<http_request::AuthorizationHeader> {
+    Some(http_request::AuthorizationHeader::OauthToken(OAuthToken {
+        service_account_email: service_account.to_owned(),
+        scope: scope.to_owned(),
+    }))
+}
+
+async fn create_task_returns_oidc_token(t: &mut Target) {
+    let queue = t.queue("oidc-token").await;
+    for (label, audience) in [
+        ("audience", "https://example.com/audience"),
+        ("no audience", ""),
+    ] {
+        let request = CreateTaskRequest {
+            parent: queue.clone(),
+            task: Some(t.task(
+                "",
+                HttpRequest {
+                    authorization_header: oidc(&t.service_account, audience),
+                    ..with_headers(&[("Authorization", "Bearer token")])
+                },
+            )),
+            response_view: task::View::Unspecified.into(),
+        };
+
+        let result = t.create_task(request).await;
+
+        t.record(label, result.map(|task| task.message_type));
+    }
+}
+
+async fn create_task_returns_oauth_token(t: &mut Target) {
+    let queue = t.queue("oauth-token").await;
+    for (label, scope) in [
+        ("scope", "https://www.googleapis.com/auth/userinfo.email"),
+        ("no scope", ""),
+    ] {
+        let request = CreateTaskRequest {
+            parent: queue.clone(),
+            task: Some(t.task(
+                "",
+                HttpRequest {
+                    url: "https://example.googleapis.com/work".to_owned(),
+                    authorization_header: oauth(&t.service_account, scope),
+                    ..with_headers(&[("Authorization", "Bearer token")])
+                },
+            )),
+            response_view: task::View::Unspecified.into(),
+        };
+
+        let result = t.create_task(request).await;
+
+        t.record(label, result.map(|task| task.message_type));
+    }
+}
+
+async fn create_task_rejects_invalid_tokens(t: &mut Target) {
+    let queue = t.queue("invalid-tokens").await;
+    let account = t.service_account.clone();
+    let with_token = |url: &str, token| HttpRequest {
+        authorization_header: token,
+        ..http(url)
+    };
+    for (label, http_request) in [
+        (
+            "oidc without email",
+            with_token("https://example.com/work", oidc("", "")),
+        ),
+        (
+            "oidc with malformed email",
+            with_token("https://example.com/work", oidc("not-an-email", "")),
+        ),
+        (
+            "oidc with audience without scheme",
+            with_token("https://example.com/work", oidc(&account, "audience")),
+        ),
+        (
+            "oidc with email without domain",
+            with_token("https://example.com/work", oidc("tasks@", "")),
+        ),
+        (
+            "oidc with email without name",
+            with_token("https://example.com/work", oidc("@example.com", "")),
+        ),
+        (
+            "oidc with email with two @",
+            with_token("https://example.com/work", oidc("tasks@a@example.com", "")),
+        ),
+        (
+            "oauth without email",
+            with_token("https://example.googleapis.com/work", oauth("", "")),
+        ),
+        (
+            "oauth with malformed email",
+            with_token(
+                "https://example.googleapis.com/work",
+                oauth("not-an-email", ""),
+            ),
+        ),
+        (
+            "oauth with scope without scheme",
+            with_token(
+                "https://example.googleapis.com/work",
+                oauth(&account, "scope"),
+            ),
+        ),
+        (
+            "oauth to other host",
+            with_token("https://example.com/work", oauth(&account, "")),
+        ),
+        (
+            "oauth to bare googleapis.com",
+            with_token("https://googleapis.com/work", oauth(&account, "")),
+        ),
+    ] {
+        let request = CreateTaskRequest {
+            parent: queue.clone(),
+            task: Some(t.task("", http_request)),
+            response_view: task::View::Unspecified.into(),
+        };
+
+        let result = t.create_task(request).await;
+
+        t.record(label, result.map(|task| task.message_type));
+    }
+}
+
+/// Decodes a JWT's header and claims, with run-specific values as placeholders and `exp` as its lifetime
+fn decode_jwt(t: &mut Target, token: &str) -> (BTreeMap<String, Value>, BTreeMap<String, Value>) {
+    let decode = |part: &str| -> BTreeMap<String, Value> {
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(part).unwrap()).unwrap()
+    };
+    let parts: Vec<&str> = token.split('.').collect();
+    assert_eq!(parts.len(), 3, "{token} is a signed JWT");
+    let header = decode(parts[0]);
+    let mut claims = decode(parts[1]);
+    t.placeholder(header["kid"].as_str().unwrap().to_owned(), "{kid}");
+    t.placeholder(
+        claims["sub"].as_str().unwrap().to_owned(),
+        "{service_account_id}",
+    );
+    let issued = claims.remove("iat").unwrap().as_i64().unwrap();
+    let expires = claims.remove("exp").unwrap().as_i64().unwrap();
+    claims.insert("exp - iat".to_owned(), Value::from(expires - issued));
+    (header, claims)
+}
+
+async fn dispatch_sends_oidc_token(t: &mut Target) {
+    let queue = t.queue("dispatch-oidc").await;
+    for (key, audience) in [
+        ("oidc-audience", "https://example.com/audience"),
+        ("oidc-url", ""),
+    ] {
+        let request = CreateTaskRequest {
+            parent: queue.clone(),
+            task: Some(Task {
+                name: format!("{queue}/tasks/{key}"),
+                message_type: Some(task::MessageType::HttpRequest(HttpRequest {
+                    headers: BTreeMap::from([(
+                        "Authorization".to_owned(),
+                        "Bearer token".to_owned(),
+                    )]),
+                    authorization_header: oidc(&t.service_account, audience),
+                    ..http(&format!("{}?query", t.receiver.url_for(key, "200")))
+                })),
+                ..Default::default()
+            }),
+            response_view: task::View::Unspecified.into(),
+        };
+        t.create_task(request).await.unwrap();
+    }
+
+    for key in ["oidc-audience", "oidc-url"] {
+        let requests = t.receiver.wait_for(key, 1).await;
+        let tokens: Vec<_> = requests[0]
+            .headers
+            .get_all("authorization")
+            .iter()
+            .map(|value| {
+                let (scheme, token) = value.to_str().unwrap().split_once(' ').unwrap();
+                (scheme.to_owned(), decode_jwt(t, token))
+            })
+            .collect();
+        t.record(key, Ok::<_, Status>(tokens));
     }
 }

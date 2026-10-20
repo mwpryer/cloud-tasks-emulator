@@ -16,7 +16,8 @@ use crate::proto::google::iam::v1 as iam;
 use crate::proto::google::longrunning::Operation;
 use crate::proto::google::rpc;
 use crate::state::{
-    Attempt, Emulator, HttpMethod, HttpRequest, Queue, QueueState, RateLimits, RetryConfig, Task,
+    Attempt, AuthorizationHeader, Emulator, HttpMethod, HttpRequest, Queue, QueueState, RateLimits,
+    RetryConfig, Task,
 };
 
 const QUEUE_NOT_FOUND: &str = "Queue does not exist. If you just created the queue, wait at least a minute for the queue to initialize.";
@@ -806,11 +807,10 @@ fn http_request(request: pb::HttpRequest) -> Result<HttpRequest, Status> {
             "HttpTarget.url must start with 'http://' or 'https://'.",
         ));
     }
-    if request.authorization_header.is_some() {
-        return Err(Status::unimplemented(
-            "OAuth and OIDC tokens are not supported yet",
-        ));
-    }
+    let authorization_header = request
+        .authorization_header
+        .map(|header| authorization_header(header, &request.url))
+        .transpose()?;
     let http_method = match pb::HttpMethod::try_from(request.http_method) {
         // Cloud Tasks stores an unknown method as POST
         Ok(pb::HttpMethod::Unspecified | pb::HttpMethod::Post) | Err(_) => HttpMethod::Post,
@@ -836,6 +836,61 @@ fn http_request(request: pb::HttpRequest) -> Result<HttpRequest, Status> {
         http_method,
         headers: stored_headers(request.headers),
         body: request.body,
+        authorization_header,
+    })
+}
+
+/// Fills the defaults Cloud Tasks stores, but allows the http URLs it rejects so local handlers get tokens
+fn authorization_header(
+    header: pb::http_request::AuthorizationHeader,
+    url: &str,
+) -> Result<AuthorizationHeader, Status> {
+    let service_account_email = match &header {
+        pb::http_request::AuthorizationHeader::OauthToken(token) => &token.service_account_email,
+        pb::http_request::AuthorizationHeader::OidcToken(token) => &token.service_account_email,
+    };
+    if service_account_email.is_empty() {
+        return Err(Status::invalid_argument(
+            "service_account_email must be set.",
+        ));
+    }
+    if !service_account_email
+        .split_once('@')
+        .is_some_and(|(name, domain)| {
+            !name.is_empty() && !domain.is_empty() && !domain.contains('@')
+        })
+    {
+        return Err(Status::invalid_argument(
+            "Request contains an invalid argument.",
+        ));
+    }
+    Ok(match header {
+        pb::http_request::AuthorizationHeader::OauthToken(token) => {
+            if !reqwest::Url::parse(url).is_ok_and(|url| {
+                url.host_str()
+                    .is_some_and(|host| host.ends_with(".googleapis.com"))
+            }) {
+                return Err(Status::invalid_argument(
+                    r#"Invalid url for HttpRequest.oauth_token. The hostname in the url must end with ".googleapis.com""#,
+                ));
+            }
+            AuthorizationHeader::OAuthToken {
+                service_account_email: token.service_account_email,
+                scope: if token.scope.is_empty() {
+                    "https://www.googleapis.com/auth/cloud-platform".to_owned()
+                } else {
+                    token.scope
+                },
+            }
+        }
+        pb::http_request::AuthorizationHeader::OidcToken(token) => AuthorizationHeader::OidcToken {
+            service_account_email: token.service_account_email,
+            audience: if token.audience.is_empty() {
+                url.to_owned()
+            } else {
+                token.audience
+            },
+        },
     })
 }
 
@@ -965,7 +1020,25 @@ fn task_to_proto(task: &Task, view: pb::task::View) -> pb::Task {
             } else {
                 Vec::new()
             },
-            authorization_header: None,
+            authorization_header: request
+                .authorization_header
+                .clone()
+                .map(|header| match header {
+                    AuthorizationHeader::OAuthToken {
+                        service_account_email,
+                        scope,
+                    } => pb::http_request::AuthorizationHeader::OauthToken(pb::OAuthToken {
+                        service_account_email,
+                        scope,
+                    }),
+                    AuthorizationHeader::OidcToken {
+                        service_account_email,
+                        audience,
+                    } => pb::http_request::AuthorizationHeader::OidcToken(pb::OidcToken {
+                        service_account_email,
+                        audience,
+                    }),
+                }),
         })),
         schedule_time: Some(timestamp(task.schedule_time)),
         create_time: Some(Timestamp {

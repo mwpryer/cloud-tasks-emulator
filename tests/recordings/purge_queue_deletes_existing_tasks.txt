@@ -1,0 +1,10 @@
+purge_queue -> (
+    Running,
+    true,
+)
+tasks after purge -> [
+    "projects/{project}/locations/{location}/queues/{run}-purged/tasks/b",
+]
+get_task purged -> NotFound: The task no longer exists, though a task with this name existed recently. The task either successfully completed or was deleted.
+create_task purged -> AlreadyExists: The task cannot be created because a task with this name existed too recently. For more information about task de-duplication see https://cloud.google.com/tasks/docs/reference/rest/v2/projects.locations.queues.tasks/create#body.request_body.FIELDS.task.
+get_queue purge_time is set -> true

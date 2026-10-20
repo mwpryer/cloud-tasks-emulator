@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
@@ -13,9 +13,10 @@ pub(crate) struct Emulator {
     pub wake: Notify,
 }
 
-#[derive(Default)]
 pub(crate) struct State {
     pub queues: BTreeMap<String, Queue>,
+    /// Deleted queue names, blocked for the 3 days the proto documents
+    pub deleted_queues: Tombstones,
     next_attempt_id: u64,
 }
 
@@ -23,10 +24,28 @@ pub(crate) struct Queue {
     pub name: String,
     pub rate_limits: RateLimits,
     pub retry_config: RetryConfig,
+    pub state: QueueState,
+    pub purge_time: Option<SystemTime>,
     pub tasks: BTreeMap<String, Task>,
+    /// Finished and deleted task names, blocked for the 24 hours the proto documents
+    pub removed_tasks: Tombstones,
     tokens: f64,
     refilled_at: SystemTime,
     in_flight: HashSet<u64>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum QueueState {
+    Running,
+    Paused,
+}
+
+/// Names removed recently enough that they cannot be reused yet
+pub(crate) struct Tombstones {
+    window: Duration,
+    /// Oldest first, so expired names come off the front
+    removed: VecDeque<(SystemTime, String)>,
+    names: HashSet<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -50,6 +69,8 @@ pub(crate) struct RetryConfig {
 pub(crate) struct Task {
     pub name: String,
     pub http_request: HttpRequest,
+    /// Overrides the queue's
+    pub retry_config: Option<RetryConfig>,
     pub schedule_time: SystemTime,
     pub create_time: SystemTime,
     pub dispatch_deadline: Duration,
@@ -59,6 +80,8 @@ pub(crate) struct Task {
     /// Dispatch time only, as Cloud Tasks keeps nothing else of the first attempt
     pub first_attempt: Option<SystemTime>,
     pub last_attempt: Option<Attempt>,
+    /// Set by RunTask until the scheduler starts the attempt
+    pub run_requested: bool,
     in_flight: Option<u64>,
 }
 
@@ -120,6 +143,16 @@ pub(crate) struct Delivery {
     pub deadline: Duration,
 }
 
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            queues: BTreeMap::new(),
+            deleted_queues: Tombstones::new(Duration::from_secs(3 * 24 * 60 * 60)),
+            next_attempt_id: 0,
+        }
+    }
+}
+
 impl State {
     /// Starts every due attempt the queue limits allow and returns how long until one could next start
     pub fn start_due(&mut self, now: SystemTime) -> (Vec<Delivery>, Option<Duration>) {
@@ -131,6 +164,18 @@ impl State {
             queue.tokens = (queue.tokens + elapsed.as_secs_f64() * rate)
                 .min(queue.rate_limits.max_burst_size as f64);
             queue.refilled_at = now;
+
+            // RunTask dispatches whatever the queue's state, limits and the task's schedule
+            for task in queue.tasks.values_mut().filter(|task| task.run_requested) {
+                task.run_requested = false;
+                self.next_attempt_id += 1;
+                queue.in_flight.insert(self.next_attempt_id);
+                deliveries.push(task.start_attempt(&queue.name, self.next_attempt_id, now));
+            }
+            // Resuming wakes the scheduler, so a paused queue needs no timer
+            if queue.state == QueueState::Paused {
+                continue;
+            }
 
             let mut waiting: Vec<&mut Task> = queue
                 .tasks
@@ -195,15 +240,14 @@ impl State {
             .first_attempt
             .expect("in-flight task has a first attempt");
         let retrying_for = now.duration_since(first_attempt).unwrap_or_default();
+        let retry_config = task.retry_config.unwrap_or(queue.retry_config);
         if matches!(outcome, Outcome::Status(200..=299))
-            || queue
-                .retry_config
-                .exhausted(task.dispatch_count, retrying_for)
+            || retry_config.exhausted(task.dispatch_count, retrying_for)
         {
-            queue.tasks.remove(&delivery.task);
+            queue.remove_task(&delivery.task, now);
             return;
         }
-        task.schedule_time = now + queue.retry_config.backoff(task.dispatch_count);
+        task.schedule_time = now + retry_config.backoff(task.dispatch_count);
     }
 }
 
@@ -218,10 +262,57 @@ impl Queue {
             name,
             rate_limits,
             retry_config,
+            state: QueueState::Running,
+            purge_time: None,
             tasks: BTreeMap::new(),
+            removed_tasks: Tombstones::new(Duration::from_secs(24 * 60 * 60)),
             tokens: rate_limits.max_burst_size as f64,
             refilled_at: now,
             in_flight: HashSet::new(),
+        }
+    }
+
+    /// Removes the task and blocks its name from reuse
+    pub fn remove_task(&mut self, name: &str, now: SystemTime) -> Option<Task> {
+        let task = self.tasks.remove(name)?;
+        self.removed_tasks.insert(task.name.clone(), now);
+        Some(task)
+    }
+
+    pub fn purge(&mut self, now: SystemTime) {
+        self.purge_time = Some(now);
+        for name in std::mem::take(&mut self.tasks).into_keys() {
+            self.removed_tasks.insert(name, now);
+        }
+    }
+}
+
+impl Tombstones {
+    fn new(window: Duration) -> Self {
+        Self {
+            window,
+            removed: VecDeque::new(),
+            names: HashSet::new(),
+        }
+    }
+
+    pub fn insert(&mut self, name: String, now: SystemTime) {
+        self.prune(now);
+        assert!(self.names.insert(name.clone()), "{name} is already blocked");
+        self.removed.push_back((now, name));
+    }
+
+    pub fn contains(&mut self, name: &str, now: SystemTime) -> bool {
+        self.prune(now);
+        self.names.contains(name)
+    }
+
+    fn prune(&mut self, now: SystemTime) {
+        while let Some((removed_at, _)) = self.removed.front()
+            && *removed_at + self.window <= now
+        {
+            let (_, name) = self.removed.pop_front().expect("front was checked");
+            self.names.remove(&name);
         }
     }
 }
@@ -254,6 +345,7 @@ impl Task {
     pub fn new(
         name: String,
         http_request: HttpRequest,
+        retry_config: Option<RetryConfig>,
         schedule_time: SystemTime,
         dispatch_deadline: Duration,
         now: SystemTime,
@@ -261,6 +353,7 @@ impl Task {
         Self {
             name,
             http_request,
+            retry_config,
             schedule_time,
             create_time: now,
             dispatch_deadline,
@@ -268,6 +361,7 @@ impl Task {
             response_count: 0,
             first_attempt: None,
             last_attempt: None,
+            run_requested: false,
             in_flight: None,
         }
     }

@@ -1,0 +1,61 @@
+run_task -> Task {
+    name: "projects/{project}/locations/{location}/queues/{run}-run/tasks/t",
+    schedule_time: Some(
+        Timestamp {
+            seconds: {tomorrow},
+            nanos: 123456000,
+        },
+    ),
+    create_time: Some(
+        Timestamp {
+            seconds: {create_time},
+            nanos: 0,
+        },
+    ),
+    dispatch_deadline: Some(
+        Duration {
+            seconds: 600,
+            nanos: 0,
+        },
+    ),
+    dispatch_count: 1,
+    response_count: 0,
+    first_attempt: None,
+    last_attempt: Some(
+        Attempt {
+            schedule_time: Some(
+                Timestamp {
+                    seconds: {tomorrow},
+                    nanos: 123456000,
+                },
+            ),
+            dispatch_time: None,
+            response_time: None,
+            response_status: None,
+        },
+    ),
+    view: Basic,
+    retry_config: None,
+    message_type: Some(
+        HttpRequest(
+            HttpRequest {
+                url: "{receiver}/run/200",
+                http_method: Post,
+                headers: {
+                    "User-Agent": "Google-Cloud-Tasks",
+                },
+                body: [],
+                authorization_header: None,
+            },
+        ),
+    ),
+}
+request headers -> {
+    "user-agent": "Google-Cloud-Tasks",
+    "x-cloudtasks-queuename": "{run}-run",
+    "x-cloudtasks-tasketa": "{tomorrow}.123456",
+    "x-cloudtasks-taskexecutioncount": "0",
+    "x-cloudtasks-taskname": "t",
+    "x-cloudtasks-taskretrycount": "0",
+}
+get_task after success -> NotFound: The task no longer exists, though a task with this name existed recently. The task either successfully completed or was deleted.

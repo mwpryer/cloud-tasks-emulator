@@ -1,0 +1,39 @@
+update_queue -> Queue {
+    name: "projects/{project}/locations/{location}/queues/{run}-masked",
+    app_engine_routing_override: None,
+    http_target: None,
+    rate_limits: Some(
+        RateLimits {
+            max_dispatches_per_second: 100.0,
+            max_burst_size: 20,
+            max_concurrent_dispatches: 5,
+        },
+    ),
+    retry_config: Some(
+        RetryConfig {
+            max_attempts: 7,
+            max_retry_duration: Some(
+                Duration {
+                    seconds: 60,
+                    nanos: 0,
+                },
+            ),
+            min_backoff: Some(
+                Duration {
+                    seconds: 1,
+                    nanos: 0,
+                },
+            ),
+            max_backoff: Some(
+                Duration {
+                    seconds: 10,
+                    nanos: 0,
+                },
+            ),
+            max_doublings: 3,
+        },
+    ),
+    state: Running,
+    purge_time: None,
+    stackdriver_logging_config: None,
+}

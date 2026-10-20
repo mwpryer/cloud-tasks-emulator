@@ -1,0 +1,4 @@
+200 get_task -> NotFound: The task no longer exists, though a task with this name existed recently. The task either successfully completed or was deleted.
+200 create_task -> AlreadyExists: The task cannot be created because a task with this name existed too recently. For more information about task de-duplication see https://cloud.google.com/tasks/docs/reference/rest/v2/projects.locations.queues.tasks/create#body.request_body.FIELDS.task.
+500 get_task -> NotFound: The task no longer exists, though a task with this name existed recently. The task either successfully completed or was deleted.
+500 create_task -> AlreadyExists: The task cannot be created because a task with this name existed too recently. For more information about task de-duplication see https://cloud.google.com/tasks/docs/reference/rest/v2/projects.locations.queues.tasks/create#body.request_body.FIELDS.task.

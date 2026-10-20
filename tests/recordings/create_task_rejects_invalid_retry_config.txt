@@ -1,0 +1,7 @@
+max attempts -2 -> InvalidArgument: RetryConfig.maxAttempts must be greater or equal to -1.
+max doublings -1 -> InvalidArgument: RetryConfig.maxDoublings cannot be negative.
+min backoff -1s -> InvalidArgument: RetryConfig.minBackoff cannot be negative.
+max backoff -1s -> InvalidArgument: RetryConfig.maxBackoff cannot be negative.
+max retry duration -1s -> InvalidArgument: RetryConfig.max_retry_duration.seconds cannot be negative.
+max retry duration 30.9s -> InvalidArgument: RetryConfig.max_retry_duration.nanos cannot be set.
+min backoff above max backoff -> InvalidArgument: RetryConfig.minBackoff must be less than or equal to RetryConfig.maxBackoff.

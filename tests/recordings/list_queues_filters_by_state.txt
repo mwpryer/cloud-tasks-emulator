@@ -1,0 +1,43 @@
+state: PAUSED -> [
+    "projects/{project}/locations/{location}/queues/{run}-state-filter-paused",
+]
+state:PAUSED -> [
+    "projects/{project}/locations/{location}/queues/{run}-state-filter-paused",
+]
+state = PAUSED -> [
+    "projects/{project}/locations/{location}/queues/{run}-state-filter-paused",
+]
+state != PAUSED -> [
+    "projects/{project}/locations/{location}/queues/{run}-state-filter-running",
+]
+state: paused -> [
+    "projects/{project}/locations/{location}/queues/{run}-state-filter-paused",
+]
+State: Paused -> [
+    "projects/{project}/locations/{location}/queues/{run}-state-filter-paused",
+]
+state: "PAUSED" -> [
+    "projects/{project}/locations/{location}/queues/{run}-state-filter-paused",
+]
+state: DISABLED -> []
+NOT state: PAUSED -> [
+    "projects/{project}/locations/{location}/queues/{run}-state-filter-running",
+]
+-state: PAUSED -> [
+    "projects/{project}/locations/{location}/queues/{run}-state-filter-running",
+]
+state: PAUSED OR state: RUNNING -> [
+    "projects/{project}/locations/{location}/queues/{run}-state-filter-paused",
+    "projects/{project}/locations/{location}/queues/{run}-state-filter-running",
+]
+state: PAUSED AND state: RUNNING -> []
+state: PAUSED state: RUNNING -> []
+(state: PAUSED) -> [
+    "projects/{project}/locations/{location}/queues/{run}-state-filter-paused",
+]
+state: PAUSED OR (state: RUNNING AND NOT state: RUNNING) -> [
+    "projects/{project}/locations/{location}/queues/{run}-state-filter-paused",
+]
+state > RUNNING -> [
+    "projects/{project}/locations/{location}/queues/{run}-state-filter-paused",
+]

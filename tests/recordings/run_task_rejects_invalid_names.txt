@@ -1,0 +1,6 @@
+unknown task -> NotFound: Requested entity was not found.
+unknown queue -> NotFound: Queue does not exist. If you just created the queue, wait at least a minute for the queue to initialize.
+empty name -> InvalidArgument: Invalid resource field value in the request.
+name not in a project -> PermissionDenied: Permission denied on resource project not-a-valid-name.
+name without task id -> PermissionDenied: The principal (user or service account) lacks IAM permission "cloudtasks.tasks.run" for the resource "projects/{project}/locations/{location}/queues/{run}-run-invalid/tasks" (or the resource may not exist).
+invalid task id -> InvalidArgument: Task ID "not valid" can contain only letters ([A-Za-z]), numbers ([0-9]), hyphens (-), or underscores (_). Task ID must between 1 and 500 characters.

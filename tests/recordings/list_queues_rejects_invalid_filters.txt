@@ -1,0 +1,7 @@
+bogus_field: x -> InvalidArgument: Field not found: 'bogus_field'.
+max_dispatches_per_second < 100 -> InvalidArgument: Field not found: 'max_dispatches_per_second'.
+state: BOGUS -> InvalidArgument: The value 'bogus' is of incorrect type.
+state: 2 -> InvalidArgument: The value '2' is of incorrect type.
+retry_config.max_backoff = 3600 -> InvalidArgument: The value '3600' is of incorrect type.
+rate_limits.max_dispatches_per_second = fast -> InvalidArgument: The value 'fast' is of incorrect type.
+rate_limits: 10 -> InvalidArgument: Cannot match a nested type 'rate_limits'. A member field of scalar or enum type must be provided.

@@ -13,14 +13,16 @@ use cloud_tasks_emulator::proto::google::cloud::tasks::v2::cloud_tasks_client::C
 use cloud_tasks_emulator::proto::google::cloud::tasks::v2::{
     CreateQueueRequest, CreateTaskRequest, DeleteQueueRequest, DeleteTaskRequest, GetQueueRequest,
     GetTaskRequest, HttpMethod, HttpRequest, ListQueuesRequest, ListQueuesResponse,
-    ListTasksRequest, ListTasksResponse, Queue, RateLimits, RetryConfig, Task, task,
+    ListTasksRequest, ListTasksResponse, PauseQueueRequest, PurgeQueueRequest, Queue, RateLimits,
+    ResumeQueueRequest, RetryConfig, RunTaskRequest, Task, UpdateQueueRequest, queue, task,
 };
-use prost_types::{Duration, Timestamp};
+use prost_types::{Duration, FieldMask, Timestamp};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
+use tokio::task::JoinError;
 use tonic::metadata::MetadataMap;
 use tonic::transport::Channel;
-use tonic::{Request, Status};
+use tonic::{Code, Request, Status};
 
 use crate::support::{Received, Receiver};
 
@@ -36,11 +38,15 @@ async fn emulator_matches_recordings() {
         Receiver::start().await,
     );
 
-    let results = run_cases(&target).await;
+    let results: Vec<_> = run_cases(&target)
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
 
     let differences: Vec<String> = results
         .iter()
-        .filter_map(|(case, transcript, _)| {
+        .filter_map(|(case, transcript)| {
             let recording = fs::read_to_string(format!("{RECORDINGS}/{case}.txt"))
                 .unwrap_or_else(|_| panic!("{case} has no recording"));
             (recording != *transcript)
@@ -72,7 +78,7 @@ async fn record() {
     let mut receiver = Receiver::start().await;
     let (_tunnel, url) = open_tunnel(&receiver.url).await;
     receiver.url = url;
-    let target = Target::new(
+    let mut target = Target::new(
         client,
         metadata,
         &env("CLOUD_TASKS_PROJECT"),
@@ -81,21 +87,42 @@ async fn record() {
     );
 
     let results = run_cases(&target).await;
-    for queue in results.iter().flat_map(|(_, _, queues)| queues) {
-        target
-            .clone()
-            .delete_queue(DeleteQueueRequest {
-                name: queue.clone(),
+    // Deletes by the run's prefix, so a case that panicked leaks nothing
+    let prefix = target.queue_name("");
+    let mut leftovers = Vec::new();
+    let mut page_token = String::new();
+    loop {
+        let page = target
+            .list_queues(ListQueuesRequest {
+                parent: target.parent.clone(),
+                page_token,
+                ..Default::default()
             })
             .await
             .unwrap();
+        leftovers.extend(
+            page.queues
+                .into_iter()
+                .filter(|queue| queue.name.starts_with(&prefix)),
+        );
+        if page.next_page_token.is_empty() {
+            break;
+        }
+        page_token = page.next_page_token;
     }
+    for queue in leftovers {
+        target
+            .delete_queue(DeleteQueueRequest { name: queue.name })
+            .await
+            .unwrap();
+    }
+    let results: Vec<_> = results.into_iter().map(Result::unwrap).collect();
 
     fs::create_dir_all(RECORDINGS).unwrap();
     for entry in fs::read_dir(RECORDINGS).unwrap() {
         fs::remove_file(entry.unwrap().path()).unwrap();
     }
-    for (case, transcript, _) in results {
+    for (case, transcript) in results {
         fs::write(format!("{RECORDINGS}/{case}.txt"), transcript).unwrap();
     }
 }
@@ -109,26 +136,32 @@ async fn open_tunnel(local_url: &str) -> (Child, String) {
         .spawn()
         .expect("cloudflared is installed");
     let mut lines = BufReader::new(tunnel.stderr.take().unwrap()).lines();
-    let url = loop {
-        let line = lines
+    // cloudflared retries forever when outbound port 7844 is blocked
+    let url = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        let url = loop {
+            let line = lines
+                .next_line()
+                .await
+                .unwrap()
+                .expect("cloudflared prints the tunnel URL");
+            if let Some(url) = line
+                .split_whitespace()
+                .find(|word| word.starts_with("https://") && word.ends_with(".trycloudflare.com"))
+            {
+                break url.to_owned();
+            }
+        };
+        while !lines
             .next_line()
             .await
             .unwrap()
-            .expect("cloudflared prints the tunnel URL");
-        if let Some(url) = line
-            .split_whitespace()
-            .find(|word| word.starts_with("https://") && word.ends_with(".trycloudflare.com"))
-        {
-            break url.to_owned();
-        }
-    };
-    while !lines
-        .next_line()
-        .await
-        .unwrap()
-        .expect("cloudflared registers the tunnel")
-        .contains("Registered tunnel connection")
-    {}
+            .expect("cloudflared registers the tunnel")
+            .contains("Registered tunnel connection")
+        {}
+        url
+    })
+    .await
+    .expect("cloudflared registers the tunnel within 60s, which needs outbound port 7844");
     // Drains the log so cloudflared never blocks on a full pipe
     tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
     // The host resolves a few seconds after registering, and a lookup before then is cached as missing for 60s
@@ -161,7 +194,6 @@ struct Target {
     tomorrow: Timestamp,
     receiver: Receiver,
     placeholders: Vec<(String, &'static str)>,
-    queues: Vec<String>,
     transcript: String,
 }
 
@@ -193,7 +225,6 @@ impl Target {
                 nanos: 123_456_789,
             },
             receiver,
-            queues: Vec::new(),
             transcript: String::new(),
         }
     }
@@ -245,12 +276,12 @@ impl Target {
     }
 
     /// Returns the transcript with run-specific values replaced, most specific first
-    fn finish(self) -> (String, Vec<String>) {
+    fn finish(self) -> String {
         let mut transcript = self.transcript;
         for (value, placeholder) in self.placeholders.iter().rev() {
             transcript = transcript.replace(value, placeholder);
         }
-        (transcript, self.queues)
+        transcript
     }
 
     /// Polls the task in full view until `done` holds for the result
@@ -289,9 +320,7 @@ impl Target {
 
     async fn create_queue(&mut self, request: CreateQueueRequest) -> Result<Queue, Status> {
         let request = self.request(format!("parent={}", request.parent), request);
-        let queue = self.client.create_queue(request).await?.into_inner();
-        self.queues.push(queue.name.clone());
-        Ok(queue)
+        Ok(self.client.create_queue(request).await?.into_inner())
     }
 
     async fn get_queue(&mut self, request: GetQueueRequest) -> Result<Queue, Status> {
@@ -308,11 +337,33 @@ impl Target {
     }
 
     async fn delete_queue(&mut self, request: DeleteQueueRequest) -> Result<(), Status> {
-        let name = request.name.clone();
-        let request = self.request(format!("name={name}"), request);
+        let request = self.request(format!("name={}", request.name), request);
         self.client.delete_queue(request).await?;
-        self.queues.retain(|queue| *queue != name);
         Ok(())
+    }
+
+    async fn update_queue(&mut self, request: UpdateQueueRequest) -> Result<Queue, Status> {
+        let name = request
+            .queue
+            .as_ref()
+            .map_or_else(String::new, |queue| queue.name.clone());
+        let request = self.request(format!("queue.name={name}"), request);
+        Ok(self.client.update_queue(request).await?.into_inner())
+    }
+
+    async fn pause_queue(&mut self, request: PauseQueueRequest) -> Result<Queue, Status> {
+        let request = self.request(format!("name={}", request.name), request);
+        Ok(self.client.pause_queue(request).await?.into_inner())
+    }
+
+    async fn resume_queue(&mut self, request: ResumeQueueRequest) -> Result<Queue, Status> {
+        let request = self.request(format!("name={}", request.name), request);
+        Ok(self.client.resume_queue(request).await?.into_inner())
+    }
+
+    async fn purge_queue(&mut self, request: PurgeQueueRequest) -> Result<Queue, Status> {
+        let request = self.request(format!("name={}", request.name), request);
+        Ok(self.client.purge_queue(request).await?.into_inner())
     }
 
     async fn create_task(&mut self, request: CreateTaskRequest) -> Result<Task, Status> {
@@ -352,6 +403,50 @@ impl Target {
         self.client.delete_task(request).await?;
         Ok(())
     }
+
+    /// Retries while real Cloud Tasks reports RunTask as exhausted, which it does for a new queue's first seconds
+    async fn run_task(&mut self, request: RunTaskRequest) -> Result<Task, Status> {
+        let routing = format!("name={}", request.name);
+        let task = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            loop {
+                match self
+                    .client
+                    .run_task(self.request(routing.clone(), request.clone()))
+                    .await
+                {
+                    Err(status) if status.code() == Code::ResourceExhausted => {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                    result => return result,
+                }
+            }
+        })
+        .await
+        .expect("RunTask stops reporting exhaustion in time")?
+        .into_inner();
+        self.placeholder(
+            task.create_time.unwrap().seconds.to_string(),
+            "{create_time}",
+        );
+        Ok(task)
+    }
+}
+
+/// Repeats `call` each second until `done` holds, for answers real Cloud Tasks varies between requests
+macro_rules! retry_until {
+    ($call:expr, $done:expr) => {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            loop {
+                let result = $call.await;
+                if $done(&result) {
+                    break result;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        })
+        .await
+        .expect("real Cloud Tasks gives the expected answer in time")
+    };
 }
 
 fn seconds_from_now(seconds: i64) -> i64 {
@@ -363,19 +458,18 @@ fn seconds_from_now(seconds: i64) -> i64 {
 
 macro_rules! cases {
     ($($case:ident),* $(,)?) => {
-        /// Runs every case at once and returns each one's transcript and leftover queues
-        async fn run_cases(target: &Target) -> Vec<(&'static str, String, Vec<String>)> {
+        /// Runs every case at once and returns each one's transcript, or how it panicked
+        async fn run_cases(target: &Target) -> Vec<Result<(&'static str, String), JoinError>> {
             let cases = vec![$({
                 let mut target = target.clone();
                 tokio::spawn(async move {
                     $case(&mut target).await;
-                    let (transcript, queues) = target.finish();
-                    (stringify!($case), transcript, queues)
+                    (stringify!($case), target.finish())
                 })
             }),*];
             let mut results = Vec::new();
             for case in cases {
-                results.push(case.await.unwrap());
+                results.push(case.await);
             }
             results
         }
@@ -395,8 +489,27 @@ cases!(
     list_queues_returns_every_queue,
     list_queues_pages_by_page_size,
     list_queues_rejects_invalid_requests,
+    list_queues_filters_by_state,
+    list_queues_filters_by_field,
+    list_queues_rejects_invalid_filters,
+    update_queue_creates_missing_queue,
+    update_queue_changes_masked_fields,
+    update_queue_without_mask_replaces_every_field,
+    update_queue_with_empty_mask_changes_nothing,
+    update_queue_masks_whole_messages,
+    update_queue_ignores_output_only_fields,
+    update_queue_keeps_state,
+    update_queue_rejects_invalid_requests,
     delete_queue_removes_queue,
     delete_queue_rejects_invalid_names,
+    delete_queue_blocks_name,
+    pause_queue_stops_dispatch,
+    pause_and_resume_repeat,
+    pause_queue_rejects_invalid_names,
+    resume_queue_rejects_invalid_names,
+    purge_queue_deletes_existing_tasks,
+    purge_queue_keeps_state,
+    purge_queue_rejects_invalid_names,
     create_task_returns_basic_view,
     create_task_returns_full_view,
     create_task_drops_reserved_headers,
@@ -406,6 +519,11 @@ cases!(
     create_task_generates_numeric_id,
     create_task_rejects_invalid_requests,
     create_task_rejects_invalid_names,
+    create_task_returns_retry_config,
+    create_task_rejects_invalid_retry_config,
+    create_task_limits_task_size,
+    create_task_limits_schedule_time,
+    create_task_moves_past_schedule_time_to_now,
     get_task_returns_basic_and_full_views,
     get_task_rejects_invalid_names,
     list_tasks_returns_every_task,
@@ -413,6 +531,12 @@ cases!(
     list_tasks_rejects_invalid_requests,
     delete_task_removes_task,
     delete_task_rejects_invalid_names,
+    delete_task_blocks_name,
+    finished_task_blocks_name,
+    run_task_dispatches_now,
+    run_task_dispatches_from_paused_queue,
+    run_task_backs_off_after_failure,
+    run_task_rejects_invalid_names,
     unknown_enums_fall_back_to_defaults,
     dispatch_sends_cloud_tasks_headers,
     dispatch_reports_previous_responses,
@@ -423,6 +547,7 @@ cases!(
     retries_stop_at_max_retry_duration,
     retries_stop_once_both_limits_pass,
     retries_back_off_exponentially_then_linearly,
+    retries_follow_task_retry_config,
 );
 
 fn http(url: &str) -> HttpRequest {
@@ -1885,4 +2010,1148 @@ async fn retries_back_off_exponentially_then_linearly(t: &mut Target) {
                 .collect::<Vec<_>>(),
         ),
     );
+}
+
+fn mask(paths: &[&str]) -> Option<FieldMask> {
+    Some(FieldMask {
+        paths: paths.iter().map(|path| path.to_string()).collect(),
+    })
+}
+
+/// Rate limits and retry config unlike the defaults, so an update shows which fields it changed
+fn configured() -> Queue {
+    Queue {
+        rate_limits: Some(RateLimits {
+            max_dispatches_per_second: 10.0,
+            max_burst_size: 0,
+            max_concurrent_dispatches: 5,
+        }),
+        retry_config: Some(RetryConfig {
+            max_attempts: 5,
+            max_retry_duration: seconds(60),
+            min_backoff: seconds(1),
+            max_backoff: seconds(10),
+            max_doublings: 3,
+        }),
+        ..Default::default()
+    }
+}
+
+async fn update_queue_creates_missing_queue(t: &mut Target) {
+    let unmasked = t.queue_name("upserted");
+    let masked = t.queue_name("upserted-masked");
+
+    let created = t
+        .update_queue(UpdateQueueRequest {
+            queue: Some(Queue {
+                name: unmasked.clone(),
+                ..configured()
+            }),
+            update_mask: None,
+        })
+        .await;
+    let created_masked = t
+        .update_queue(UpdateQueueRequest {
+            queue: Some(Queue {
+                name: masked,
+                ..configured()
+            }),
+            update_mask: mask(&["rate_limits.max_concurrent_dispatches"]),
+        })
+        .await;
+    let got = t.get_queue(GetQueueRequest { name: unmasked }).await;
+
+    t.record("update_queue without mask", created);
+    t.record("update_queue with mask", created_masked);
+    t.record("get_queue", got);
+}
+
+async fn update_queue_changes_masked_fields(t: &mut Target) {
+    let name = t.queue_with("masked", configured()).await;
+    let request = UpdateQueueRequest {
+        queue: Some(Queue {
+            name,
+            rate_limits: Some(RateLimits {
+                max_dispatches_per_second: 100.0,
+                ..Default::default()
+            }),
+            retry_config: Some(RetryConfig {
+                max_attempts: 7,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        update_mask: mask(&[
+            "rate_limits.max_dispatches_per_second",
+            "retry_config.max_attempts",
+        ]),
+    };
+
+    let result = t.update_queue(request).await;
+
+    t.record("update_queue", result);
+}
+
+async fn update_queue_without_mask_replaces_every_field(t: &mut Target) {
+    let name = t.queue_with("unmasked", configured()).await;
+    let request = UpdateQueueRequest {
+        queue: Some(Queue {
+            name,
+            rate_limits: Some(RateLimits {
+                max_dispatches_per_second: 100.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        update_mask: None,
+    };
+
+    let result = t.update_queue(request).await;
+
+    t.record("update_queue", result);
+}
+
+async fn update_queue_with_empty_mask_changes_nothing(t: &mut Target) {
+    let name = t.queue("empty-mask").await;
+    let request = UpdateQueueRequest {
+        queue: Some(Queue {
+            name,
+            ..configured()
+        }),
+        update_mask: mask(&[]),
+    };
+
+    let result = t.update_queue(request).await;
+
+    t.record("update_queue", result);
+}
+
+async fn update_queue_masks_whole_messages(t: &mut Target) {
+    let name = t.queue_with("whole-messages", configured()).await;
+
+    let rate_limits = t
+        .update_queue(UpdateQueueRequest {
+            queue: Some(Queue {
+                name: name.clone(),
+                rate_limits: Some(RateLimits {
+                    max_dispatches_per_second: 100.0,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            update_mask: mask(&["rate_limits"]),
+        })
+        .await;
+    let retry_config = t
+        .update_queue(UpdateQueueRequest {
+            queue: Some(Queue {
+                name,
+                ..Default::default()
+            }),
+            update_mask: mask(&["retry_config"]),
+        })
+        .await;
+
+    t.record("rate_limits", rate_limits);
+    t.record("retry_config", retry_config);
+}
+
+async fn update_queue_ignores_output_only_fields(t: &mut Target) {
+    let name = t.queue_name("output-only");
+    let created = t
+        .create_queue(CreateQueueRequest {
+            parent: t.parent.clone(),
+            queue: Some(Queue {
+                name: name.clone(),
+                ..Default::default()
+            }),
+        })
+        .await
+        .unwrap();
+    for path in [
+        "name",
+        "state",
+        "purge_time",
+        "rate_limits.max_burst_size",
+        "app_engine_routing_override",
+        "http_target",
+        "stackdriver_logging_config",
+    ] {
+        let request = UpdateQueueRequest {
+            queue: Some(Queue {
+                name: name.clone(),
+                state: queue::State::Paused.into(),
+                purge_time: Some(t.tomorrow),
+                rate_limits: Some(RateLimits {
+                    max_burst_size: 50,
+                    ..RateLimits::default()
+                }),
+                ..Default::default()
+            }),
+            update_mask: mask(&[path]),
+        };
+
+        let result = t.update_queue(request).await;
+
+        t.record(path, result.map(|queue| queue == created));
+    }
+}
+
+async fn update_queue_keeps_state(t: &mut Target) {
+    let name = t.queue("update-paused").await;
+    t.pause_queue(PauseQueueRequest { name: name.clone() })
+        .await
+        .unwrap();
+    let request = UpdateQueueRequest {
+        queue: Some(Queue {
+            name,
+            state: queue::State::Running.into(),
+            ..Default::default()
+        }),
+        update_mask: None,
+    };
+
+    let result = t.update_queue(request).await;
+
+    t.record("update_queue state", result.map(|queue| queue.state()));
+}
+
+async fn update_queue_rejects_invalid_requests(t: &mut Target) {
+    let existing = t.queue_with("update-invalid", configured()).await;
+    let named = |name: String| {
+        Some(Queue {
+            name,
+            ..Default::default()
+        })
+    };
+    let update = |paths: &[&str], queue: Queue| UpdateQueueRequest {
+        queue: Some(Queue {
+            name: existing.clone(),
+            ..queue
+        }),
+        update_mask: mask(paths),
+    };
+    for (label, request) in [
+        (
+            "no queue",
+            UpdateQueueRequest {
+                queue: None,
+                update_mask: None,
+            },
+        ),
+        (
+            "empty name",
+            UpdateQueueRequest {
+                queue: named(String::new()),
+                update_mask: None,
+            },
+        ),
+        (
+            "name not in a project",
+            UpdateQueueRequest {
+                queue: named("not-a-valid-name".to_owned()),
+                update_mask: None,
+            },
+        ),
+        (
+            "name without queue id",
+            UpdateQueueRequest {
+                queue: named(format!("{}/queues", t.parent)),
+                update_mask: None,
+            },
+        ),
+        (
+            "invalid queue id",
+            UpdateQueueRequest {
+                queue: named(format!("{}/queues/not_valid", t.parent)),
+                update_mask: None,
+            },
+        ),
+        (
+            "unknown mask path on unknown queue",
+            UpdateQueueRequest {
+                queue: named(t.queue_name("missing")),
+                update_mask: mask(&["bogus"]),
+            },
+        ),
+        ("unknown mask path", update(&["bogus"], Queue::default())),
+        (
+            "unknown nested mask path",
+            update(&["rate_limits.bogus"], Queue::default()),
+        ),
+        (
+            "mask path below a scalar",
+            update(
+                &["rate_limits.max_dispatches_per_second.bogus"],
+                Queue::default(),
+            ),
+        ),
+        (
+            "camel case mask path",
+            update(&["rateLimits.maxDispatchesPerSecond"], Queue::default()),
+        ),
+        (
+            "comma-separated mask paths",
+            update(
+                &["rate_limits.max_dispatches_per_second,retry_config.max_attempts"],
+                Queue::default(),
+            ),
+        ),
+        (
+            "mask path with space",
+            update(&[" state"], Queue::default()),
+        ),
+        ("empty mask path", update(&[""], Queue::default())),
+        (
+            "rate 501",
+            update(
+                &["rate_limits.max_dispatches_per_second"],
+                Queue {
+                    rate_limits: Some(RateLimits {
+                        max_dispatches_per_second: 501.0,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ),
+        ),
+        (
+            "min backoff above stored max backoff",
+            update(
+                &["retry_config.min_backoff"],
+                Queue {
+                    retry_config: Some(RetryConfig {
+                        min_backoff: seconds(20),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ),
+        ),
+    ] {
+        let result = t.update_queue(request).await;
+
+        t.record(label, result);
+    }
+}
+
+async fn pause_queue_stops_dispatch(t: &mut Target) {
+    let queue = t.queue("paused").await;
+    let paused = t
+        .pause_queue(PauseQueueRequest {
+            name: queue.clone(),
+        })
+        .await;
+    t.create_task(CreateTaskRequest {
+        parent: queue.clone(),
+        task: Some(due_task(
+            &format!("{queue}/tasks/t"),
+            t.receiver.url_for("paused", "200"),
+        )),
+        response_view: task::View::Unspecified.into(),
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    let while_paused = t.receiver.received("paused").len();
+
+    let resumed = t.resume_queue(ResumeQueueRequest { name: queue }).await;
+
+    let after_resume = t.receiver.wait_for("paused", 1).await.len();
+    t.record("pause_queue", paused);
+    t.record("requests while paused", Ok::<_, Status>(while_paused));
+    t.record("resume_queue", resumed);
+    t.record("requests after resume", Ok::<_, Status>(after_resume));
+}
+
+async fn pause_and_resume_repeat(t: &mut Target) {
+    let name = t.queue("repeat").await;
+
+    let first_pause = t
+        .pause_queue(PauseQueueRequest { name: name.clone() })
+        .await;
+    let second_pause = t
+        .pause_queue(PauseQueueRequest { name: name.clone() })
+        .await;
+    let first_resume = t
+        .resume_queue(ResumeQueueRequest { name: name.clone() })
+        .await;
+    let second_resume = t.resume_queue(ResumeQueueRequest { name }).await;
+
+    t.record("first pause", first_pause.map(|queue| queue.state()));
+    t.record("second pause", second_pause.map(|queue| queue.state()));
+    t.record("first resume", first_resume.map(|queue| queue.state()));
+    t.record("second resume", second_resume.map(|queue| queue.state()));
+}
+
+/// Names that every queue RPC rejects, alongside a queue that does not exist
+fn invalid_queue_names(t: &Target) -> [(&'static str, String); 5] {
+    [
+        ("unknown queue", t.queue_name("missing")),
+        ("empty name", String::new()),
+        ("name not in a project", "not-a-valid-name".to_owned()),
+        ("name without queue id", format!("{}/queues", t.parent)),
+        ("invalid queue id", format!("{}/queues/not_valid", t.parent)),
+    ]
+}
+
+async fn pause_queue_rejects_invalid_names(t: &mut Target) {
+    for (label, name) in invalid_queue_names(t) {
+        let result = t.pause_queue(PauseQueueRequest { name }).await;
+
+        t.record(label, result);
+    }
+}
+
+async fn resume_queue_rejects_invalid_names(t: &mut Target) {
+    for (label, name) in invalid_queue_names(t) {
+        let result = t.resume_queue(ResumeQueueRequest { name }).await;
+
+        t.record(label, result);
+    }
+}
+
+async fn purge_queue_rejects_invalid_names(t: &mut Target) {
+    for (label, name) in invalid_queue_names(t) {
+        let result = t.purge_queue(PurgeQueueRequest { name }).await;
+
+        t.record(label, result);
+    }
+}
+
+/// Polls the queue's task names until `done` holds, as a purge takes a moment in real Cloud Tasks
+async fn poll_task_names(
+    t: &mut Target,
+    queue: &str,
+    done: impl Fn(&[String]) -> bool,
+) -> Vec<String> {
+    tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        loop {
+            let mut names: Vec<String> = t
+                .list_tasks(ListTasksRequest {
+                    parent: queue.to_owned(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .tasks
+                .into_iter()
+                .map(|task| task.name)
+                .collect();
+            names.sort();
+            if done(&names) {
+                return names;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{queue} reached the expected tasks in time"))
+}
+
+async fn purge_queue_deletes_existing_tasks(t: &mut Target) {
+    let queue = t.queue("purged").await;
+    let purged_task = format!("{queue}/tasks/a");
+    let create = |t: &Target, name: &str| CreateTaskRequest {
+        parent: queue.clone(),
+        task: Some(t.task(name, http("https://example.com/work"))),
+        response_view: task::View::Unspecified.into(),
+    };
+    t.create_task(create(t, &purged_task)).await.unwrap();
+
+    let purged = t
+        .purge_queue(PurgeQueueRequest {
+            name: queue.clone(),
+        })
+        .await;
+
+    poll_task_names(t, &queue, <[String]>::is_empty).await;
+    // Cloud Tasks keeps create_time in whole seconds, so a task created in the purge's second can count as before it
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    t.create_task(create(t, &format!("{queue}/tasks/b")))
+        .await
+        .unwrap();
+    let listed = poll_task_names(t, &queue, |names| !names.is_empty()).await;
+    let got = t
+        .get_task(GetTaskRequest {
+            name: purged_task.clone(),
+            response_view: task::View::Unspecified.into(),
+        })
+        .await;
+    let recreated = t.create_task(create(t, &purged_task)).await;
+    let got_queue = t
+        .get_queue(GetQueueRequest {
+            name: queue.clone(),
+        })
+        .await;
+    t.record(
+        "purge_queue",
+        purged.map(|queue| (queue.state(), queue.purge_time.is_some())),
+    );
+    t.record("tasks after purge", Ok::<_, Status>(listed));
+    t.record("get_task purged", got);
+    t.record("create_task purged", recreated.map(|task| task.name));
+    t.record(
+        "get_queue purge_time is set",
+        got_queue.map(|queue| queue.purge_time.is_some()),
+    );
+}
+
+async fn purge_queue_keeps_state(t: &mut Target) {
+    let name = t.queue("purge-paused").await;
+    t.pause_queue(PauseQueueRequest { name: name.clone() })
+        .await
+        .unwrap();
+
+    let result = t.purge_queue(PurgeQueueRequest { name }).await;
+
+    t.record("purge_queue state", result.map(|queue| queue.state()));
+}
+
+async fn run_task_dispatches_now(t: &mut Target) {
+    let queue = t.queue("run").await;
+    let name = format!("{queue}/tasks/t");
+    t.create_task(CreateTaskRequest {
+        parent: queue,
+        task: Some(t.task(&name, http(&t.receiver.url_for("run", "200")))),
+        response_view: task::View::Unspecified.into(),
+    })
+    .await
+    .unwrap();
+
+    let result = t
+        .run_task(RunTaskRequest {
+            name: name.clone(),
+            response_view: task::View::Unspecified.into(),
+        })
+        .await;
+
+    let requests = t.receiver.wait_for("run", 1).await;
+    let gone = t.poll_task(&name, Result::is_err).await;
+    t.record("run_task", result);
+    t.record(
+        "request headers",
+        Ok::<_, Status>(dispatched_headers(&requests[0])),
+    );
+    t.record("get_task after success", gone);
+}
+
+async fn run_task_dispatches_from_paused_queue(t: &mut Target) {
+    let queue = t.queue("run-paused").await;
+    t.pause_queue(PauseQueueRequest {
+        name: queue.clone(),
+    })
+    .await
+    .unwrap();
+    let name = format!("{queue}/tasks/t");
+    t.create_task(CreateTaskRequest {
+        parent: queue,
+        task: Some(t.task(&name, http(&t.receiver.url_for("run-paused", "200")))),
+        response_view: task::View::Unspecified.into(),
+    })
+    .await
+    .unwrap();
+
+    t.run_task(RunTaskRequest {
+        name,
+        response_view: task::View::Unspecified.into(),
+    })
+    .await
+    .unwrap();
+
+    let requests = t.receiver.wait_for("run-paused", 1).await;
+    t.record("requests", Ok::<_, Status>(requests.len()));
+}
+
+async fn run_task_backs_off_after_failure(t: &mut Target) {
+    let queue = t
+        .queue_with(
+            "run-failed",
+            Queue {
+                retry_config: Some(RetryConfig {
+                    min_backoff: seconds(60),
+                    max_backoff: seconds(60),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await;
+    let name = format!("{queue}/tasks/t");
+    t.create_task(CreateTaskRequest {
+        parent: queue,
+        task: Some(t.task(&name, http(&t.receiver.url_for("run-failed", "500")))),
+        response_view: task::View::Unspecified.into(),
+    })
+    .await
+    .unwrap();
+
+    t.run_task(RunTaskRequest {
+        name: name.clone(),
+        response_view: task::View::Unspecified.into(),
+    })
+    .await
+    .unwrap();
+
+    let result = t
+        .poll_task(&name, |result| {
+            result.as_ref().is_ok_and(|task| {
+                task.last_attempt
+                    .as_ref()
+                    .is_some_and(|attempt| attempt.response_status.is_some())
+            })
+        })
+        .await;
+    t.record(
+        "get_task",
+        result.map(|task| {
+            let attempt = task.last_attempt.unwrap();
+            let responded = SystemTime::try_from(attempt.response_time.unwrap()).unwrap();
+            let retry_at = SystemTime::try_from(task.schedule_time.unwrap()).unwrap();
+            (
+                task.dispatch_count,
+                task.response_count,
+                task.first_attempt.is_some(),
+                attempt.dispatch_time.is_some(),
+                attempt.response_status,
+                retry_at
+                    .duration_since(responded)
+                    .unwrap()
+                    .as_secs_f64()
+                    .round() as u64,
+            )
+        }),
+    );
+}
+
+async fn run_task_rejects_invalid_names(t: &mut Target) {
+    let queue = t.queue("run-invalid").await;
+    for (label, name) in [
+        ("unknown task", format!("{queue}/tasks/missing")),
+        (
+            "unknown queue",
+            format!("{}/tasks/t", t.queue_name("missing")),
+        ),
+        ("empty name", String::new()),
+        ("name not in a project", "not-a-valid-name".to_owned()),
+        ("name without task id", format!("{queue}/tasks")),
+        ("invalid task id", format!("{queue}/tasks/not valid")),
+    ] {
+        let result = t
+            .run_task(RunTaskRequest {
+                name,
+                response_view: task::View::Unspecified.into(),
+            })
+            .await;
+
+        t.record(label, result);
+    }
+}
+
+/// Lists with the filter, keeping only this case's queues as other cases share the location
+async fn filtered_queue_names(
+    t: &mut Target,
+    filter: &str,
+    key: &str,
+) -> Result<Vec<String>, Status> {
+    let response = t
+        .list_queues(ListQueuesRequest {
+            parent: t.parent.clone(),
+            filter: filter.to_owned(),
+            ..Default::default()
+        })
+        .await?;
+    let mut names: Vec<String> = response
+        .queues
+        .into_iter()
+        .map(|queue| queue.name)
+        .filter(|name| name.contains(key))
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+async fn list_queues_filters_by_state(t: &mut Target) {
+    t.queue("state-filter-running").await;
+    let paused = t.queue("state-filter-paused").await;
+    t.pause_queue(PauseQueueRequest { name: paused })
+        .await
+        .unwrap();
+    for filter in [
+        "state: PAUSED",
+        "state:PAUSED",
+        "state = PAUSED",
+        "state != PAUSED",
+        "state: paused",
+        "State: Paused",
+        "state: \"PAUSED\"",
+        "state: DISABLED",
+        "NOT state: PAUSED",
+        "-state: PAUSED",
+        "state: PAUSED OR state: RUNNING",
+        "state: PAUSED AND state: RUNNING",
+        "state: PAUSED state: RUNNING",
+        "(state: PAUSED)",
+        "state: PAUSED OR (state: RUNNING AND NOT state: RUNNING)",
+        "state > RUNNING",
+    ] {
+        let result = filtered_queue_names(t, filter, "-state-filter-").await;
+
+        t.record(filter, result);
+    }
+}
+
+async fn list_queues_filters_by_field(t: &mut Target) {
+    t.queue_with("field-filter-configured", configured()).await;
+    let purged = t.queue("field-filter-purged").await;
+    t.purge_queue(PurgeQueueRequest { name: purged })
+        .await
+        .unwrap();
+    for filter in [
+        "name: field-filter-purged",
+        "name: PURGED",
+        "name: *",
+        "rate_limits.max_dispatches_per_second = 500",
+        "rate_limits.max_dispatches_per_second < 100",
+        "rate_limits.max_dispatches_per_second: 10",
+        "rateLimits.maxDispatchesPerSecond <= 10",
+        "rate_limits.max_concurrent_dispatches >= 1000",
+        "rate_limits.max_burst_size != 100",
+        "retry_config.max_attempts = 5",
+        "retry_config.min_backoff = 1s",
+        "retry_config.min_backoff > 0.5s",
+        "retry_config.min_backoff: 0.1s",
+        "retry_config.max_retry_duration: *",
+        "retry_config.max_retry_duration < 1s",
+        "purge_time: *",
+        "purge_time > \"2020-01-01T00:00:00Z\"",
+        "purge_time < \"2020-01-01T00:00:00Z\"",
+        "rate_limits: *",
+        "http_target: *",
+    ] {
+        let result = filtered_queue_names(t, filter, "-field-filter-").await;
+
+        t.record(filter, result);
+    }
+}
+
+async fn list_queues_rejects_invalid_filters(t: &mut Target) {
+    for filter in [
+        "bogus_field: x",
+        "max_dispatches_per_second < 100",
+        "state: BOGUS",
+        "state: 2",
+        "retry_config.max_backoff = 3600",
+        "rate_limits.max_dispatches_per_second = fast",
+        "rate_limits: 10",
+    ] {
+        let result = t
+            .list_queues(ListQueuesRequest {
+                parent: t.parent.clone(),
+                filter: filter.to_owned(),
+                ..Default::default()
+            })
+            .await;
+
+        t.record(filter, result.map(|response| response.queues.len()));
+    }
+}
+
+/// Retry config unlike the queue defaults
+fn task_retry_config() -> RetryConfig {
+    RetryConfig {
+        max_attempts: 3,
+        max_retry_duration: seconds(60),
+        min_backoff: seconds(2),
+        max_backoff: seconds(4),
+        max_doublings: 1,
+    }
+}
+
+async fn create_task_returns_retry_config(t: &mut Target) {
+    let queue = t.queue("task-retry").await;
+    let name = format!("{queue}/tasks/t");
+    let partial = format!("{queue}/tasks/partial");
+
+    let created = t
+        .create_task(CreateTaskRequest {
+            parent: queue.clone(),
+            task: Some(Task {
+                retry_config: Some(task_retry_config()),
+                ..t.task(&name, http("https://example.com/work"))
+            }),
+            response_view: task::View::Unspecified.into(),
+        })
+        .await;
+    let partial_created = t
+        .create_task(CreateTaskRequest {
+            parent: queue,
+            task: Some(Task {
+                retry_config: Some(RetryConfig {
+                    max_attempts: 3,
+                    ..Default::default()
+                }),
+                ..t.task(&partial, http("https://example.com/work"))
+            }),
+            response_view: task::View::Unspecified.into(),
+        })
+        .await;
+    let got = t
+        .get_task(GetTaskRequest {
+            name,
+            response_view: task::View::Unspecified.into(),
+        })
+        .await;
+
+    t.record("create_task", created.map(|task| task.retry_config));
+    t.record(
+        "create_task partial",
+        partial_created.map(|task| task.retry_config),
+    );
+    t.record("get_task", got.map(|task| task.retry_config));
+}
+
+async fn create_task_rejects_invalid_retry_config(t: &mut Target) {
+    let queue = t.queue("task-retry-invalid").await;
+    let negative = Some(Duration {
+        seconds: -1,
+        nanos: 0,
+    });
+    for (label, retry_config) in [
+        (
+            "max attempts -2",
+            RetryConfig {
+                max_attempts: -2,
+                ..Default::default()
+            },
+        ),
+        (
+            "max doublings -1",
+            RetryConfig {
+                max_doublings: -1,
+                ..Default::default()
+            },
+        ),
+        (
+            "min backoff -1s",
+            RetryConfig {
+                min_backoff: negative,
+                ..Default::default()
+            },
+        ),
+        (
+            "max backoff -1s",
+            RetryConfig {
+                max_backoff: negative,
+                ..Default::default()
+            },
+        ),
+        (
+            "max retry duration -1s",
+            RetryConfig {
+                max_retry_duration: negative,
+                ..Default::default()
+            },
+        ),
+        (
+            "max retry duration 30.9s",
+            RetryConfig {
+                max_retry_duration: Some(Duration {
+                    seconds: 30,
+                    nanos: 900_000_000,
+                }),
+                ..Default::default()
+            },
+        ),
+        (
+            "min backoff above max backoff",
+            RetryConfig {
+                min_backoff: seconds(10),
+                max_backoff: seconds(5),
+                ..Default::default()
+            },
+        ),
+    ] {
+        let request = CreateTaskRequest {
+            parent: queue.clone(),
+            task: Some(Task {
+                retry_config: Some(retry_config),
+                ..t.task("", http("https://example.com/work"))
+            }),
+            response_view: task::View::Unspecified.into(),
+        };
+
+        let result = t.create_task(request).await;
+
+        t.record(label, result.map(|task| task.retry_config));
+    }
+}
+
+async fn retries_follow_task_retry_config(t: &mut Target) {
+    let queue = t
+        .queue_with(
+            "task-retries",
+            Queue {
+                retry_config: Some(RetryConfig {
+                    max_attempts: 10,
+                    min_backoff: seconds(1),
+                    max_backoff: seconds(1),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await;
+    let name = format!("{queue}/tasks/t");
+    t.create_task(CreateTaskRequest {
+        parent: queue,
+        task: Some(Task {
+            retry_config: Some(RetryConfig {
+                max_attempts: 2,
+                min_backoff: seconds(1),
+                max_backoff: seconds(1),
+                ..Default::default()
+            }),
+            ..due_task(&name, t.receiver.url_for("task-retries", "500"))
+        }),
+        response_view: task::View::Unspecified.into(),
+    })
+    .await
+    .unwrap();
+
+    t.poll_task(&name, Result::is_err).await.unwrap_err();
+
+    let attempts = t.receiver.received("task-retries").len();
+    t.record("2 attempts on a queue of 10", Ok::<_, Status>(attempts));
+}
+
+async fn create_task_limits_task_size(t: &mut Target) {
+    let queue = t.queue("task-size").await;
+    let name = format!("{queue}/tasks/t");
+    // Searches for the largest body accepted, which is below 2 MB
+    let (mut accepted, mut rejected) = (0, 2_000_000);
+    let mut error = None;
+    let mut probe = 0;
+    while rejected - accepted > 1 {
+        let body = (accepted + rejected) / 2;
+        probe += 1;
+        let request = CreateTaskRequest {
+            parent: queue.clone(),
+            task: Some(t.task(
+                &format!("{name}{probe:02}"),
+                HttpRequest {
+                    body: vec![b'a'; body],
+                    ..with_headers(&[("X-Header", &"h".repeat(1000))])
+                },
+            )),
+            response_view: task::View::Unspecified.into(),
+        };
+        match t.create_task(request).await {
+            Ok(_) => accepted = body,
+            Err(status) => {
+                rejected = body;
+                error = Some(status);
+            }
+        }
+    }
+
+    // The name's length counts towards the size, and differs between targets
+    t.record(
+        "largest body plus name length",
+        Ok::<_, Status>(accepted + name.len()),
+    );
+    t.record("one byte more", Err::<(), _>(error.unwrap()));
+}
+
+async fn delete_task_blocks_name(t: &mut Target) {
+    let queue = t.queue("deleted-task").await;
+    let name = format!("{queue}/tasks/t");
+    let create = |t: &Target| CreateTaskRequest {
+        parent: queue.clone(),
+        task: Some(t.task(&name, http("https://example.com/work"))),
+        response_view: task::View::Unspecified.into(),
+    };
+    t.create_task(create(t)).await.unwrap();
+    t.delete_task(DeleteTaskRequest { name: name.clone() })
+        .await
+        .unwrap();
+
+    let got = t
+        .get_task(GetTaskRequest {
+            name: name.clone(),
+            response_view: task::View::Unspecified.into(),
+        })
+        .await;
+    let recreated = t.create_task(create(t)).await;
+    let deleted = t
+        .delete_task(DeleteTaskRequest { name: name.clone() })
+        .await;
+    let run = t
+        .run_task(RunTaskRequest {
+            name,
+            response_view: task::View::Unspecified.into(),
+        })
+        .await;
+
+    t.record("get_task", got);
+    t.record("create_task", recreated.map(|task| task.name));
+    t.record("delete_task", deleted);
+    t.record("run_task", run);
+}
+
+async fn finished_task_blocks_name(t: &mut Target) {
+    let queue = t
+        .queue_with(
+            "finished-task",
+            Queue {
+                retry_config: Some(RetryConfig {
+                    max_attempts: 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await;
+    for step in ["200", "500"] {
+        let name = format!("{queue}/tasks/t{step}");
+        let create = |t: &Target| CreateTaskRequest {
+            parent: queue.clone(),
+            task: Some(due_task(
+                &name,
+                t.receiver.url_for(&format!("finished-{step}"), step),
+            )),
+            response_view: task::View::Unspecified.into(),
+        };
+        t.create_task(create(t)).await.unwrap();
+
+        let got = t.poll_task(&name, Result::is_err).await;
+        let recreated = t.create_task(create(t)).await;
+
+        t.record(&format!("{step} get_task"), got);
+        t.record(
+            &format!("{step} create_task"),
+            recreated.map(|task| task.name),
+        );
+    }
+}
+
+async fn delete_queue_blocks_name(t: &mut Target) {
+    let name = t.queue("deleted-queue").await;
+    t.delete_queue(DeleteQueueRequest { name: name.clone() })
+        .await
+        .unwrap();
+    let create = CreateQueueRequest {
+        parent: t.parent.clone(),
+        queue: Some(Queue {
+            name: name.clone(),
+            ..Default::default()
+        }),
+    };
+
+    // Real Cloud Tasks accepts the name for a moment after the delete
+    let created = retry_until!(t.create_queue(create.clone()), Result::is_err);
+    // Real Cloud Tasks accepts about 1 in 50, though no queue appears
+    let updated = retry_until!(
+        t.update_queue(UpdateQueueRequest {
+            queue: create.queue.clone(),
+            update_mask: None,
+        }),
+        Result::is_err
+    );
+    let got = t.get_queue(GetQueueRequest { name: name.clone() }).await;
+    let deleted = t
+        .delete_queue(DeleteQueueRequest { name: name.clone() })
+        .await;
+    let paused = t
+        .pause_queue(PauseQueueRequest { name: name.clone() })
+        .await;
+    // Real Cloud Tasks answers about 1 in 3 with FailedPrecondition, saying the queue existed recently
+    let task = retry_until!(
+        t.create_task(CreateTaskRequest {
+            parent: name.clone(),
+            task: Some(t.task("", http("https://example.com/work"))),
+            response_view: task::View::Unspecified.into(),
+        }),
+        |result: &Result<Task, Status>| result
+            .as_ref()
+            .is_err_and(|status| status.code() == Code::NotFound)
+    );
+    let listed = t
+        .list_queues(ListQueuesRequest {
+            parent: t.parent.clone(),
+            ..Default::default()
+        })
+        .await;
+
+    t.record("create_queue", created);
+    t.record("update_queue", updated);
+    t.record("get_queue", got);
+    t.record("delete_queue", deleted);
+    t.record("pause_queue", paused);
+    t.record("create_task", task.map(|task| task.name));
+    t.record(
+        "list_queues includes it",
+        listed.map(|response| response.queues.iter().any(|queue| queue.name == name)),
+    );
+}
+
+async fn create_task_limits_schedule_time(t: &mut Target) {
+    let queue = t.queue("schedule-limit").await;
+    for (label, seconds, nanos) in [
+        ("29 days out", seconds_from_now(29 * 24 * 60 * 60), 0),
+        ("2100-01-01T00:00:00Z", 4_102_444_800, 0),
+        ("2100-07-01T00:00:00Z", 4_118_083_200, 0),
+        ("2100-01-01T00:00:00.5Z", 4_102_444_800, 500_000_000),
+        ("2100-01-01T00:00:00.000000001Z", 4_102_444_800, 1),
+        ("10000-01-01T00:00:00Z", 253_402_300_800, 0),
+    ] {
+        let request = CreateTaskRequest {
+            parent: queue.clone(),
+            task: Some(Task {
+                schedule_time: Some(Timestamp { seconds, nanos }),
+                ..t.task("", http("https://example.com/work"))
+            }),
+            response_view: task::View::Unspecified.into(),
+        };
+
+        let result = t.create_task(request).await;
+
+        t.record(label, result.map(|task| task.name.starts_with(&queue)));
+    }
+}
+
+async fn create_task_moves_past_schedule_time_to_now(t: &mut Target) {
+    let queue = t.queue("schedule-past").await;
+    t.pause_queue(PauseQueueRequest {
+        name: queue.clone(),
+    })
+    .await
+    .unwrap();
+    for (label, seconds) in [
+        ("an hour ago", seconds_from_now(-60 * 60)),
+        ("1970-01-01T00:00:00Z", 0),
+        ("1969-12-31T23:59:59Z", -1),
+        ("0001-01-01T00:00:00Z", -62_135_596_800),
+        ("0000-12-31T23:59:59Z", -62_135_596_801),
+    ] {
+        let request = CreateTaskRequest {
+            parent: queue.clone(),
+            task: Some(Task {
+                schedule_time: Some(Timestamp { seconds, nanos: 0 }),
+                ..t.task("", http("https://example.com/work"))
+            }),
+            response_view: task::View::Unspecified.into(),
+        };
+
+        let result = t.create_task(request).await;
+
+        // Whether the task is due as it is created
+        t.record(
+            label,
+            result.map(|task| {
+                let lag = task.schedule_time.unwrap().seconds - task.create_time.unwrap().seconds;
+                (0..=1).contains(&lag)
+            }),
+        );
+    }
 }

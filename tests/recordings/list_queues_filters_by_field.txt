@@ -1,0 +1,60 @@
+name: field-filter-purged -> [
+    "projects/{project}/locations/{location}/queues/{run}-field-filter-purged",
+]
+name: PURGED -> [
+    "projects/{project}/locations/{location}/queues/{run}-field-filter-purged",
+]
+name: * -> [
+    "projects/{project}/locations/{location}/queues/{run}-field-filter-configured",
+    "projects/{project}/locations/{location}/queues/{run}-field-filter-purged",
+]
+rate_limits.max_dispatches_per_second = 500 -> [
+    "projects/{project}/locations/{location}/queues/{run}-field-filter-purged",
+]
+rate_limits.max_dispatches_per_second < 100 -> [
+    "projects/{project}/locations/{location}/queues/{run}-field-filter-configured",
+]
+rate_limits.max_dispatches_per_second: 10 -> [
+    "projects/{project}/locations/{location}/queues/{run}-field-filter-configured",
+]
+rateLimits.maxDispatchesPerSecond <= 10 -> [
+    "projects/{project}/locations/{location}/queues/{run}-field-filter-configured",
+]
+rate_limits.max_concurrent_dispatches >= 1000 -> [
+    "projects/{project}/locations/{location}/queues/{run}-field-filter-purged",
+]
+rate_limits.max_burst_size != 100 -> [
+    "projects/{project}/locations/{location}/queues/{run}-field-filter-configured",
+]
+retry_config.max_attempts = 5 -> [
+    "projects/{project}/locations/{location}/queues/{run}-field-filter-configured",
+]
+retry_config.min_backoff = 1s -> [
+    "projects/{project}/locations/{location}/queues/{run}-field-filter-configured",
+]
+retry_config.min_backoff > 0.5s -> [
+    "projects/{project}/locations/{location}/queues/{run}-field-filter-configured",
+]
+retry_config.min_backoff: 0.1s -> [
+    "projects/{project}/locations/{location}/queues/{run}-field-filter-purged",
+]
+retry_config.max_retry_duration: * -> [
+    "projects/{project}/locations/{location}/queues/{run}-field-filter-configured",
+]
+retry_config.max_retry_duration < 1s -> [
+    "projects/{project}/locations/{location}/queues/{run}-field-filter-purged",
+]
+purge_time: * -> [
+    "projects/{project}/locations/{location}/queues/{run}-field-filter-purged",
+]
+purge_time > "2020-01-01T00:00:00Z" -> [
+    "projects/{project}/locations/{location}/queues/{run}-field-filter-purged",
+]
+purge_time < "2020-01-01T00:00:00Z" -> [
+    "projects/{project}/locations/{location}/queues/{run}-field-filter-configured",
+]
+rate_limits: * -> [
+    "projects/{project}/locations/{location}/queues/{run}-field-filter-configured",
+    "projects/{project}/locations/{location}/queues/{run}-field-filter-purged",
+]
+http_target: * -> []

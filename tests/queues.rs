@@ -3,6 +3,7 @@ mod support;
 use cloud_tasks_emulator::proto::google::cloud::tasks::v2::{
     CreateQueueRequest, GetQueueRequest, ListQueuesRequest, Queue,
 };
+use tonic::Code;
 
 fn create(parent: &str, queue: Queue) -> CreateQueueRequest {
     CreateQueueRequest {
@@ -144,4 +145,20 @@ async fn list_queues_pages_by_page_size() {
         ),
         (vec!["projects/p/locations/l/queues/c"], false)
     );
+}
+
+#[tokio::test]
+async fn list_queues_rejects_malformed_filter() {
+    let mut client = support::start_emulator().await;
+
+    let status = client
+        .list_queues(ListQueuesRequest {
+            parent: "projects/p/locations/l".to_owned(),
+            filter: "state: (".to_owned(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(status.code(), Code::InvalidArgument);
 }

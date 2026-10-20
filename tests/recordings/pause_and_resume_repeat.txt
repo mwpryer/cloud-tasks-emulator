@@ -1,0 +1,4 @@
+first pause -> Paused
+second pause -> Paused
+first resume -> Running
+second resume -> Running

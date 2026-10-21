@@ -4,11 +4,12 @@ use std::time::{Duration, SystemTime};
 
 use cloud_tasks_emulator::proto::google::cloud::tasks::v2::{
     AppEngineHttpRequest, AppEngineRouting, CreateQueueRequest, CreateTaskRequest, HttpMethod,
-    HttpRequest, OidcToken, Queue, RetryConfig, Task, http_request, task,
+    HttpRequest, OidcToken, PauseQueueRequest, Queue, RetryConfig, Task, http_request, task,
 };
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use prost_types::Timestamp;
+use reqwest::StatusCode;
 use serde_json::Value;
 use tonic::Code;
 
@@ -279,4 +280,75 @@ async fn app_engine_task_needs_app_engine_url() {
         .unwrap_err();
 
     assert_eq!(status.code(), Code::NotFound);
+}
+
+#[tokio::test]
+async fn wait_idle_answers_once_queue_has_no_tasks() {
+    let receiver = support::Receiver::start().await;
+    let (mut client, url) = support::start_emulator_with(None).await;
+    client.create_queue(queue(None)).await.unwrap();
+    client
+        .create_task(create(&receiver.url_for("t", "500,200")))
+        .await
+        .unwrap();
+
+    let response = reqwest::get(format!(
+        "{url}/emulator/projects/p/locations/l/queues/q:waitIdle"
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(
+        (response.status(), receiver.received("t").len()),
+        (StatusCode::NO_CONTENT, 2)
+    );
+}
+
+#[tokio::test]
+async fn wait_idle_rejects_unknown_queue() {
+    let (_, url) = support::start_emulator_with(None).await;
+
+    let response = reqwest::get(format!(
+        "{url}/emulator/projects/p/locations/l/queues/q:waitIdle"
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(
+        (response.status(), response.text().await.unwrap()),
+        (
+            StatusCode::NOT_FOUND,
+            "Queue projects/p/locations/l/queues/q does not exist".to_owned()
+        )
+    );
+}
+
+#[tokio::test]
+async fn wait_idle_rejects_paused_queue_with_tasks() {
+    let (mut client, url) = support::start_emulator_with(None).await;
+    client.create_queue(queue(None)).await.unwrap();
+    client
+        .pause_queue(PauseQueueRequest {
+            name: "projects/p/locations/l/queues/q".to_owned(),
+        })
+        .await
+        .unwrap();
+    client
+        .create_task(create("http://127.0.0.1:1/t"))
+        .await
+        .unwrap();
+
+    let response = reqwest::get(format!(
+        "{url}/emulator/projects/p/locations/l/queues/q:waitIdle"
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(
+        (response.status(), response.text().await.unwrap()),
+        (
+            StatusCode::CONFLICT,
+            "Queue projects/p/locations/l/queues/q is paused with tasks left".to_owned()
+        )
+    );
 }

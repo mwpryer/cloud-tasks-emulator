@@ -27,6 +27,7 @@ pub async fn start_emulator_with(app_engine: Option<&str>) -> (CloudTasksClient<
         listener,
         url.clone(),
         app_engine.map(str::to_owned),
+        Vec::new(),
     ));
     let client = CloudTasksClient::connect(url.clone()).await.unwrap();
     (client, url)

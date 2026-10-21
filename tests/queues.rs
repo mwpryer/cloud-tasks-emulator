@@ -1,8 +1,10 @@
 mod support;
 
+use cloud_tasks_emulator::proto::google::cloud::tasks::v2::cloud_tasks_client::CloudTasksClient;
 use cloud_tasks_emulator::proto::google::cloud::tasks::v2::{
     AppEngineRouting, CreateQueueRequest, GetQueueRequest, ListQueuesRequest, Queue,
 };
+use tokio::net::TcpListener;
 use tonic::Code;
 
 fn create(parent: &str, queue: Queue) -> CreateQueueRequest {
@@ -182,4 +184,60 @@ async fn routing_override_needs_app_engine_url() {
         .unwrap_err();
 
     assert_eq!(status.code(), Code::NotFound);
+}
+
+#[tokio::test]
+async fn startup_creates_listed_queues() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(cloud_tasks_emulator::serve(
+        listener,
+        url.clone(),
+        None,
+        vec![
+            "projects/p/locations/l/queues/b".to_owned(),
+            "projects/p/locations/l/queues/a".to_owned(),
+        ],
+    ));
+    let mut client = CloudTasksClient::connect(url).await.unwrap();
+
+    let response = client
+        .list_queues(ListQueuesRequest {
+            parent: "projects/p/locations/l".to_owned(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(
+        response
+            .queues
+            .iter()
+            .map(|queue| queue.name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "projects/p/locations/l/queues/a",
+            "projects/p/locations/l/queues/b"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn startup_fails_on_rejected_queue() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+    let error = cloud_tasks_emulator::serve(
+        listener,
+        "http://127.0.0.1:8123".to_owned(),
+        None,
+        vec!["projects/p/locations/l/queues/a_b".to_owned()],
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        r#"Cannot create projects/p/locations/l/queues/a_b: Queue ID "a_b" can contain only letters ([A-Za-z]), numbers ([0-9]), or hyphens (-). Queue ID must be between 1 and 100 characters."#
+    );
 }

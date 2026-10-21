@@ -1,0 +1,21 @@
+list -> 200 {
+  "queues": [
+    {
+      "name": "projects/{project}/locations/{location}/queues/{run}-restlist",
+      "rateLimits": {
+        "maxDispatchesPerSecond": 500,
+        "maxBurstSize": 100,
+        "maxConcurrentDispatches": 1000
+      },
+      "retryConfig": {
+        "maxAttempts": 100,
+        "minBackoff": "0.100s",
+        "maxBackoff": "3600s",
+        "maxDoublings": 16
+      },
+      "state": "RUNNING"
+    }
+  ],
+  "nextPageToken": "{page_token}"
+}
+

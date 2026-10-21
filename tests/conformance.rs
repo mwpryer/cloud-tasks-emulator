@@ -37,7 +37,8 @@ use cloud_tasks_emulator::proto::google::rpc;
 use cloud_tasks_emulator::proto::google::r#type::Expr;
 use prost::Message;
 use prost_types::{Any, Duration, FieldMask, Timestamp};
-use serde_json::Value;
+use reqwest::Method;
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::task::JoinError;
@@ -56,6 +57,7 @@ async fn emulator_matches_recordings() {
     let channel = Endpoint::new(url.clone()).unwrap().connect().await.unwrap();
     let mut target = Target::new(
         channel,
+        &url,
         MetadataMap::new(),
         "emulator-project",
         "emulator-location",
@@ -109,6 +111,7 @@ async fn record() {
     receiver.url = url;
     let mut target = Target::new(
         channel,
+        "https://cloudtasks.googleapis.com",
         metadata,
         &env("CLOUD_TASKS_PROJECT"),
         &env("CLOUD_TASKS_LOCATION"),
@@ -217,6 +220,9 @@ async fn open_tunnel(local_url: &str) -> (Child, String) {
 struct Target {
     client: CloudTasksClient<Channel>,
     operations: OperationsClient<Channel>,
+    rest: reqwest::Client,
+    /// Origin of the REST API
+    rest_url: String,
     /// Sent with every request, so empty for the emulator
     metadata: MetadataMap,
     project: String,
@@ -233,8 +239,13 @@ struct Target {
 }
 
 impl Target {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each target differs in every one"
+    )]
     fn new(
         channel: Channel,
+        rest_url: &str,
         metadata: MetadataMap,
         project: &str,
         location: &str,
@@ -244,9 +255,17 @@ impl Target {
     ) -> Self {
         let run = format!("r{:08x}", rand::random::<u32>());
         let tomorrow = seconds_from_now(24 * 60 * 60);
+        // REST shows times in RFC 3339, so the fraction after the seconds stays in transcripts
+        let tomorrow_time = Timestamp {
+            seconds: tomorrow,
+            nanos: 0,
+        }
+        .to_string();
         Self {
             client: CloudTasksClient::new(channel.clone()),
             operations: OperationsClient::new(channel),
+            rest: reqwest::Client::new(),
+            rest_url: rest_url.to_owned(),
             metadata,
             project: format!("projects/{project}"),
             parent: format!("projects/{project}/locations/{location}"),
@@ -257,6 +276,7 @@ impl Target {
                 (location.to_owned(), "{location}"),
                 (run.clone(), "{run}"),
                 (tomorrow.to_string(), "{tomorrow}"),
+                (tomorrow_time.trim_end_matches('Z').to_owned(), "{tomorrow}"),
                 (service_account.to_owned(), "{service_account}"),
                 (issuer.to_owned(), "{issuer}"),
             ],
@@ -350,6 +370,43 @@ impl Target {
             }
         };
         self.transcript += &format!("{label} -> {entry}\n");
+    }
+
+    /// Sends a REST request with the target's credentials and records the status and body as received
+    /// Retries while real Cloud Tasks reports exhaustion, as it does for RunTask in a new queue's first seconds
+    async fn rest(&mut self, label: &str, method: Method, path: &str, body: &str) -> String {
+        let (status, body) = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            loop {
+                let mut request = self
+                    .rest
+                    .request(method.clone(), format!("{}{path}", self.rest_url))
+                    .headers(self.metadata.clone().into_headers());
+                if !body.is_empty() {
+                    request = request
+                        .header("content-type", "application/json")
+                        .body(body.to_owned());
+                }
+                let response = request.send().await.unwrap();
+                if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    break (response.status().as_u16(), response.text().await.unwrap());
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        })
+        .await
+        .expect("REST requests stop reporting exhaustion in time");
+        self.transcript += &format!("{label} -> {status} {body}\n");
+        body
+    }
+
+    /// Replaces the string at `pointer` in a JSON body
+    fn json_placeholder(&mut self, body: &str, pointer: &str, placeholder: &'static str) {
+        let json: Value = serde_json::from_str(body).unwrap();
+        let value = json
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("{pointer} is a string in {body}"));
+        self.placeholder(value.to_owned(), placeholder);
     }
 
     /// Returns the transcript with run-specific values replaced, most specific first
@@ -884,6 +941,17 @@ cases!(
     get_cmek_config_rejects_invalid_names,
     update_cmek_config_rejects_invalid_requests,
     update_cmek_config_refuses_queues_with_header_overrides,
+    rest_manages_queues,
+    rest_lists_queues,
+    rest_manages_tasks,
+    rest_runs_tasks,
+    rest_runs_batches,
+    rest_manages_iam_policies,
+    rest_manages_cmek_config,
+    rest_reports_errors,
+    rest_rejects_invalid_requests,
+    rest_serves_only_mapped_routes,
+    rest_follows_system_parameters,
 );
 
 fn http(url: &str) -> HttpRequest {
@@ -5867,4 +5935,255 @@ async fn update_cmek_config_refuses_queues_with_header_overrides(t: &mut Target)
     let result = t.update_cmek_config(request).await;
 
     t.record("update_cmek_config", result);
+}
+
+async fn rest_manages_queues(t: &mut Target) {
+    let name = t.queue_name("rest-queue");
+    let queue = json!({
+        "name": name,
+        "rateLimits": {"maxDispatchesPerSecond": 10},
+        "retryConfig": {"maxAttempts": -1, "minBackoff": "1.5s"},
+        "httpTarget": {
+            "uriOverride": {"host": "example.com"},
+            "httpMethod": "PUT",
+            "oidcToken": {"serviceAccountEmail": t.service_account},
+        },
+        "stackdriverLoggingConfig": {"samplingRatio": 0.5},
+    });
+    let update = json!({"rate_limits": {"max_dispatches_per_second": 2}});
+
+    let queues = format!("/v2/{}/queues", t.parent);
+    t.rest("create", Method::POST, &queues, &queue.to_string())
+        .await;
+    t.rest("get", Method::GET, &format!("/v2/{name}"), "").await;
+    let mask = "updateMask=rateLimits.maxDispatchesPerSecond";
+    let path = format!("/v2/{name}?{mask}");
+    t.rest("update", Method::PATCH, &path, &update.to_string())
+        .await;
+    t.rest("pause", Method::POST, &format!("/v2/{name}:pause"), "")
+        .await;
+    t.rest("resume", Method::POST, &format!("/v2/{name}:resume"), "{}")
+        .await;
+    let purged = t
+        .rest("purge", Method::POST, &format!("/v2/{name}:purge"), "{}")
+        .await;
+    t.rest("delete", Method::DELETE, &format!("/v2/{name}"), "")
+        .await;
+
+    t.json_placeholder(&purged, "/purgeTime", "{purge_time}");
+}
+
+async fn rest_lists_queues(t: &mut Target) {
+    t.queue("restlist").await;
+
+    // Other cases' queues share the location
+    let path = format!("/v2/{}/queues?filter=name:restlist", t.parent);
+    let listed = t.rest("list", Method::GET, &path, "").await;
+
+    t.json_placeholder(&listed, "/nextPageToken", "{page_token}");
+}
+
+async fn rest_manages_tasks(t: &mut Target) {
+    let queue = t.queue("rest-tasks").await;
+    let name = format!("{queue}/tasks/t");
+    // No headers beyond the User-Agent that Cloud Tasks adds, as it orders map entries differently on each request
+    let request = json!({
+        "task": {
+            "name": name,
+            "scheduleTime": t.tomorrow.to_string(),
+            "dispatchDeadline": "30s",
+            "httpRequest": {
+                "url": "https://example.com/work",
+                "httpMethod": "PUT",
+                "body": "aGk=",
+            },
+        },
+        "responseView": "FULL",
+    });
+
+    let tasks = format!("/v2/{queue}/tasks");
+    let created = t
+        .rest("create", Method::POST, &tasks, &request.to_string())
+        .await;
+    let path = format!("/v2/{name}?responseView=FULL");
+    t.rest("get", Method::GET, &path, "").await;
+    let listed = t.rest("list", Method::GET, &tasks, "").await;
+    t.rest("delete", Method::DELETE, &format!("/v2/{name}"), "")
+        .await;
+
+    t.json_placeholder(&created, "/createTime", "{create_time}");
+    t.json_placeholder(&listed, "/nextPageToken", "{page_token}");
+}
+
+async fn rest_runs_tasks(t: &mut Target) {
+    let queue = t.queue("rest-run").await;
+    let name = format!("{queue}/tasks/t");
+    t.create_task(CreateTaskRequest {
+        parent: queue,
+        task: Some(t.task(&name, http(&t.receiver.url_for("rest-run", "200")))),
+        response_view: task::View::Unspecified.into(),
+    })
+    .await
+    .unwrap();
+
+    let run = t
+        .rest("run", Method::POST, &format!("/v2/{name}:run"), "{}")
+        .await;
+
+    t.json_placeholder(&run, "/createTime", "{create_time}");
+}
+
+async fn rest_runs_batches(t: &mut Target) {
+    let queue = t.queue("rest-batch").await;
+    let name = format!("{queue}/tasks/t");
+    let create = json!({
+        "requests": [{
+            "parent": queue,
+            "task": {
+                "name": name,
+                "scheduleTime": t.tomorrow.to_string(),
+                "httpRequest": {"url": "https://example.com/work"},
+            },
+        }],
+        "requestId": format!("{}-rest-create", t.run),
+    });
+    let delete = json!({
+        "names": [name],
+        "requestId": format!("{}-rest-delete", t.run),
+    });
+
+    let path = format!("/v2/{queue}/tasks:batchCreate");
+    let created = t
+        .rest("batch create", Method::POST, &path, &create.to_string())
+        .await;
+    let path = format!("/v2/{queue}/tasks:batchDelete");
+    let deleted = t
+        .rest("batch delete", Method::POST, &path, &delete.to_string())
+        .await;
+    let path = format!("/v2/{}/operations/{}-rest-create", t.parent, t.run);
+    t.rest("get operation", Method::GET, &path, "").await;
+
+    for operation in [&created, &deleted] {
+        t.json_placeholder(operation, "/metadata/startTime", "{start_time}");
+        t.json_placeholder(operation, "/metadata/endTime", "{end_time}");
+    }
+    t.json_placeholder(&created, "/response/tasks/0/createTime", "{create_time}");
+}
+
+async fn rest_manages_iam_policies(t: &mut Target) {
+    let queue = t.queue("rest-iam").await;
+    let policy = json!({
+        "policy": {
+            "bindings": [{
+                "role": "roles/cloudtasks.viewer",
+                "members": [format!("serviceAccount:{}", t.service_account)],
+            }],
+        },
+    });
+    let permissions = json!({"permissions": ["cloudtasks.queues.get", "cloudtasks.tasks.create"]});
+
+    t.rest(
+        "get",
+        Method::POST,
+        &format!("/v2/{queue}:getIamPolicy"),
+        "{}",
+    )
+    .await;
+    let path = format!("/v2/{queue}:setIamPolicy");
+    let set = t
+        .rest("set", Method::POST, &path, &policy.to_string())
+        .await;
+    let path = format!("/v2/{queue}:testIamPermissions");
+    t.rest("test", Method::POST, &path, &permissions.to_string())
+        .await;
+
+    t.json_placeholder(&set, "/etag", "{etag}");
+}
+
+async fn rest_manages_cmek_config(t: &mut Target) {
+    // The run creates no queues here, and the key is rejected, as a real one would turn on CMEK for the location
+    let path = format!("/v2/{}/locations/us-central1/cmekConfig", t.project);
+
+    t.rest("get", Method::GET, &path, "").await;
+    t.rest("update", Method::PATCH, &path, r#"{"kmsKey": "not-a-key"}"#)
+        .await;
+}
+
+async fn rest_reports_errors(t: &mut Target) {
+    let queue = json!({
+        "name": t.queue_name("rest-errors"),
+        "httpTarget": {"uriOverride": {"host": "https://example.com"}},
+    });
+
+    let path = format!("/v2/{}/queues/not_valid", t.parent);
+    t.rest("invalid queue id", Method::GET, &path, "").await;
+    let path = format!("/v2/{}", t.queue_name("rest-missing"));
+    t.rest("unknown queue", Method::GET, &path, "").await;
+    let path = format!("/v2/{}/queues", t.parent);
+    t.rest(
+        "invalid http target",
+        Method::POST,
+        &path,
+        &queue.to_string(),
+    )
+    .await;
+}
+
+async fn rest_rejects_invalid_requests(t: &mut Target) {
+    let tasks = format!("/v2/{}/tasks", t.queue_name("rest-invalid"));
+
+    t.rest("unknown field", Method::POST, &tasks, r#"{"bogus": 1}"#)
+        .await;
+    let body = r#"{"task": {"httpRequest": {"bogus": 1, "other": 2}}}"#;
+    t.rest("unknown nested fields", Method::POST, &tasks, body)
+        .await;
+    let path = format!("{tasks}?bogus=1");
+    t.rest("unknown query parameter", Method::GET, &path, "")
+        .await;
+    let body = r#"{"task": {"name": 5}}"#;
+    t.rest("wrong type", Method::POST, &tasks, body).await;
+    let path = format!("{tasks}?pageSize=abc");
+    t.rest("wrong query parameter type", Method::GET, &path, "")
+        .await;
+    let path = format!("{tasks}?responseView=NOPE");
+    t.rest("unknown enum", Method::GET, &path, "").await;
+    t.rest("array body", Method::POST, &tasks, "[]").await;
+    let malformed = t
+        .rest("malformed json", Method::POST, &tasks, r#"{"task": "#)
+        .await;
+
+    // Cuts the parser's account of the error, which only Google's parser gives
+    let body: Value = serde_json::from_str(&malformed).unwrap();
+    let message = body["error"]["message"].to_string();
+    let (_, account) = message
+        .trim_matches('"')
+        .split_once("Invalid JSON payload received. ")
+        .unwrap();
+    t.placeholder(account.to_owned(), "{account}");
+}
+
+async fn rest_serves_only_mapped_routes(t: &mut Target) {
+    let operations = format!("/v2/{}/operations", t.parent);
+    let operation = format!("{operations}/{}-missing", t.run);
+
+    t.rest("list operations", Method::GET, &operations, "")
+        .await;
+    let path = format!("{operation}:wait");
+    t.rest("wait operation", Method::POST, &path, "{}").await;
+    let path = format!("{operation}:cancel");
+    t.rest("cancel operation", Method::POST, &path, "{}").await;
+    t.rest("delete operation", Method::DELETE, &operation, "")
+        .await;
+    t.rest("unknown path", Method::GET, "/v2/bogus", "").await;
+    let path = format!("/v2/{}:pause", t.queue_name("rest-routes"));
+    t.rest("wrong method", Method::DELETE, &path, "").await;
+}
+
+async fn rest_follows_system_parameters(t: &mut Target) {
+    let queue = t.queue("rest-parameters").await;
+
+    let path = format!("/v2/{queue}?$alt=json;enum-encoding=int");
+    t.rest("enum numbers", Method::GET, &path, "").await;
+    let path = format!("/v2/{queue}?alt=json&prettyPrint=false");
+    t.rest("compact", Method::GET, &path, "").await;
 }

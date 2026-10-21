@@ -1,0 +1,45 @@
+invalid queue id -> 400 {
+  "error": {
+    "code": 400,
+    "message": "Queue ID \"not_valid\" can contain only letters ([A-Za-z]), numbers ([0-9]), or hyphens (-). Queue ID must be between 1 and 100 characters.",
+    "status": "INVALID_ARGUMENT",
+    "details": [
+      {
+        "@type": "type.googleapis.com/google.rpc.Help",
+        "links": [
+          {
+            "description": "Definition of queue ID",
+            "url": "https://cloud.google.com/tasks/docs/reference/rest/v2/projects.locations.queues#Queue.FIELDS.name"
+          }
+        ]
+      }
+    ]
+  }
+}
+
+unknown queue -> 404 {
+  "error": {
+    "code": 404,
+    "message": "Queue does not exist. If you just created the queue, wait at least a minute for the queue to initialize.",
+    "status": "NOT_FOUND"
+  }
+}
+
+invalid http target -> 400 {
+  "error": {
+    "code": 400,
+    "message": "Error in parsing HttpTarget. Invalid Host.",
+    "status": "INVALID_ARGUMENT",
+    "details": [
+      {
+        "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+        "reason": "INVALID_INPUT_ON_HTTP_TARGET_OVERRIDE",
+        "domain": "cloudtasks.googleapis.com",
+        "metadata": {
+          "invalid_field": "Invalid Host."
+        }
+      }
+    ]
+  }
+}
+

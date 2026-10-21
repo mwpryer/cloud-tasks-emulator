@@ -1,0 +1,74 @@
+batch create -> 200 {
+  "name": "projects/{project}/locations/{location}/operations/{run}-rest-create",
+  "metadata": {
+    "@type": "type.googleapis.com/google.cloud.tasks.v2.BatchCreateTasksMetadata",
+    "startTime": "{start_time}",
+    "endTime": "{end_time}",
+    "state": "SUCCEEDED"
+  },
+  "done": true,
+  "response": {
+    "@type": "type.googleapis.com/google.cloud.tasks.v2.BatchCreateTasksResponse",
+    "tasks": [
+      {
+        "name": "projects/{project}/locations/{location}/queues/{run}-rest-batch/tasks/t",
+        "httpRequest": {
+          "url": "https://example.com/work",
+          "httpMethod": "POST",
+          "headers": {
+            "User-Agent": "Google-Cloud-Tasks"
+          }
+        },
+        "scheduleTime": "{tomorrow}.123456Z",
+        "createTime": "{create_time}",
+        "dispatchDeadline": "600s",
+        "view": "BASIC"
+      }
+    ]
+  }
+}
+
+batch delete -> 200 {
+  "name": "projects/{project}/locations/{location}/operations/{run}-rest-delete",
+  "metadata": {
+    "@type": "type.googleapis.com/google.cloud.tasks.v2.BatchDeleteTasksMetadata",
+    "startTime": "{start_time}",
+    "endTime": "{end_time}",
+    "state": "SUCCEEDED"
+  },
+  "done": true,
+  "response": {
+    "@type": "type.googleapis.com/google.protobuf.Empty"
+  }
+}
+
+get operation -> 200 {
+  "name": "projects/{project}/locations/{location}/operations/{run}-rest-create",
+  "metadata": {
+    "@type": "type.googleapis.com/google.cloud.tasks.v2.BatchCreateTasksMetadata",
+    "startTime": "{start_time}",
+    "endTime": "{end_time}",
+    "state": "SUCCEEDED"
+  },
+  "done": true,
+  "response": {
+    "@type": "type.googleapis.com/google.cloud.tasks.v2.BatchCreateTasksResponse",
+    "tasks": [
+      {
+        "name": "projects/{project}/locations/{location}/queues/{run}-rest-batch/tasks/t",
+        "httpRequest": {
+          "url": "https://example.com/work",
+          "httpMethod": "POST",
+          "headers": {
+            "User-Agent": "Google-Cloud-Tasks"
+          }
+        },
+        "scheduleTime": "{tomorrow}.123456Z",
+        "createTime": "{create_time}",
+        "dispatchDeadline": "600s",
+        "view": "BASIC"
+      }
+    ]
+  }
+}
+

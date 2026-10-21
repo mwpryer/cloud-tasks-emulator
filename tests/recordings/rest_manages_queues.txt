@@ -1,0 +1,171 @@
+create -> 200 {
+  "name": "projects/{project}/locations/{location}/queues/{run}-rest-queue",
+  "rateLimits": {
+    "maxDispatchesPerSecond": 10,
+    "maxBurstSize": 10,
+    "maxConcurrentDispatches": 1000
+  },
+  "retryConfig": {
+    "maxAttempts": -1,
+    "minBackoff": "1.500s",
+    "maxBackoff": "3600s",
+    "maxDoublings": 16
+  },
+  "state": "RUNNING",
+  "stackdriverLoggingConfig": {
+    "samplingRatio": 0.5
+  },
+  "httpTarget": {
+    "uriOverride": {
+      "host": "example.com"
+    },
+    "httpMethod": "PUT",
+    "oidcToken": {
+      "serviceAccountEmail": "{service_account}"
+    }
+  }
+}
+
+get -> 200 {
+  "name": "projects/{project}/locations/{location}/queues/{run}-rest-queue",
+  "rateLimits": {
+    "maxDispatchesPerSecond": 10,
+    "maxBurstSize": 10,
+    "maxConcurrentDispatches": 1000
+  },
+  "retryConfig": {
+    "maxAttempts": -1,
+    "minBackoff": "1.500s",
+    "maxBackoff": "3600s",
+    "maxDoublings": 16
+  },
+  "state": "RUNNING",
+  "stackdriverLoggingConfig": {
+    "samplingRatio": 0.5
+  },
+  "httpTarget": {
+    "uriOverride": {
+      "host": "example.com"
+    },
+    "httpMethod": "PUT",
+    "oidcToken": {
+      "serviceAccountEmail": "{service_account}"
+    }
+  }
+}
+
+update -> 200 {
+  "name": "projects/{project}/locations/{location}/queues/{run}-rest-queue",
+  "rateLimits": {
+    "maxDispatchesPerSecond": 2,
+    "maxBurstSize": 10,
+    "maxConcurrentDispatches": 1000
+  },
+  "retryConfig": {
+    "maxAttempts": -1,
+    "minBackoff": "1.500s",
+    "maxBackoff": "3600s",
+    "maxDoublings": 16
+  },
+  "state": "RUNNING",
+  "stackdriverLoggingConfig": {
+    "samplingRatio": 0.5
+  },
+  "httpTarget": {
+    "uriOverride": {
+      "host": "example.com"
+    },
+    "httpMethod": "PUT",
+    "oidcToken": {
+      "serviceAccountEmail": "{service_account}"
+    }
+  }
+}
+
+pause -> 200 {
+  "name": "projects/{project}/locations/{location}/queues/{run}-rest-queue",
+  "rateLimits": {
+    "maxDispatchesPerSecond": 2,
+    "maxBurstSize": 10,
+    "maxConcurrentDispatches": 1000
+  },
+  "retryConfig": {
+    "maxAttempts": -1,
+    "minBackoff": "1.500s",
+    "maxBackoff": "3600s",
+    "maxDoublings": 16
+  },
+  "state": "PAUSED",
+  "stackdriverLoggingConfig": {
+    "samplingRatio": 0.5
+  },
+  "httpTarget": {
+    "uriOverride": {
+      "host": "example.com"
+    },
+    "httpMethod": "PUT",
+    "oidcToken": {
+      "serviceAccountEmail": "{service_account}"
+    }
+  }
+}
+
+resume -> 200 {
+  "name": "projects/{project}/locations/{location}/queues/{run}-rest-queue",
+  "rateLimits": {
+    "maxDispatchesPerSecond": 2,
+    "maxBurstSize": 10,
+    "maxConcurrentDispatches": 1000
+  },
+  "retryConfig": {
+    "maxAttempts": -1,
+    "minBackoff": "1.500s",
+    "maxBackoff": "3600s",
+    "maxDoublings": 16
+  },
+  "state": "RUNNING",
+  "stackdriverLoggingConfig": {
+    "samplingRatio": 0.5
+  },
+  "httpTarget": {
+    "uriOverride": {
+      "host": "example.com"
+    },
+    "httpMethod": "PUT",
+    "oidcToken": {
+      "serviceAccountEmail": "{service_account}"
+    }
+  }
+}
+
+purge -> 200 {
+  "name": "projects/{project}/locations/{location}/queues/{run}-rest-queue",
+  "rateLimits": {
+    "maxDispatchesPerSecond": 2,
+    "maxBurstSize": 10,
+    "maxConcurrentDispatches": 1000
+  },
+  "retryConfig": {
+    "maxAttempts": -1,
+    "minBackoff": "1.500s",
+    "maxBackoff": "3600s",
+    "maxDoublings": 16
+  },
+  "state": "RUNNING",
+  "purgeTime": "{purge_time}",
+  "stackdriverLoggingConfig": {
+    "samplingRatio": 0.5
+  },
+  "httpTarget": {
+    "uriOverride": {
+      "host": "example.com"
+    },
+    "httpMethod": "PUT",
+    "oidcToken": {
+      "serviceAccountEmail": "{service_account}"
+    }
+  }
+}
+
+delete -> 200 {}
+

@@ -1,0 +1,24 @@
+get -> 200 {
+  "etag": "ACAB"
+}
+
+set -> 200 {
+  "version": 1,
+  "etag": "{etag}",
+  "bindings": [
+    {
+      "role": "roles/cloudtasks.viewer",
+      "members": [
+        "serviceAccount:{service_account}"
+      ]
+    }
+  ]
+}
+
+test -> 200 {
+  "permissions": [
+    "cloudtasks.queues.get",
+    "cloudtasks.tasks.create"
+  ]
+}
+

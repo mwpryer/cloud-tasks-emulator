@@ -1,0 +1,12 @@
+get -> 200 {
+  "name": "projects/{project}/locations/us-central1/cmekConfig"
+}
+
+update -> 400 {
+  "error": {
+    "code": 400,
+    "message": "Resource name [not-a-key] does not match any known resource name pattern.",
+    "status": "INVALID_ARGUMENT"
+  }
+}
+

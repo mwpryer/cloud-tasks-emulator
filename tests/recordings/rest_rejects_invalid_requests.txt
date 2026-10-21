@@ -1,0 +1,142 @@
+unknown field -> 400 {
+  "error": {
+    "code": 400,
+    "message": "Invalid JSON payload received. Unknown name \"bogus\": Cannot find field.",
+    "status": "INVALID_ARGUMENT",
+    "details": [
+      {
+        "@type": "type.googleapis.com/google.rpc.BadRequest",
+        "fieldViolations": [
+          {
+            "description": "Invalid JSON payload received. Unknown name \"bogus\": Cannot find field."
+          }
+        ]
+      }
+    ]
+  }
+}
+
+unknown nested fields -> 400 {
+  "error": {
+    "code": 400,
+    "message": "Invalid JSON payload received. Unknown name \"bogus\" at 'task.http_request': Cannot find field.\nInvalid JSON payload received. Unknown name \"other\" at 'task.http_request': Cannot find field.",
+    "status": "INVALID_ARGUMENT",
+    "details": [
+      {
+        "@type": "type.googleapis.com/google.rpc.BadRequest",
+        "fieldViolations": [
+          {
+            "field": "task.http_request",
+            "description": "Invalid JSON payload received. Unknown name \"bogus\" at 'task.http_request': Cannot find field."
+          },
+          {
+            "field": "task.http_request",
+            "description": "Invalid JSON payload received. Unknown name \"other\" at 'task.http_request': Cannot find field."
+          }
+        ]
+      }
+    ]
+  }
+}
+
+unknown query parameter -> 400 {
+  "error": {
+    "code": 400,
+    "message": "Invalid JSON payload received. Unknown name \"bogus\": Cannot bind query parameter. Field 'bogus' could not be found in request message.",
+    "status": "INVALID_ARGUMENT",
+    "details": [
+      {
+        "@type": "type.googleapis.com/google.rpc.BadRequest",
+        "fieldViolations": [
+          {
+            "description": "Invalid JSON payload received. Unknown name \"bogus\": Cannot bind query parameter. Field 'bogus' could not be found in request message."
+          }
+        ]
+      }
+    ]
+  }
+}
+
+wrong type -> 400 {
+  "error": {
+    "code": 400,
+    "message": "Invalid value at 'task.name' (TYPE_STRING), 5",
+    "status": "INVALID_ARGUMENT",
+    "details": [
+      {
+        "@type": "type.googleapis.com/google.rpc.BadRequest",
+        "fieldViolations": [
+          {
+            "field": "task.name",
+            "description": "Invalid value at 'task.name' (TYPE_STRING), 5"
+          }
+        ]
+      }
+    ]
+  }
+}
+
+wrong query parameter type -> 400 {
+  "error": {
+    "code": 400,
+    "message": "Invalid value at 'page_size' (TYPE_INT32), \"abc\"",
+    "status": "INVALID_ARGUMENT",
+    "details": [
+      {
+        "@type": "type.googleapis.com/google.rpc.BadRequest",
+        "fieldViolations": [
+          {
+            "field": "page_size",
+            "description": "Invalid value at 'page_size' (TYPE_INT32), \"abc\""
+          }
+        ]
+      }
+    ]
+  }
+}
+
+unknown enum -> 400 {
+  "error": {
+    "code": 400,
+    "message": "Invalid value at 'response_view' (type.googleapis.com/google.cloud.tasks.v2.Task.View), \"NOPE\"",
+    "status": "INVALID_ARGUMENT",
+    "details": [
+      {
+        "@type": "type.googleapis.com/google.rpc.BadRequest",
+        "fieldViolations": [
+          {
+            "field": "response_view",
+            "description": "Invalid value at 'response_view' (type.googleapis.com/google.cloud.tasks.v2.Task.View), \"NOPE\""
+          }
+        ]
+      }
+    ]
+  }
+}
+
+array body -> 400 {
+  "error": {
+    "code": 400,
+    "message": "Invalid JSON payload received. Unknown name \"\": Root element must be a message.",
+    "status": "INVALID_ARGUMENT",
+    "details": [
+      {
+        "@type": "type.googleapis.com/google.rpc.BadRequest",
+        "fieldViolations": [
+          {
+            "description": "Invalid JSON payload received. Unknown name \"\": Root element must be a message."
+          }
+        ]
+      }
+    ]
+  }
+}
+
+malformed json -> 400 {
+  "error": {
+    "code": 400,
+    "message": "Invalid JSON payload received. {account}",
+    "status": "INVALID_ARGUMENT"
+  }
+}
+

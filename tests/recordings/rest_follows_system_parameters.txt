@@ -1,0 +1,17 @@
+enum numbers -> 200 {
+  "name": "projects/{project}/locations/{location}/queues/{run}-rest-parameters",
+  "rateLimits": {
+    "maxDispatchesPerSecond": 500,
+    "maxBurstSize": 100,
+    "maxConcurrentDispatches": 1000
+  },
+  "retryConfig": {
+    "maxAttempts": 100,
+    "minBackoff": "0.100s",
+    "maxBackoff": "3600s",
+    "maxDoublings": 16
+  },
+  "state": 1
+}
+
+compact -> 200 {"name":"projects/{project}/locations/{location}/queues/{run}-rest-parameters","rateLimits":{"maxDispatchesPerSecond":500,"maxBurstSize":100,"maxConcurrentDispatches":1000},"retryConfig":{"maxAttempts":100,"minBackoff":"0.100s","maxBackoff":"3600s","maxDoublings":16},"state":"RUNNING"}

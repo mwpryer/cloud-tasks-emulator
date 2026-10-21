@@ -2,6 +2,7 @@ mod api;
 mod filter;
 mod names;
 mod oidc;
+mod rest;
 mod scheduler;
 mod state;
 
@@ -9,6 +10,7 @@ use std::sync::Arc;
 
 use axum::routing::get;
 use tokio::net::TcpListener;
+use tonic::service::Routes;
 use tonic::transport::server::TcpIncoming;
 
 use crate::proto::google::cloud::tasks::v2::cloud_tasks_server::CloudTasksServer;
@@ -43,7 +45,7 @@ pub mod proto {
     }
 }
 
-/// Serves the API, and OIDC discovery for tokens issued as `issuer`, an origin such as `http://127.0.0.1:8123`
+/// Serves the API over gRPC and REST, and OIDC discovery for tokens issued as `issuer`, an origin such as `http://127.0.0.1:8123`
 /// App Engine tasks go to the `app_engine` origin, and without one every project lacks an App Engine app
 pub async fn serve(
     listener: TcpListener,
@@ -57,13 +59,18 @@ pub async fn serve(
         .route("/.well-known/openid-configuration", get(oidc::discovery))
         .route("/jwks", get(oidc::jwks))
         .with_state(issuer);
+    let grpc = Routes::new(CloudTasksServer::new(api::CloudTasksService::new(
+        emulator.clone(),
+    )))
+    .add_service(OperationsServer::new(api::OperationsService::new(emulator)));
+    let routes = grpc
+        .clone()
+        .into_axum_router()
+        .merge(discovery)
+        .merge(rest::router(grpc));
     tonic::transport::Server::builder()
         .accept_http1(true)
-        .add_routes(discovery.into())
-        .add_service(CloudTasksServer::new(api::CloudTasksService::new(
-            emulator.clone(),
-        )))
-        .add_service(OperationsServer::new(api::OperationsService::new(emulator)))
+        .add_routes(routes.into())
         .serve_with_incoming(TcpIncoming::from(listener))
         .await
 }

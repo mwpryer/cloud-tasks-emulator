@@ -3,6 +3,8 @@ use std::ops::Bound;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jiff::fmt::strtime::BrokenDownTime;
 use prost::Message;
 use prost_types::{Any, Timestamp};
@@ -1656,7 +1658,7 @@ fn pacific_time(time: Timestamp) -> String {
         .expect("format suits a datetime with an offset")
 }
 
-/// Pages through names under `prefix`, using the last name returned as the page token
+/// Pages through names under `prefix`, using the last name returned as an opaque page token
 fn page<T, U>(
     items: &BTreeMap<String, T>,
     prefix: &str,
@@ -1675,10 +1677,20 @@ fn page<T, U>(
             )));
         }
     };
-    let start = match page_token {
-        "" => Bound::Included(prefix),
-        token if token.starts_with(prefix) => Bound::Excluded(token),
-        _ => return Err(Status::invalid_argument("Invalid page_token")),
+    let after = match page_token {
+        "" => None,
+        token => Some(
+            URL_SAFE_NO_PAD
+                .decode(token)
+                .ok()
+                .and_then(|name| String::from_utf8(name).ok())
+                .filter(|name| name.starts_with(prefix))
+                .ok_or_else(|| Status::invalid_argument("Invalid page_token"))?,
+        ),
+    };
+    let start = match &after {
+        None => Bound::Included(prefix),
+        Some(name) => Bound::Excluded(name.as_str()),
     };
     let names: Vec<&String> = items
         .range::<str, _>((start, Bound::Unbounded))
@@ -1689,7 +1701,7 @@ fn page<T, U>(
     // Cloud Tasks returns a token after every non-empty page, so only an empty page ends the list
     let next_page_token = names
         .last()
-        .map_or_else(String::new, |name| (*name).clone());
+        .map_or_else(String::new, |name| URL_SAFE_NO_PAD.encode(name));
     Ok((
         names
             .into_iter()

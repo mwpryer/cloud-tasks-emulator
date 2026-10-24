@@ -35,11 +35,11 @@ pub(crate) struct Queue {
     pub tasks: BTreeMap<String, Task>,
     /// Finished and deleted task names
     pub removed_tasks: Tombstones,
-    /// None until policy is first set, and stored only, as emulator has no caller identity
-    pub policy: Option<iam::Policy>,
+    /// Stored only, as emulator has no caller identity
+    pub policy: iam::Policy,
     tokens: f64,
     refilled_at: SystemTime,
-    in_flight: HashSet<u64>,
+    in_flight: u32,
 }
 
 /// Settings that CreateQueue sets and UpdateQueue replaces
@@ -124,7 +124,6 @@ pub(crate) struct Task {
     pub last_attempt: Option<Attempt>,
     /// Set by RunTask until scheduler starts attempt
     pub run_requested: bool,
-    in_flight: Option<u64>,
 }
 
 pub(crate) struct HttpRequest {
@@ -164,8 +163,11 @@ pub(crate) enum HttpMethod {
 }
 
 pub(crate) struct Attempt {
+    /// Tells finished delivery whether RunTask has since started newer attempt
+    pub id: u64,
     pub schedule_time: SystemTime,
     pub dispatch_time: SystemTime,
+    /// None while in flight
     pub response: Option<AttemptResponse>,
 }
 
@@ -245,7 +247,7 @@ impl State {
             for task in queue.tasks.values_mut().filter(|task| task.run_requested) {
                 task.run_requested = false;
                 self.next_attempt_id += 1;
-                queue.in_flight.insert(self.next_attempt_id);
+                queue.in_flight += 1;
                 deliveries.push(task.start_attempt(
                     &queue.name,
                     queue.config.http_target.as_ref(),
@@ -261,7 +263,11 @@ impl State {
             let mut waiting: Vec<&mut Task> = queue
                 .tasks
                 .values_mut()
-                .filter(|task| task.in_flight.is_none())
+                .filter(|task| {
+                    task.last_attempt
+                        .as_ref()
+                        .is_none_or(|attempt| attempt.response.is_some())
+                })
                 .collect();
             waiting.sort_by_key(|task| task.schedule_time);
             for task in waiting {
@@ -272,7 +278,7 @@ impl State {
                     break;
                 }
                 // Finished attempt wakes scheduler, so full queue needs no timer
-                if queue.in_flight.len() >= rate_limits.max_concurrent_dispatches as usize {
+                if queue.in_flight >= rate_limits.max_concurrent_dispatches {
                     break;
                 }
                 if queue.tokens < 1.0 {
@@ -282,7 +288,7 @@ impl State {
                 }
                 queue.tokens -= 1.0;
                 self.next_attempt_id += 1;
-                queue.in_flight.insert(self.next_attempt_id);
+                queue.in_flight += 1;
                 deliveries.push(task.start_attempt(
                     &queue.name,
                     queue.config.http_target.as_ref(),
@@ -299,28 +305,27 @@ impl State {
         let Some(queue) = self.queues.get_mut(&delivery.queue) else {
             return;
         };
-        if !queue.in_flight.remove(&delivery.attempt_id) {
+        queue.in_flight = queue
+            .in_flight
+            .checked_sub(1)
+            .expect("deleted queue names stay blocked longer than attempts run");
+        let Some(task) = queue.tasks.get_mut(&delivery.task) else {
             return;
-        }
-        let Some(task) = queue
-            .tasks
-            .get_mut(&delivery.task)
-            .filter(|task| task.in_flight == Some(delivery.attempt_id))
+        };
+        let Some(attempt) = task
+            .last_attempt
+            .as_mut()
+            .filter(|attempt| attempt.id == delivery.attempt_id)
         else {
             return;
         };
 
-        task.in_flight = None;
+        attempt.response = Some(AttemptResponse { time: now, outcome });
         if let Outcome::Status(status) = outcome
             && !(500..600).contains(&status)
         {
             task.response_count += 1;
         }
-        let attempt = task
-            .last_attempt
-            .as_mut()
-            .expect("in-flight task has an attempt");
-        attempt.response = Some(AttemptResponse { time: now, outcome });
 
         let first_attempt = task
             .first_attempt
@@ -347,9 +352,13 @@ impl Queue {
             purge_time: None,
             tasks: BTreeMap::new(),
             removed_tasks: Tombstones::new(Duration::from_secs(24 * 60 * 60)),
-            policy: None,
+            policy: iam::Policy {
+                // Etag of queue that never had policy, `ACAB` in base64
+                etag: vec![0x00, 0x20, 0x01],
+                ..Default::default()
+            },
             refilled_at: now,
-            in_flight: HashSet::new(),
+            in_flight: 0,
         }
     }
 
@@ -468,30 +477,6 @@ impl RetryConfig {
 }
 
 impl Task {
-    pub fn new(
-        name: String,
-        http_request: HttpRequest,
-        retry_config: Option<RetryConfig>,
-        schedule_time: SystemTime,
-        dispatch_deadline: Duration,
-        now: SystemTime,
-    ) -> Self {
-        Self {
-            name,
-            http_request,
-            retry_config,
-            schedule_time,
-            create_time: now,
-            dispatch_deadline,
-            dispatch_count: 0,
-            response_count: 0,
-            first_attempt: None,
-            last_attempt: None,
-            run_requested: false,
-            in_flight: None,
-        }
-    }
-
     fn start_attempt(
         &mut self,
         queue: &str,
@@ -594,11 +579,11 @@ impl Task {
         self.dispatch_count += 1;
         self.first_attempt.get_or_insert(now);
         self.last_attempt = Some(Attempt {
+            id: attempt_id,
             schedule_time: self.schedule_time,
             dispatch_time: now,
             response: None,
         });
-        self.in_flight = Some(attempt_id);
         Delivery {
             queue: queue.to_owned(),
             task: self.name.clone(),

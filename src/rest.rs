@@ -13,7 +13,6 @@ use prost_reflect::{
 };
 use prost_types::Any;
 use serde_json::{Map, Value};
-use tonic::Code;
 use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tonic::service::Routes;
 
@@ -205,7 +204,7 @@ async fn handle(
                 "json;enum-encoding=int" => enum_numbers = true,
                 _ => {
                     let status = rpc::Status {
-                        code: Code::InvalidArgument as i32,
+                        code: rpc::Code::InvalidArgument as i32,
                         message: format!("Invalid value \"{value}\" for query parameter 'alt'"),
                         details: Vec::new(),
                     };
@@ -447,7 +446,7 @@ fn bad_request(violations: Vec<rpc::bad_request::FieldViolation>) -> rpc::Status
         field_violations: violations,
     };
     rpc::Status {
-        code: Code::InvalidArgument as i32,
+        code: rpc::Code::InvalidArgument as i32,
         message,
         details: vec![Any::from_msg(&details).expect("Vec grows to fit")],
     }
@@ -455,7 +454,7 @@ fn bad_request(violations: Vec<rpc::bad_request::FieldViolation>) -> rpc::Status
 
 fn invalid_payload(error: impl std::fmt::Display) -> rpc::Status {
     rpc::Status {
-        code: Code::InvalidArgument as i32,
+        code: rpc::Code::InvalidArgument as i32,
         message: format!("Invalid JSON payload received. {error}"),
         details: Vec::new(),
     }
@@ -524,29 +523,30 @@ impl Decoder for DynamicCodec {
 }
 
 fn error(descriptor: &MessageDescriptor, status: rpc::Status) -> (StatusCode, Value) {
-    let (http, name) = match Code::from(status.code) {
-        Code::Ok => (200, "OK"),
-        Code::Cancelled => (499, "CANCELLED"),
-        Code::Unknown => (500, "UNKNOWN"),
-        Code::InvalidArgument => (400, "INVALID_ARGUMENT"),
-        Code::DeadlineExceeded => (504, "DEADLINE_EXCEEDED"),
-        Code::NotFound => (404, "NOT_FOUND"),
-        Code::AlreadyExists => (409, "ALREADY_EXISTS"),
-        Code::PermissionDenied => (403, "PERMISSION_DENIED"),
-        Code::ResourceExhausted => (429, "RESOURCE_EXHAUSTED"),
-        Code::FailedPrecondition => (400, "FAILED_PRECONDITION"),
-        Code::Aborted => (409, "ABORTED"),
-        Code::OutOfRange => (400, "OUT_OF_RANGE"),
-        Code::Unimplemented => (501, "UNIMPLEMENTED"),
-        Code::Internal => (500, "INTERNAL"),
-        Code::Unavailable => (503, "UNAVAILABLE"),
-        Code::DataLoss => (500, "DATA_LOSS"),
-        Code::Unauthenticated => (401, "UNAUTHENTICATED"),
+    let code = rpc::Code::try_from(status.code).expect("statuses carry google.rpc codes");
+    let http = match code {
+        rpc::Code::Ok => 200,
+        rpc::Code::Cancelled => 499,
+        rpc::Code::Unknown => 500,
+        rpc::Code::InvalidArgument => 400,
+        rpc::Code::DeadlineExceeded => 504,
+        rpc::Code::NotFound => 404,
+        rpc::Code::AlreadyExists => 409,
+        rpc::Code::PermissionDenied => 403,
+        rpc::Code::ResourceExhausted => 429,
+        rpc::Code::FailedPrecondition => 400,
+        rpc::Code::Aborted => 409,
+        rpc::Code::OutOfRange => 400,
+        rpc::Code::Unimplemented => 501,
+        rpc::Code::Internal => 500,
+        rpc::Code::Unavailable => 503,
+        rpc::Code::DataLoss => 500,
+        rpc::Code::Unauthenticated => 401,
     };
     let mut error = Map::new();
     error.insert("code".to_owned(), http.into());
     error.insert("message".to_owned(), status.message.clone().into());
-    error.insert("status".to_owned(), name.into());
+    error.insert("status".to_owned(), code.as_str_name().into());
     if !status.details.is_empty() {
         let status = DynamicMessage::decode(descriptor.clone(), status.encode_to_vec().as_slice())
             .expect("a google.rpc.Status encodes as one");

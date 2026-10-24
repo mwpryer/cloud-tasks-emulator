@@ -5,6 +5,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .include_imports(true)
         .open_files([
             "google/cloud/tasks/v2/cloudtasks.proto",
+            "google/rpc/code.proto",
             "google/rpc/error_details.proto",
         ])?;
     let out_dir = std::env::var("OUT_DIR")?;

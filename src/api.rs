@@ -53,8 +53,6 @@ const RESERVED_HEADERS: [&str; 14] = [
     "x-forwarded-for",
 ];
 const RESERVED_PREFIXES: [&str; 2] = ["x-google", "x-appengine"];
-/// Etag of queue that never had policy, `ACAB` in base64
-const NO_POLICY_ETAG: [u8; 3] = [0x00, 0x20, 0x01];
 const MEMBER_PREFIXES: [&str; 7] = [
     "user:",
     "serviceAccount:",
@@ -173,14 +171,19 @@ fn insert_task(
     if queue.removed_tasks.contains(&name, now) {
         return Err(Status::already_exists(TASK_RECENTLY_REMOVED));
     }
-    let task = Task::new(
+    let task = Task {
         name,
         http_request,
-        task_retry_config,
+        retry_config: task_retry_config,
         schedule_time,
+        create_time: now,
         dispatch_deadline,
-        now,
-    );
+        dispatch_count: 0,
+        response_count: 0,
+        first_attempt: None,
+        last_attempt: None,
+        run_requested: false,
+    };
     if task_to_proto(&task, pb::task::View::Full).encoded_len() > MAX_TASK_SIZE {
         return Err(Status::invalid_argument("Task size too large"));
     }
@@ -468,12 +471,7 @@ impl CloudTasks for Emulator {
             .queues
             .get(&request.resource)
             .ok_or_else(|| Status::not_found(QUEUE_NOT_FOUND))?;
-        Ok(Response::new(queue.policy.clone().unwrap_or_else(|| {
-            iam::Policy {
-                etag: NO_POLICY_ETAG.to_vec(),
-                ..Default::default()
-            }
-        })))
+        Ok(Response::new(queue.policy.clone()))
     }
 
     async fn set_iam_policy(
@@ -537,18 +535,14 @@ impl CloudTasks for Emulator {
             .queues
             .get_mut(&request.resource)
             .ok_or_else(|| Status::not_found(QUEUE_NOT_FOUND))?;
-        let etag = queue
-            .policy
-            .as_ref()
-            .map_or(&NO_POLICY_ETAG[..], |policy| &policy.etag);
-        if !policy.etag.is_empty() && policy.etag != etag {
+        if !policy.etag.is_empty() && policy.etag != queue.policy.etag {
             return Err(Status::aborted(format!(
                 "There were concurrent policy changes. Please retry the whole read-modify-write with exponential backoff. The request's ETag '{}' did not match the current policy's ETag '{}'.",
                 c_escape(&policy.etag),
-                c_escape(etag)
+                c_escape(&queue.policy.etag)
             )));
         }
-        let policy = queue.policy.insert(iam::Policy {
+        queue.policy = iam::Policy {
             version: 1,
             etag: rand::random::<[u8; 8]>().to_vec(),
             bindings: bindings
@@ -560,8 +554,8 @@ impl CloudTasks for Emulator {
                 })
                 .collect(),
             audit_configs: Vec::new(),
-        });
-        Ok(Response::new(policy.clone()))
+        };
+        Ok(Response::new(queue.policy.clone()))
     }
 
     async fn test_iam_permissions(
@@ -892,7 +886,7 @@ impl CloudTasks for Emulator {
         }
         let result = if failed_requests.len() == request.names.len() {
             operation::Result::Error(rpc::Status {
-                code: tonic::Code::Aborted as i32,
+                code: rpc::Code::Aborted as i32,
                 message: "None of the requests succeeded, refer to BatchDeleteTasksMetadata.failed_requests for individual error details".to_owned(),
                 details: Vec::new(),
             })
@@ -1634,12 +1628,8 @@ fn http_target(target: pb::HttpTarget) -> Result<HttpTarget, Status> {
                 .map_err(|_| parse_error(""))?;
             if let Some(host) = &uri.host
                 // Only bare host, which parses back to itself
-                && !reqwest::Url::parse(&format!("http://{host}/")).is_ok_and(|url| {
-                    url.host_str()
-                        .is_some_and(|parsed| parsed.eq_ignore_ascii_case(host))
-                        && url.port().is_none()
-                        && url.path() == "/"
-                })
+                && !url::Host::parse(host)
+                    .is_ok_and(|parsed| parsed.to_string().eq_ignore_ascii_case(host))
             {
                 return Err(parse_error("Invalid Host."));
             }
@@ -1749,13 +1739,6 @@ fn response_view(view: i32) -> pb::task::View {
     }
 }
 
-fn proto_duration(duration: Duration) -> prost_types::Duration {
-    prost_types::Duration {
-        seconds: duration.as_secs() as i64,
-        nanos: duration.subsec_nanos() as i32,
-    }
-}
-
 /// Truncated to microseconds, as Cloud Tasks stores times
 fn timestamp(time: SystemTime) -> Timestamp {
     let mut timestamp = Timestamp::from(time);
@@ -1860,9 +1843,11 @@ fn http_method_to_proto(method: HttpMethod) -> pb::HttpMethod {
 fn retry_config_to_proto(retry_config: &RetryConfig) -> pb::RetryConfig {
     pb::RetryConfig {
         max_attempts: retry_config.max_attempts.map_or(-1, |max| max as i32),
-        max_retry_duration: retry_config.max_retry_duration.map(proto_duration),
-        min_backoff: Some(proto_duration(retry_config.min_backoff)),
-        max_backoff: Some(proto_duration(retry_config.max_backoff)),
+        max_retry_duration: retry_config
+            .max_retry_duration
+            .map(|max| max.try_into().expect("durations fit")),
+        min_backoff: Some(retry_config.min_backoff.try_into().expect("durations fit")),
+        max_backoff: Some(retry_config.max_backoff.try_into().expect("durations fit")),
         max_doublings: retry_config.max_doublings as i32,
     }
 }
@@ -1905,7 +1890,7 @@ fn task_to_proto(task: &Task, view: pb::task::View) -> pb::Task {
             nanos: 0,
             ..Timestamp::from(task.create_time)
         }),
-        dispatch_deadline: Some(proto_duration(task.dispatch_deadline)),
+        dispatch_deadline: Some(task.dispatch_deadline.try_into().expect("durations fit")),
         dispatch_count: task.dispatch_count as i32,
         response_count: task.response_count as i32,
         first_attempt: task.first_attempt.map(|dispatch_time| pb::Attempt {
@@ -1928,26 +1913,29 @@ fn attempt_to_proto(attempt: &Attempt) -> pb::Attempt {
             .map(|response| timestamp(response.time)),
         response_status: attempt.response.as_ref().map(|response| {
             let status = response.outcome.status();
-            let (code, name) = match status {
-                200..=299 => (0, "OK"),
-                400 => (3, "INVALID_ARGUMENT"),
-                401 => (16, "UNAUTHENTICATED"),
-                403 => (7, "PERMISSION_DENIED"),
-                404 => (5, "NOT_FOUND"),
-                409 => (10, "ABORTED"),
-                429 => (8, "RESOURCE_EXHAUSTED"),
-                499 => (1, "CANCELLED"),
-                402..=498 => (9, "FAILED_PRECONDITION"),
-                501 => (12, "UNIMPLEMENTED"),
-                503 => (14, "UNAVAILABLE"),
-                504 => (4, "DEADLINE_EXCEEDED"),
-                500..=599 => (13, "INTERNAL"),
-                _ => (2, "UNKNOWN"),
+            let code = match status {
+                200..=299 => rpc::Code::Ok,
+                400 => rpc::Code::InvalidArgument,
+                401 => rpc::Code::Unauthenticated,
+                403 => rpc::Code::PermissionDenied,
+                404 => rpc::Code::NotFound,
+                409 => rpc::Code::Aborted,
+                429 => rpc::Code::ResourceExhausted,
+                499 => rpc::Code::Cancelled,
+                402..=498 => rpc::Code::FailedPrecondition,
+                501 => rpc::Code::Unimplemented,
+                503 => rpc::Code::Unavailable,
+                504 => rpc::Code::DeadlineExceeded,
+                500..=599 => rpc::Code::Internal,
+                _ => rpc::Code::Unknown,
             };
-            let message = format!("{name}({code}): HTTP status code {status}");
             rpc::Status {
-                code,
-                message,
+                code: code as i32,
+                message: format!(
+                    "{}({}): HTTP status code {status}",
+                    code.as_str_name(),
+                    code as i32
+                ),
                 details: Vec::new(),
             }
         }),

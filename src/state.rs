@@ -25,6 +25,8 @@ pub(crate) struct State {
     /// KMS key of each location with CMEK on, which emulator stores without encrypting
     pub cmek_keys: BTreeMap<String, String>,
     next_attempt_id: u64,
+    /// Number of resets so far
+    generation: u64,
 }
 
 pub(crate) struct Queue {
@@ -197,6 +199,7 @@ pub(crate) struct Delivery {
     pub queue: String,
     pub task: String,
     pub attempt_id: u64,
+    pub generation: u64,
     /// None when Cloud Tasks fails attempt without sending anything
     pub request: Option<Request>,
 }
@@ -226,11 +229,20 @@ impl Default for State {
             operations: BTreeMap::new(),
             cmek_keys: BTreeMap::new(),
             next_attempt_id: 0,
+            generation: 0,
         }
     }
 }
 
 impl State {
+    /// Takes contents of `fresh`, as restart would, so attempts in flight finish unrecorded
+    pub fn reset(&mut self, fresh: State) {
+        *self = State {
+            generation: self.generation + 1,
+            ..fresh
+        };
+    }
+
     /// Starts every due attempt that queue limits allow, and returns how long until one could next start
     pub fn start_due(&mut self, now: SystemTime) -> (Vec<Delivery>, Option<Duration>) {
         let mut deliveries = Vec::new();
@@ -252,6 +264,7 @@ impl State {
                     &queue.name,
                     queue.config.http_target.as_ref(),
                     self.next_attempt_id,
+                    self.generation,
                     now,
                 ));
             }
@@ -293,6 +306,7 @@ impl State {
                     &queue.name,
                     queue.config.http_target.as_ref(),
                     self.next_attempt_id,
+                    self.generation,
                     now,
                 ));
             }
@@ -301,6 +315,9 @@ impl State {
     }
 
     pub fn finish_attempt(&mut self, delivery: &Delivery, outcome: Outcome, now: SystemTime) {
+        if delivery.generation != self.generation {
+            return;
+        }
         // Queue or task may have been deleted while attempt was in flight
         let Some(queue) = self.queues.get_mut(&delivery.queue) else {
             return;
@@ -482,6 +499,7 @@ impl Task {
         queue: &str,
         http_target: Option<&HttpTarget>,
         attempt_id: u64,
+        generation: u64,
         now: SystemTime,
     ) -> Delivery {
         let previous = self
@@ -588,6 +606,7 @@ impl Task {
             queue: queue.to_owned(),
             task: self.name.clone(),
             attempt_id,
+            generation,
             request,
         }
     }

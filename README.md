@@ -12,7 +12,7 @@
 - **Real dispatch.** Tasks reach your handlers with the headers, retries and rate limits that Cloud Tasks applies.
 - **Verifiable tokens.** The emulator signs OIDC tokens with a key made each run, and handlers verify them through its discovery document.
 - **Same answers as Cloud Tasks.** We test the emulator against transcripts recorded from real Cloud Tasks, so its responses and error messages match the real service.
-- **Built for tests.** Queues can exist from startup, and one endpoint waits until a queue is empty.
+- **Built for tests.** Queues can exist from startup, one endpoint waits until a queue is empty, and another resets the emulator.
 
 ## Why
 
@@ -127,9 +127,11 @@ sequenceDiagram
 
 - `QUEUES` creates queues at startup, so tests don't need to.
 - `GET /emulator/<queue name>:waitIdle` blocks until the queue holds no tasks, then returns 204. It returns 404 for an unknown queue and 409 for a paused queue with tasks left.
+- `POST /emulator:reset` puts the emulator back in its startup state, then returns 204. It drops every queue, task and CMEK config, frees the names of deleted queues and tasks, and creates the `QUEUES` queues again. It keeps the OIDC key, so handlers keep verifying tokens.
 
 ```sh
 curl http://127.0.0.1:8123/emulator/projects/p/locations/l/queues/q:waitIdle
+curl -X POST http://127.0.0.1:8123/emulator:reset
 ```
 
 ## Differences from Cloud Tasks

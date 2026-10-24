@@ -6,15 +6,16 @@ mod rest;
 mod scheduler;
 mod state;
 
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use prost_reflect::DescriptorPool;
 use tokio::net::TcpListener;
+use tokio::sync::Notify;
 use tonic::service::Routes;
 use tonic::transport::server::TcpIncoming;
 
@@ -63,7 +64,42 @@ pub async fn serve(
     issuer: String,
     queues: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let emulator = Arc::new(Emulator::default());
+    let emulator = Arc::new(Emulator {
+        state: Mutex::new(startup_state(&queues).await?),
+        wake: Notify::new(),
+    });
+    let issuer = Arc::new(oidc::Issuer::new(issuer));
+    tokio::spawn(scheduler::run(emulator.clone(), issuer.clone()));
+    let discovery = axum::Router::new()
+        .route("/.well-known/openid-configuration", get(oidc::discovery))
+        .route("/jwks", get(oidc::jwks))
+        .with_state(issuer);
+    let idle = axum::Router::new()
+        .route("/emulator/{*path}", get(wait_idle))
+        .with_state(emulator.clone());
+    let reset = axum::Router::new()
+        .route("/emulator:reset", post(reset))
+        .with_state((emulator.clone(), Arc::new(queues)));
+    let grpc = Routes::new(CloudTasksServer::from_arc(emulator.clone()))
+        .add_service(OperationsServer::from_arc(emulator));
+    let routes = grpc
+        .clone()
+        .into_axum_router()
+        .merge(discovery)
+        .merge(idle)
+        .merge(reset)
+        .merge(rest::router(grpc));
+    tonic::transport::Server::builder()
+        .accept_http1(true)
+        .add_routes(routes.into())
+        .serve_with_incoming(TcpIncoming::from(listener))
+        .await?;
+    Ok(())
+}
+
+/// State holding only `queues`, each created with default config
+async fn startup_state(queues: &[String]) -> Result<state::State, String> {
+    let emulator = Emulator::default();
     for name in queues {
         let request = CreateQueueRequest {
             parent: name
@@ -80,29 +116,16 @@ pub async fn serve(
             .await
             .map_err(|status| format!("Cannot create {name}: {}", status.message()))?;
     }
-    let issuer = Arc::new(oidc::Issuer::new(issuer));
-    tokio::spawn(scheduler::run(emulator.clone(), issuer.clone()));
-    let discovery = axum::Router::new()
-        .route("/.well-known/openid-configuration", get(oidc::discovery))
-        .route("/jwks", get(oidc::jwks))
-        .with_state(issuer);
-    let idle = axum::Router::new()
-        .route("/emulator/{*path}", get(wait_idle))
-        .with_state(emulator.clone());
-    let grpc = Routes::new(CloudTasksServer::from_arc(emulator.clone()))
-        .add_service(OperationsServer::from_arc(emulator));
-    let routes = grpc
-        .clone()
-        .into_axum_router()
-        .merge(discovery)
-        .merge(idle)
-        .merge(rest::router(grpc));
-    tonic::transport::Server::builder()
-        .accept_http1(true)
-        .add_routes(routes.into())
-        .serve_with_incoming(TcpIncoming::from(listener))
-        .await?;
-    Ok(())
+    Ok(emulator.state.into_inner().unwrap())
+}
+
+/// Returns emulator to state it started with, keeping OIDC key
+async fn reset(State((emulator, queues)): State<(Arc<Emulator>, Arc<Vec<String>>)>) -> StatusCode {
+    let fresh = startup_state(&queues)
+        .await
+        .expect("startup created these queues already");
+    emulator.state.lock().unwrap().reset(fresh);
+    StatusCode::NO_CONTENT
 }
 
 /// Answers once queue in path such as `projects/p/locations/l/queues/q:waitIdle` holds no tasks

@@ -17,7 +17,7 @@ prost-types = "0.14"
 rand = "0.10"
 reqwest = "0.13"
 serde_json = { version = "1", features = ["preserve_order"] }
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tonic = "0.14"
 tonic-prost = "0.14"
 url = "2"

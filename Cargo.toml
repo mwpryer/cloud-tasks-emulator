@@ -2,6 +2,9 @@
 name = "cloud-tasks-emulator"
 version = "0.1.0"
 edition = "2024"
+description = "Local emulator of the Google Cloud Tasks v2 API"
+license = "MIT"
+repository = "https://github.com/mwpryer/cloud-tasks-emulator"
 
 [dependencies]
 aws-lc-rs = "1"

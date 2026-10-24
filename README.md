@@ -15,7 +15,6 @@ LISTEN_ADDR=127.0.0.1:8123 OIDC_ISSUER=http://127.0.0.1:8123 QUEUES= cargo run -
 | `LISTEN_ADDR` | Address that serves gRPC, REST and OIDC discovery, for example `127.0.0.1:8123` |
 | `OIDC_ISSUER` | Origin your handlers reach the emulator at, which signs OIDC tokens as this issuer |
 | `QUEUES` | Full queue names separated by commas, created at startup with the default config. Empty for none |
-| `APP_ENGINE_URL` | Origin that every App Engine task goes to. Unset when no project has an App Engine app |
 
 ## Connect
 
@@ -31,7 +30,7 @@ curl http://127.0.0.1:8123/v2/projects/p/locations/l/queues
 
 ## Handlers
 
-- HTTP tasks go to their URL with the `X-CloudTasks-*` headers. App Engine tasks go to `APP_ENGINE_URL` with the `X-AppEngine-*` headers.
+- HTTP tasks go to their URL with the `X-CloudTasks-*` headers.
 - The emulator signs OIDC tokens with a key made each run. Handlers verify them through `<OIDC_ISSUER>/.well-known/openid-configuration`.
 - OAuth tokens are opaque, as only Google APIs could check a real one.
 - Unlike Cloud Tasks, the emulator sends tokens to http URLs, so local handlers receive them.
@@ -50,7 +49,7 @@ curl http://127.0.0.1:8123/emulator/projects/p/locations/l/queues/q:waitIdle
 - State lives in memory, so every start is a clean slate.
 - The emulator does not check that a project, location or service account exists. It stores IAM policies without enforcing them.
 - It stores CMEK keys without encrypting anything.
-- Every App Engine task goes to one origin. Routing decides only the host the task reports.
+- It does not support App Engine targets. It answers as Cloud Tasks does for a project without an App Engine app.
 - It serves v2 only, without the Locations RPCs.
 - Bare words and text comparisons other than `:` in the `ListQueues` filter return `UNIMPLEMENTED`.
 - REST rejects partial responses through the `fields` parameter.

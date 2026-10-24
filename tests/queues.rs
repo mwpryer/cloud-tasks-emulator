@@ -166,7 +166,7 @@ async fn list_queues_rejects_malformed_filter() {
 }
 
 #[tokio::test]
-async fn routing_override_needs_app_engine_url() {
+async fn create_queue_rejects_routing_override() {
     let mut client = support::start_emulator().await;
 
     let status = client
@@ -193,7 +193,6 @@ async fn startup_creates_listed_queues() {
     tokio::spawn(cloud_tasks_emulator::serve(
         listener,
         url.clone(),
-        None,
         vec![
             "projects/p/locations/l/queues/b".to_owned(),
             "projects/p/locations/l/queues/a".to_owned(),
@@ -230,7 +229,6 @@ async fn startup_fails_on_rejected_queue() {
     let error = cloud_tasks_emulator::serve(
         listener,
         "http://127.0.0.1:8123".to_owned(),
-        None,
         vec!["projects/p/locations/l/queues/a_b".to_owned()],
     )
     .await

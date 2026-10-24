@@ -61,10 +61,9 @@ static DESCRIPTORS: LazyLock<DescriptorPool> = LazyLock::new(|| {
 pub async fn serve(
     listener: TcpListener,
     issuer: String,
-    app_engine: Option<String>,
     queues: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let emulator = Arc::new(Emulator::new(app_engine));
+    let emulator = Arc::new(Emulator::default());
     for name in queues {
         let request = CreateQueueRequest {
             parent: name

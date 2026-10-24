@@ -11,7 +11,6 @@ http_target.http_method: put -> [
 http_target.http_method = HTTP_METHOD_UNSPECIFIED -> [
     "projects/{project}/locations/{location}/queues/{run}-target-filter-empty",
     "projects/{project}/locations/{location}/queues/{run}-target-filter-none",
-    "projects/{project}/locations/{location}/queues/{run}-target-filter-routed",
 ]
 http_target.http_method > POST -> [
     "projects/{project}/locations/{location}/queues/{run}-target-filter-full",
@@ -33,13 +32,11 @@ http_target.uri_override.scheme = SCHEME_UNSPECIFIED -> [
     "projects/{project}/locations/{location}/queues/{run}-target-filter-empty",
     "projects/{project}/locations/{location}/queues/{run}-target-filter-full",
     "projects/{project}/locations/{location}/queues/{run}-target-filter-none",
-    "projects/{project}/locations/{location}/queues/{run}-target-filter-routed",
 ]
 http_target.uri_override.uri_override_enforce_mode = URI_OVERRIDE_ENFORCE_MODE_UNSPECIFIED -> [
     "projects/{project}/locations/{location}/queues/{run}-target-filter-empty",
     "projects/{project}/locations/{location}/queues/{run}-target-filter-full",
     "projects/{project}/locations/{location}/queues/{run}-target-filter-none",
-    "projects/{project}/locations/{location}/queues/{run}-target-filter-routed",
 ]
 http_target.uri_override.path_override: * -> [
     "projects/{project}/locations/{location}/queues/{run}-target-filter-full",
@@ -69,15 +66,5 @@ stackdriver_logging_config.sampling_ratio > 0.1 -> [
 stackdriver_logging_config.sampling_ratio = 0 -> [
     "projects/{project}/locations/{location}/queues/{run}-target-filter-empty",
     "projects/{project}/locations/{location}/queues/{run}-target-filter-none",
-    "projects/{project}/locations/{location}/queues/{run}-target-filter-routed",
-]
-app_engine_routing_override: * -> [
-    "projects/{project}/locations/{location}/queues/{run}-target-filter-routed",
-]
-app_engine_routing_override.service: worker -> [
-    "projects/{project}/locations/{location}/queues/{run}-target-filter-routed",
 ]
 app_engine_routing_override.instance: * -> []
-app_engine_routing_override.host: worker -> [
-    "projects/{project}/locations/{location}/queues/{run}-target-filter-routed",
-]

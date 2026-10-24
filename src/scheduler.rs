@@ -7,23 +7,10 @@ use crate::oidc::Issuer;
 use crate::state::{Delivery, Emulator, HttpMethod, Outcome, Request, Token};
 
 pub(crate) async fn run(emulator: Arc<Emulator>, issuer: Arc<Issuer>) {
-    // Redirect policy is per client, and App Engine tasks don't follow redirects
-    let following = reqwest::Client::new();
-    let not_following = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("client config is valid");
+    let client = reqwest::Client::new();
     loop {
-        let (deliveries, wait) = emulator
-            .state
-            .lock()
-            .unwrap()
-            .start_due(emulator.app_engine.as_deref(), SystemTime::now());
+        let (deliveries, wait) = emulator.state.lock().unwrap().start_due(SystemTime::now());
         for delivery in deliveries {
-            let client = match &delivery.request {
-                Some(request) if !request.follows_redirects => &not_following,
-                _ => &following,
-            };
             tokio::spawn(deliver(
                 emulator.clone(),
                 issuer.clone(),

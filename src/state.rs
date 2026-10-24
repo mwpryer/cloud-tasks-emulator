@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
@@ -6,53 +6,59 @@ use reqwest::Url;
 use tokio::sync::Notify;
 
 use crate::names;
+use crate::proto::google::cloud::tasks::v2 as pb;
+use crate::proto::google::iam::v1 as iam;
 use crate::proto::google::longrunning::Operation;
 
 pub(crate) struct Emulator {
     pub state: Mutex<State>,
-    /// Wakes the scheduler after any change that can make a task due sooner
+    /// Wakes scheduler after any change that can make task due sooner
     pub wake: Notify,
-    /// Origin that every App Engine task goes to, or None when no project has an App Engine app
+    /// Origin that every App Engine task goes to, or None when no project has App Engine app
     pub app_engine: Option<String>,
 }
 
 pub(crate) struct State {
     pub queues: BTreeMap<String, Queue>,
-    /// Deleted queue names, blocked for the 3 days the proto documents
     pub deleted_queues: Tombstones,
     /// Finished batch operations, kept as returned since nothing changes them
     pub operations: BTreeMap<String, Operation>,
-    /// KMS key of each location with CMEK on, which the emulator stores without encrypting
+    /// KMS key of each location with CMEK on, which emulator stores without encrypting
     pub cmek_keys: BTreeMap<String, String>,
     next_attempt_id: u64,
 }
 
 pub(crate) struct Queue {
     pub name: String,
-    pub rate_limits: RateLimits,
-    pub retry_config: RetryConfig,
-    /// Applies to every HTTP task as it dispatches, including tasks created before it
-    pub http_target: Option<HttpTarget>,
-    pub app_engine_routing_override: Option<AppEngineRouting>,
-    /// Stored only, as the emulator writes no operation logs
-    pub log_sampling_ratio: f64,
+    pub config: QueueConfig,
     pub state: QueueState,
     pub purge_time: Option<SystemTime>,
     pub tasks: BTreeMap<String, Task>,
-    /// Finished and deleted task names, blocked for the 24 hours the proto documents
+    /// Finished and deleted task names
     pub removed_tasks: Tombstones,
-    /// None until a policy is first set
-    pub policy: Option<Policy>,
+    /// None until policy is first set, and stored only, as emulator has no caller identity
+    pub policy: Option<iam::Policy>,
     tokens: f64,
     refilled_at: SystemTime,
     in_flight: HashSet<u64>,
 }
 
-/// Stored only, as the emulator has no caller identity to check it against
-pub(crate) struct Policy {
-    pub etag: [u8; 8],
-    /// Members of each role
-    pub bindings: BTreeMap<String, BTreeSet<String>>,
+/// Settings that CreateQueue sets and UpdateQueue replaces
+#[derive(Clone)]
+pub(crate) struct QueueConfig {
+    pub rate_limits: RateLimits,
+    pub retry_config: RetryConfig,
+    pub target: Option<Target>,
+    /// Stored only, as emulator writes no operation logs
+    pub log_sampling_ratio: f64,
+}
+
+#[derive(Clone)]
+pub(crate) enum Target {
+    /// Applies to every HTTP task as it dispatches, including tasks created before it
+    Http(HttpTarget),
+    /// Stored only, with its host filled in, as every App Engine task goes to one origin
+    AppEngine(pb::AppEngineRouting),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -64,7 +70,7 @@ pub(crate) enum QueueState {
 /// Names removed recently enough that they cannot be reused yet
 pub(crate) struct Tombstones {
     window: Duration,
-    /// Oldest first, so expired names come off the front
+    /// Oldest first, so expired names come off front
     removed: VecDeque<(SystemTime, String)>,
     names: HashSet<String>,
 }
@@ -96,37 +102,24 @@ pub(crate) struct HttpTarget {
     pub authorization_header: Option<AuthorizationHeader>,
 }
 
-/// Each part replaces that part of the task URL, and an empty port, path or query removes it
+/// Each part replaces that part of task URL, and empty path or query removes it
 #[derive(Clone)]
 pub(crate) struct UriOverride {
-    pub scheme: Option<Scheme>,
+    /// Unspecified is HTTPS, as proto documents
+    pub scheme: Option<pb::uri_override::Scheme>,
     pub host: Option<String>,
-    /// Zero removes the port
+    /// Zero removes port
     pub port: Option<u64>,
     pub path: Option<String>,
     pub query: Option<String>,
-    /// None applies the override always
-    pub enforce_mode: Option<EnforceMode>,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) enum Scheme {
-    /// HTTPS, as the proto documents
-    Unspecified,
-    Http,
-    Https,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-pub(crate) enum EnforceMode {
-    IfNotExists,
-    Always,
+    /// Unspecified applies override always
+    pub enforce_mode: pb::uri_override::UriOverrideEnforceMode,
 }
 
 pub(crate) struct Task {
     pub name: String,
     pub payload: Payload,
-    /// Overrides the queue's
+    /// Overrides queue's
     pub retry_config: Option<RetryConfig>,
     pub schedule_time: SystemTime,
     pub create_time: SystemTime,
@@ -135,10 +128,10 @@ pub(crate) struct Task {
     pub dispatch_count: u32,
     /// Responses other than 5xx, which Cloud Tasks also sends as X-CloudTasks-TaskExecutionCount
     pub response_count: u32,
-    /// Dispatch time only, as Cloud Tasks keeps nothing else of the first attempt
+    /// Dispatch time only, as Cloud Tasks keeps nothing else of first attempt
     pub first_attempt: Option<SystemTime>,
     pub last_attempt: Option<Attempt>,
-    /// Set by RunTask until the scheduler starts the attempt
+    /// Set by RunTask until scheduler starts attempt
     pub run_requested: bool,
     in_flight: Option<u64>,
 }
@@ -158,18 +151,11 @@ pub(crate) struct HttpRequest {
 
 pub(crate) struct AppEngineHttpRequest {
     pub http_method: HttpMethod,
-    pub routing: AppEngineRouting,
+    /// Stored as returned, as every App Engine task goes to one origin
+    pub routing: pb::AppEngineRouting,
     pub relative_uri: String,
     pub headers: BTreeMap<String, String>,
     pub body: Vec<u8>,
-}
-
-/// Decides only the reported host, as every App Engine task goes to one origin
-#[derive(Clone)]
-pub(crate) struct AppEngineRouting {
-    pub service: Option<String>,
-    pub version: Option<String>,
-    pub instance: Option<String>,
 }
 
 /// Token generated for each attempt, which replaces any stored Authorization header
@@ -182,7 +168,7 @@ pub(crate) enum AuthorizationHeader {
     },
     OidcToken {
         service_account_email: String,
-        /// None is the task URL
+        /// None is task URL
         audience: Option<String>,
     },
 }
@@ -221,7 +207,6 @@ pub(crate) enum Outcome {
 }
 
 impl Outcome {
-    /// The status Cloud Tasks reports, which it sets to 504 after a timeout and 0 without a connection
     pub fn status(self) -> u16 {
         match self {
             Outcome::Status(status) => status,
@@ -235,7 +220,7 @@ pub(crate) struct Delivery {
     pub queue: String,
     pub task: String,
     pub attempt_id: u64,
-    /// None when Cloud Tasks fails the attempt without sending anything
+    /// None when Cloud Tasks fails attempt without sending anything
     pub request: Option<Request>,
 }
 
@@ -280,7 +265,7 @@ impl Default for State {
 }
 
 impl State {
-    /// Starts every due attempt the queue limits allow and returns how long until one could next start
+    /// Starts every due attempt that queue limits allow, and returns how long until one could next start
     pub fn start_due(
         &mut self,
         app_engine: Option<&str>,
@@ -289,26 +274,27 @@ impl State {
         let mut deliveries = Vec::new();
         let mut wait: Option<Duration> = None;
         for queue in self.queues.values_mut() {
-            let rate = queue.rate_limits.max_dispatches_per_second;
+            let rate_limits = queue.config.rate_limits;
+            let rate = rate_limits.max_dispatches_per_second;
             let elapsed = now.duration_since(queue.refilled_at).unwrap_or_default();
             queue.tokens = (queue.tokens + elapsed.as_secs_f64() * rate)
-                .min(queue.rate_limits.max_burst_size as f64);
+                .min(rate_limits.max_burst_size as f64);
             queue.refilled_at = now;
 
-            // RunTask dispatches whatever the queue's state, limits and the task's schedule
+            // RunTask dispatches whatever queue's state, limits and task's schedule
             for task in queue.tasks.values_mut().filter(|task| task.run_requested) {
                 task.run_requested = false;
                 self.next_attempt_id += 1;
                 queue.in_flight.insert(self.next_attempt_id);
                 deliveries.push(task.start_attempt(
                     &queue.name,
-                    queue.http_target.as_ref(),
+                    queue.config.http_target(),
                     app_engine,
                     self.next_attempt_id,
                     now,
                 ));
             }
-            // Resuming wakes the scheduler, so a paused queue needs no timer
+            // Resuming wakes scheduler, so paused queue needs no timer
             if queue.state == QueueState::Paused {
                 continue;
             }
@@ -326,8 +312,8 @@ impl State {
                     wait = Some(wait.map_or(until_due, |wait| wait.min(until_due)));
                     break;
                 }
-                // A finishing attempt wakes the scheduler, so a full queue needs no timer
-                if queue.in_flight.len() >= queue.rate_limits.max_concurrent_dispatches as usize {
+                // Finished attempt wakes scheduler, so full queue needs no timer
+                if queue.in_flight.len() >= rate_limits.max_concurrent_dispatches as usize {
                     break;
                 }
                 if queue.tokens < 1.0 {
@@ -340,7 +326,7 @@ impl State {
                 queue.in_flight.insert(self.next_attempt_id);
                 deliveries.push(task.start_attempt(
                     &queue.name,
-                    queue.http_target.as_ref(),
+                    queue.config.http_target(),
                     app_engine,
                     self.next_attempt_id,
                     now,
@@ -351,7 +337,7 @@ impl State {
     }
 
     pub fn finish_attempt(&mut self, delivery: &Delivery, outcome: Outcome, now: SystemTime) {
-        // The queue or task may have been deleted while the attempt was in flight
+        // Queue or task may have been deleted while attempt was in flight
         let Some(queue) = self.queues.get_mut(&delivery.queue) else {
             return;
         };
@@ -382,7 +368,7 @@ impl State {
             .first_attempt
             .expect("in-flight task has a first attempt");
         let retrying_for = now.duration_since(first_attempt).unwrap_or_default();
-        let retry_config = task.retry_config.unwrap_or(queue.retry_config);
+        let retry_config = task.retry_config.unwrap_or(queue.config.retry_config);
         if matches!(outcome, Outcome::Status(200..=299))
             || retry_config.exhausted(task.dispatch_count, retrying_for)
         {
@@ -394,34 +380,21 @@ impl State {
 }
 
 impl Queue {
-    pub fn new(
-        name: String,
-        rate_limits: RateLimits,
-        retry_config: RetryConfig,
-        http_target: Option<HttpTarget>,
-        app_engine_routing_override: Option<AppEngineRouting>,
-        log_sampling_ratio: f64,
-        now: SystemTime,
-    ) -> Self {
+    pub fn new(name: String, config: QueueConfig, now: SystemTime) -> Self {
         Self {
             name,
-            rate_limits,
-            retry_config,
-            http_target,
-            app_engine_routing_override,
-            log_sampling_ratio,
+            tokens: config.rate_limits.max_burst_size as f64,
+            config,
             state: QueueState::Running,
             purge_time: None,
             tasks: BTreeMap::new(),
             removed_tasks: Tombstones::new(Duration::from_secs(24 * 60 * 60)),
             policy: None,
-            tokens: rate_limits.max_burst_size as f64,
             refilled_at: now,
             in_flight: HashSet::new(),
         }
     }
 
-    /// Removes the task and blocks its name from reuse
     pub fn remove_task(&mut self, name: &str, now: SystemTime) -> Option<Task> {
         let task = self.tasks.remove(name)?;
         self.removed_tasks.insert(task.name.clone(), now);
@@ -436,18 +409,27 @@ impl Queue {
     }
 }
 
+impl QueueConfig {
+    pub fn http_target(&self) -> Option<&HttpTarget> {
+        match &self.target {
+            Some(Target::Http(target)) => Some(target),
+            Some(Target::AppEngine(_)) | None => None,
+        }
+    }
+}
+
 impl UriOverride {
-    /// None when the override leaves no valid URL
+    /// None when override leaves no valid URL
     fn apply(&self, url: &str) -> Option<Url> {
         let mut url = Url::parse(url).ok()?;
-        // A task always has a URL, so this mode never applies
-        if self.enforce_mode == Some(EnforceMode::IfNotExists) {
+        // Task always has URL, so this mode never applies
+        if self.enforce_mode == pb::uri_override::UriOverrideEnforceMode::IfNotExists {
             return Some(url);
         }
         if let Some(scheme) = self.scheme {
             url.set_scheme(match scheme {
-                Scheme::Http => "http",
-                Scheme::Unspecified | Scheme::Https => "https",
+                pb::uri_override::Scheme::Http => "http",
+                pb::uri_override::Scheme::Unspecified | pb::uri_override::Scheme::Https => "https",
             })
             .expect("http and https convert to each other");
         }
@@ -513,7 +495,7 @@ impl Tombstones {
 }
 
 impl RetryConfig {
-    /// Doubles `max_doublings` times, then grows linearly by the last doubled interval
+    /// Doubles `max_doublings` times, then grows linearly by last doubled interval
     fn backoff(&self, attempts: u32) -> Duration {
         let doublings = (attempts - 1).min(self.max_doublings);
         let doubled = self
@@ -524,7 +506,7 @@ impl RetryConfig {
             .min(self.max_backoff)
     }
 
-    /// Both limits must be reached, and an unlimited one counts as reached only when the other is set
+    /// Both limits must be reached, and unlimited one counts as reached only when other is set
     fn exhausted(&self, attempts: u32, retrying_for: Duration) -> bool {
         if self.max_attempts.is_none() && self.max_retry_duration.is_none() {
             return false;
@@ -577,7 +559,6 @@ impl Task {
             .schedule_time
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default();
-        // Named X-CloudTasks-* for HTTP tasks and X-AppEngine-* for App Engine tasks
         let injected = |prefix: &str| {
             let mut injected = vec![
                 (
@@ -598,7 +579,7 @@ impl Task {
                 ),
                 (
                     format!("{prefix}TaskETA"),
-                    // Shortest decimal for the float, so 1.120000 is 1.12
+                    // Shortest decimal for float, so 1.120000 is 1.12
                     eta.as_secs_f64().to_string(),
                 ),
             ];
@@ -617,7 +598,7 @@ impl Task {
                 let authorization_header = http_target
                     .and_then(|target| target.authorization_header.as_ref())
                     .or(stored.authorization_header.as_ref());
-                // Overrides, then injected headers, replace stored ones of the same name
+                // Overrides, then injected headers, replace stored ones of same name
                 let overrides = http_target.map_or(&[][..], |target| &target.header_overrides);
                 let mut headers: Vec<(String, String)> = stored
                     .headers
@@ -655,7 +636,7 @@ impl Task {
                         audience: audience.clone().unwrap_or_else(|| stored.url.clone()),
                     },
                 });
-                // Cloud Tasks fails a method override that disallows the body, though the proto says it drops it
+                // Cloud Tasks fails method override that disallows body, though proto says it drops it
                 url.filter(|_| stored.body.is_empty() || http_method.allows_body())
                     .map(|url| Request {
                         http_method,
@@ -682,7 +663,7 @@ impl Task {
                 headers.extend(injected);
                 let origin =
                     app_engine.expect("App Engine tasks exist only with an App Engine URL");
-                // Joined as text, so a relative URI that starts with // stays a path
+                // Joined as text, so relative URI starting with // stays path
                 Url::parse(&format!("{origin}{}", stored.relative_uri))
                     .ok()
                     .map(|url| Request {

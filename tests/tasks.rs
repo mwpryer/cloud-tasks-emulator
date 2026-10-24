@@ -26,7 +26,7 @@ async fn start_with_queue() -> CloudTasksClient<Channel> {
     client
 }
 
-/// A day out, so control-plane tests see no dispatch
+/// Keeps control-plane tests from dispatching
 fn tomorrow() -> Timestamp {
     Timestamp::from(SystemTime::now() + Duration::from_secs(24 * 60 * 60))
 }

@@ -6,13 +6,14 @@ mod rest;
 mod scheduler;
 mod state;
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use prost_reflect::DescriptorPool;
 use tokio::net::TcpListener;
 use tonic::service::Routes;
 use tonic::transport::server::TcpIncoming;
@@ -51,9 +52,12 @@ pub mod proto {
     }
 }
 
-/// Serves the API over gRPC and REST, and OIDC discovery for tokens issued as `issuer`, an origin such as `http://127.0.0.1:8123`
-/// App Engine tasks go to the `app_engine` origin, and without one every project lacks an App Engine app
-/// Each of `queues`, a full queue name, starts with the default config
+static DESCRIPTORS: LazyLock<DescriptorPool> = LazyLock::new(|| {
+    DescriptorPool::decode(include_bytes!(concat!(env!("OUT_DIR"), "/descriptors.bin")).as_slice())
+        .expect("build.rs encodes the descriptors")
+});
+
+/// Serves gRPC, REST and OIDC discovery for `issuer`, creating each of `queues` with default config
 pub async fn serve(
     listener: TcpListener,
     issuer: String,
@@ -61,7 +65,6 @@ pub async fn serve(
     queues: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let emulator = Arc::new(Emulator::new(app_engine));
-    let cloud_tasks = api::CloudTasksService::new(emulator.clone());
     for name in queues {
         let request = CreateQueueRequest {
             parent: name
@@ -73,7 +76,7 @@ pub async fn serve(
                 ..Default::default()
             }),
         };
-        cloud_tasks
+        emulator
             .create_queue(tonic::Request::new(request))
             .await
             .map_err(|status| format!("Cannot create {name}: {}", status.message()))?;
@@ -87,8 +90,8 @@ pub async fn serve(
     let idle = axum::Router::new()
         .route("/emulator/{*path}", get(wait_idle))
         .with_state(emulator.clone());
-    let grpc = Routes::new(CloudTasksServer::new(cloud_tasks))
-        .add_service(OperationsServer::new(api::OperationsService::new(emulator)));
+    let grpc = Routes::new(CloudTasksServer::from_arc(emulator.clone()))
+        .add_service(OperationsServer::from_arc(emulator));
     let routes = grpc
         .clone()
         .into_axum_router()
@@ -103,7 +106,7 @@ pub async fn serve(
     Ok(())
 }
 
-/// Answers once the queue in a path such as `projects/p/locations/l/queues/q:waitIdle` holds no tasks
+/// Answers once queue in path such as `projects/p/locations/l/queues/q:waitIdle` holds no tasks
 async fn wait_idle(State(emulator): State<Arc<Emulator>>, Path(path): Path<String>) -> Response {
     let Some(name) = path.strip_suffix(":waitIdle") else {
         return StatusCode::NOT_FOUND.into_response();

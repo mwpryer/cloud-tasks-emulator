@@ -1,17 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ops::Bound;
-use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jiff::fmt::strtime::BrokenDownTime;
 use prost::Message;
+use prost_reflect::{DynamicMessage, Kind, ReflectMessage};
 use prost_types::{Any, Timestamp};
 use tonic::{Code, Request, Response, Status};
 
-use crate::filter::{self, Filter};
-use crate::names;
 use crate::proto::google::cloud::tasks::v2 as pb;
 use crate::proto::google::cloud::tasks::v2::cloud_tasks_server::CloudTasks;
 use crate::proto::google::iam::v1 as iam;
@@ -19,10 +17,11 @@ use crate::proto::google::longrunning::operations_server::Operations;
 use crate::proto::google::longrunning::{self, Operation, operation};
 use crate::proto::google::rpc;
 use crate::state::{
-    AppEngineHttpRequest, AppEngineRouting, Attempt, AuthorizationHeader, DEFAULT_DEADLINE,
-    DEFAULT_SCOPE, Emulator, EnforceMode, HttpMethod, HttpRequest, HttpTarget, Payload, Policy,
-    Queue, QueueState, RateLimits, RetryConfig, Scheme, State, Task, UriOverride,
+    AppEngineHttpRequest, Attempt, AuthorizationHeader, DEFAULT_DEADLINE, DEFAULT_SCOPE, Emulator,
+    HttpMethod, HttpRequest, HttpTarget, Payload, Queue, QueueConfig, QueueState, RateLimits,
+    RetryConfig, State, Target, Task, UriOverride,
 };
+use crate::{filter, names};
 
 const QUEUE_NOT_FOUND: &str = "Queue does not exist. If you just created the queue, wait at least a minute for the queue to initialize.";
 const QUEUE_RECENTLY_DELETED: &str =
@@ -32,10 +31,10 @@ const TASK_GONE: &str = "The task no longer exists, though a task with this name
 const NOT_FOUND: &str = "Requested entity was not found.";
 const QUEUE_NAME_DOCS: &str = "https://cloud.google.com/tasks/docs/reference/rest/v2/projects.locations.queues#Queue.FIELDS.name";
 const TASK_NAME_DOCS: &str = "https://cloud.google.com/tasks/docs/reference/rest/v2/projects.locations.queues.tasks#Task.FIELDS.name";
-/// Wording and code are guesses, as recording this needs a Cloud KMS key
+/// Wording and code are guesses, as recording this needs Cloud KMS key
 const CMEK_HEADER_OVERRIDES: &str =
     "Queues with HTTP Target Override headers cannot be created or updated while CMEK is enabled.";
-/// How Google's front end refuses the Operations RPCs that Cloud Tasks does not serve
+/// How Google's front end refuses Operations RPCs that Cloud Tasks does not serve
 const UNSERVED: &str = "Method doesn't allow unregistered callers (callers without established identity). Please use API Key or other form of API consumer identity to call this API.";
 /// Dropped from task headers and rejected in queue header overrides, along with `RESERVED_PREFIXES`
 const RESERVED_HEADERS: [&str; 14] = [
@@ -55,7 +54,7 @@ const RESERVED_HEADERS: [&str; 14] = [
     "x-forwarded-for",
 ];
 const RESERVED_PREFIXES: [&str; 2] = ["x-google", "x-appengine"];
-/// Etag of a queue that never had a policy, `ACAB` in base64
+/// Etag of queue that never had policy, `ACAB` in base64
 const NO_POLICY_ETAG: [u8; 3] = [0x00, 0x20, 0x01];
 const MEMBER_PREFIXES: [&str; 7] = [
     "user:",
@@ -66,7 +65,6 @@ const MEMBER_PREFIXES: [&str; 7] = [
     "principalSet:",
     "deleted:",
 ];
-/// Permissions TestIamPermissions accepts for a queue
 const QUEUE_PERMISSIONS: [&str; 14] = [
     "cloudtasks.queues.delete",
     "cloudtasks.queues.get",
@@ -83,20 +81,12 @@ const QUEUE_PERMISSIONS: [&str; 14] = [
     "cloudtasks.tasks.list",
     "cloudtasks.tasks.run",
 ];
-/// Largest encoded task, 1 MiB less the 5 bytes Cloud Tasks stores beyond the proto
+/// Largest encoded task, 1 MiB less 5 bytes Cloud Tasks stores beyond proto
 const MAX_TASK_SIZE: usize = 1024 * 1024 - 5;
 
-pub(crate) struct CloudTasksService {
-    emulator: Arc<Emulator>,
-}
-
-impl CloudTasksService {
-    pub fn new(emulator: Arc<Emulator>) -> Self {
-        Self { emulator }
-    }
-
-    /// Checks the task and adds it to the queue, failing as CreateTask does
-    fn create(
+impl Emulator {
+    /// Checks task and adds it to queue, failing as CreateTask does
+    fn insert_task(
         &self,
         state: &mut State,
         parent: &str,
@@ -107,10 +97,10 @@ impl CloudTasksService {
         let mut payload = match task.message_type {
             Some(pb::task::MessageType::HttpRequest(http)) => Payload::Http(http_request(http)?),
             Some(pb::task::MessageType::AppEngineHttpRequest(app_engine)) => {
-                if self.emulator.app_engine.is_none() {
+                if self.app_engine.is_none() {
                     return Err(no_app_engine(parent));
                 }
-                Payload::AppEngine(app_engine_http_request(app_engine)?)
+                Payload::AppEngine(app_engine_http_request(app_engine, parent)?)
             }
             None => return Err(Status::invalid_argument("Task.payload_type is not set.")),
         };
@@ -137,7 +127,7 @@ impl CloudTasksService {
         let now = SystemTime::now();
         let schedule_time = match task.schedule_time {
             None => now,
-            // Past 9999, which a Timestamp cannot hold
+            // Past 9999, which Timestamp cannot hold
             Some(time) if time.seconds > 253_402_300_799 => {
                 return Err(Status::invalid_argument(
                     "Request contains an invalid argument.",
@@ -152,7 +142,7 @@ impl CloudTasksService {
                         SystemTime::UNIX_EPOCH
                             + Duration::from_micros(since_epoch.as_micros() as u64)
                     })
-                    // Cloud Tasks moves any past time to now, even one before the epoch
+                    // Cloud Tasks moves any past time to now, even one before epoch
                     .filter(|&schedule_time| schedule_time > now)
                     .unwrap_or(now);
                 if schedule_time > now + Duration::from_secs(720 * 60 * 60) {
@@ -170,15 +160,15 @@ impl CloudTasksService {
             .get_mut(parent)
             .ok_or_else(|| Status::not_found(QUEUE_NOT_FOUND))?;
         if let Payload::Http(http_request) = &mut payload {
-            // The queue's token replaces the task's before the URL check, which never sees the replaced one
+            // Queue's token replaces task's before URL check, which never sees replaced one
             if let Some(header) = queue
-                .http_target
-                .as_ref()
+                .config
+                .http_target()
                 .and_then(|target| target.authorization_header.clone())
             {
                 http_request.authorization_header = Some(header);
             }
-            // Checks only the host, allowing the http URLs Cloud Tasks rejects tokens for, so local handlers get tokens
+            // Checks only host, allowing http URLs Cloud Tasks rejects tokens for, so local handlers get tokens
             if let Some(AuthorizationHeader::OAuthToken { .. }) = http_request.authorization_header
                 && !reqwest::Url::parse(&http_request.url).is_ok_and(|url| {
                     url.host_str()
@@ -211,10 +201,24 @@ impl CloudTasksService {
         queue.tasks.insert(task.name.clone(), task);
         Ok(response)
     }
+
+    /// Checks what create or update request asks for, before any mask merges it
+    fn check_requested(&self, queue: &pb::Queue) -> Result<(), Status> {
+        if queue.app_engine_routing_override.is_some() && self.app_engine.is_none() {
+            return Err(no_app_engine(&queue.name));
+        }
+        // In full, as Cloud Tasks skips token check once mask merges target
+        if let Some(target) = &queue.http_target
+            && let Some(header) = http_target(target.clone())?.authorization_header
+        {
+            service_account(&header)?;
+        }
+        Ok(())
+    }
 }
 
 #[tonic::async_trait]
-impl CloudTasks for CloudTasksService {
+impl CloudTasks for Emulator {
     async fn list_queues(
         &self,
         request: Request<pb::ListQueuesRequest>,
@@ -226,26 +230,10 @@ impl CloudTasks for CloudTasksService {
             "cloudtasks.queues.list",
             "google.cloud.tasks.v2.CloudTasks.ListQueues",
         )?;
-        let filter = Filter::parse(&request.filter).map_err(|error| match error {
-            filter::Error::Syntax(token) => Status::invalid_argument(format!(
-                "Failed to parse filter expression: syntax error at token '{token}'"
-            )),
-            filter::Error::FieldNotFound(field) => {
-                Status::invalid_argument(format!("Field not found: '{field}'."))
-            }
-            filter::Error::IncorrectType(value) => {
-                Status::invalid_argument(format!("The value '{value}' is of incorrect type."))
-            }
-            filter::Error::NestedType(field) => Status::invalid_argument(format!(
-                "Cannot match a nested type '{field}'. A member field of scalar or enum type must be provided."
-            )),
-            filter::Error::Unsupported(feature) => Status::unimplemented(format!(
-                "ListQueues filter {feature} is not supported yet"
-            )),
-        })?;
-        let state = self.emulator.state.lock().unwrap();
+        let filter = filter::parse(&request.filter)?;
+        let state = self.state.lock().unwrap();
         let prefix = format!("{}/queues/", request.parent);
-        // Filtering within the page, which the proto allows to return fewer queues than the page size
+        // Filtering within page, which proto allows to return fewer queues than page size
         let (mut queues, next_page_token) = page(
             &state.queues,
             &prefix,
@@ -273,7 +261,7 @@ impl CloudTasks for CloudTasksService {
             "cloudtasks.queues.get",
             "google.cloud.tasks.v2.CloudTasks.GetQueue",
         )?;
-        let state = self.emulator.state.lock().unwrap();
+        let state = self.state.lock().unwrap();
         let queue = state
             .queues
             .get(&request.name)
@@ -292,7 +280,7 @@ impl CloudTasks for CloudTasksService {
             "cloudtasks.queues.create",
             "google.cloud.tasks.v2.CloudTasks.CreateQueue",
         )?;
-        // Cloud Tasks reads a missing queue as one with an empty name
+        // Cloud Tasks reads missing queue as one with empty name
         let queue = request.queue.unwrap_or_default();
         let ids = names::ids(&queue.name, names::QUEUE).ok_or_else(|| {
             detailed(
@@ -311,50 +299,26 @@ impl CloudTasks for CloudTasksService {
                 queue.name, request.parent
             )));
         }
-        if queue.app_engine_routing_override.is_some() && self.emulator.app_engine.is_none() {
-            return Err(no_app_engine(&queue.name));
-        }
-        let rate_limits = rate_limits(queue.rate_limits.unwrap_or_default())?;
-        let retry_config = retry_config(queue.retry_config.unwrap_or_default())?;
-        if let Some(target) = &queue.http_target {
-            check_http_target(target)?;
-        }
-        let app_engine_routing_override = queue
-            .app_engine_routing_override
-            .map(app_engine_routing)
-            .transpose()?;
-        // A queue holds one target, and Cloud Tasks silently drops the HTTP one
-        let http_target = queue
-            .http_target
-            .filter(|_| app_engine_routing_override.is_none())
-            .map(http_target)
-            .transpose()?;
-        let log_sampling_ratio = log_sampling_ratio(queue.stackdriver_logging_config)?;
+        self.check_requested(&queue)?;
+        let name = queue.name.clone();
+        let config = queue_config(queue)?;
 
         let now = SystemTime::now();
-        let mut state = self.emulator.state.lock().unwrap();
-        if state.queues.contains_key(&queue.name) {
+        let mut state = self.state.lock().unwrap();
+        if state.queues.contains_key(&name) {
             return Err(Status::already_exists("Queue already exists"));
         }
-        if state.deleted_queues.contains(&queue.name, now) {
+        if state.deleted_queues.contains(&name, now) {
             return Err(Status::failed_precondition(QUEUE_RECENTLY_DELETED));
         }
-        if http_target
-            .as_ref()
+        if config
+            .http_target()
             .is_some_and(|target| !target.header_overrides.is_empty())
             && state.cmek_keys.contains_key(&request.parent)
         {
             return Err(Status::failed_precondition(CMEK_HEADER_OVERRIDES));
         }
-        let queue = Queue::new(
-            queue.name,
-            rate_limits,
-            retry_config,
-            http_target,
-            app_engine_routing_override,
-            log_sampling_ratio,
-            now,
-        );
+        let queue = Queue::new(name, config, now);
         let response = queue_to_proto(&queue);
         state.queues.insert(queue.name.clone(), queue);
         Ok(Response::new(response))
@@ -365,7 +329,7 @@ impl CloudTasks for CloudTasksService {
         request: Request<pb::UpdateQueueRequest>,
     ) -> Result<Response<pb::Queue>, Status> {
         let request = request.into_inner();
-        // Cloud Tasks reads a missing queue as one with an empty name
+        // Cloud Tasks reads missing queue as one with empty name
         let update = request.queue.unwrap_or_default();
         resource(
             &update.name,
@@ -373,22 +337,17 @@ impl CloudTasks for CloudTasksService {
             "cloudtasks.queues.update",
             "google.cloud.tasks.v2.CloudTasks.UpdateQueue",
         )?;
-        if update.app_engine_routing_override.is_some() && self.emulator.app_engine.is_none() {
-            return Err(no_app_engine(&update.name));
-        }
-        // Cloud Tasks checks the requested target even outside the mask
-        if let Some(target) = &update.http_target {
-            check_http_target(target)?;
-        }
+        // Cloud Tasks checks request even outside mask
+        self.check_requested(&update)?;
 
         let now = SystemTime::now();
-        let mut state = self.emulator.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         if !state.queues.contains_key(&update.name)
             && state.deleted_queues.contains(&update.name, now)
         {
             return Err(Status::failed_precondition(QUEUE_RECENTLY_DELETED));
         }
-        // Unmasked fields of a new queue take their defaults
+        // Unmasked fields of new queue take their defaults
         let current = state.queues.get(&update.name).map_or_else(
             || pb::Queue {
                 name: update.name.clone(),
@@ -396,54 +355,29 @@ impl CloudTasks for CloudTasksService {
             },
             queue_to_proto,
         );
-        // An absent mask updates every field, while an empty one updates none
+        // Absent mask updates every field, while empty one updates none
         let merged = match request.update_mask {
             None => update,
             Some(mask) => masked(current, update, &mask.paths)?,
         };
-        let rate_limits = rate_limits(merged.rate_limits.unwrap_or_default())?;
-        let retry_config = retry_config(merged.retry_config.unwrap_or_default())?;
-        let app_engine_routing_override = merged
-            .app_engine_routing_override
-            .map(app_engine_routing)
-            .transpose()?;
-        // A queue holds one target, and Cloud Tasks silently drops the HTTP one
-        let http_target = merged
-            .http_target
-            .filter(|_| app_engine_routing_override.is_none())
-            .map(http_target)
-            .transpose()?;
-        let log_sampling_ratio = log_sampling_ratio(merged.stackdriver_logging_config)?;
-        let (location, _) = merged
-            .name
-            .rsplit_once("/queues/")
-            .expect("checked queue name");
-        if http_target
-            .as_ref()
+        let name = merged.name.clone();
+        let config = queue_config(merged)?;
+        let (location, _) = name.rsplit_once("/queues/").expect("checked queue name");
+        if config
+            .http_target()
             .is_some_and(|target| !target.header_overrides.is_empty())
             && state.cmek_keys.contains_key(location)
         {
             return Err(Status::failed_precondition(CMEK_HEADER_OVERRIDES));
         }
-        let queue = state.queues.entry(merged.name.clone()).or_insert_with(|| {
-            Queue::new(
-                merged.name,
-                rate_limits,
-                retry_config,
-                http_target.clone(),
-                app_engine_routing_override.clone(),
-                log_sampling_ratio,
-                now,
-            )
-        });
-        queue.rate_limits = rate_limits;
-        queue.retry_config = retry_config;
-        queue.http_target = http_target;
-        queue.app_engine_routing_override = app_engine_routing_override;
-        queue.log_sampling_ratio = log_sampling_ratio;
+        let queue = state
+            .queues
+            .entry(name.clone())
+            .or_insert_with(|| Queue::new(name, config.clone(), now));
+        queue.config = config;
         let response = queue_to_proto(queue);
         drop(state);
-        self.emulator.wake.notify_one();
+        self.wake.notify_one();
         Ok(Response::new(response))
     }
 
@@ -458,7 +392,7 @@ impl CloudTasks for CloudTasksService {
             "cloudtasks.queues.delete",
             "google.cloud.tasks.v2.CloudTasks.DeleteQueue",
         )?;
-        let mut state = self.emulator.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         state
             .queues
             .remove(&request.name)
@@ -478,7 +412,7 @@ impl CloudTasks for CloudTasksService {
             "cloudtasks.queues.purge",
             "google.cloud.tasks.v2.CloudTasks.PurgeQueue",
         )?;
-        let mut state = self.emulator.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         let queue = state
             .queues
             .get_mut(&request.name)
@@ -498,7 +432,7 @@ impl CloudTasks for CloudTasksService {
             "cloudtasks.queues.pause",
             "google.cloud.tasks.v2.CloudTasks.PauseQueue",
         )?;
-        let mut state = self.emulator.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         let queue = state
             .queues
             .get_mut(&request.name)
@@ -518,7 +452,7 @@ impl CloudTasks for CloudTasksService {
             "cloudtasks.queues.resume",
             "google.cloud.tasks.v2.CloudTasks.ResumeQueue",
         )?;
-        let mut state = self.emulator.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         let queue = state
             .queues
             .get_mut(&request.name)
@@ -526,7 +460,7 @@ impl CloudTasks for CloudTasksService {
         queue.state = QueueState::Running;
         let response = queue_to_proto(queue);
         drop(state);
-        self.emulator.wake.notify_one();
+        self.wake.notify_one();
         Ok(Response::new(response))
     }
 
@@ -541,12 +475,17 @@ impl CloudTasks for CloudTasksService {
             "cloudtasks.queues.list",
             "google.cloud.tasks.v2.CloudTasks.GetIamPolicy",
         )?;
-        let state = self.emulator.state.lock().unwrap();
+        let state = self.state.lock().unwrap();
         let queue = state
             .queues
             .get(&request.resource)
             .ok_or_else(|| Status::not_found(QUEUE_NOT_FOUND))?;
-        Ok(Response::new(policy_to_proto(queue.policy.as_ref())))
+        Ok(Response::new(queue.policy.clone().unwrap_or_else(|| {
+            iam::Policy {
+                etag: NO_POLICY_ETAG.to_vec(),
+                ..Default::default()
+            }
+        })))
     }
 
     async fn set_iam_policy(
@@ -560,7 +499,7 @@ impl CloudTasks for CloudTasksService {
             "cloudtasks.queues.list",
             "google.cloud.tasks.v2.CloudTasks.SetIamPolicy",
         )?;
-        // Cloud Tasks reads a missing policy as an empty one
+        // Cloud Tasks reads missing policy as empty one
         let policy = request.policy.unwrap_or_default();
         if policy.version > 3 {
             return Err(Status::invalid_argument(format!(
@@ -605,7 +544,7 @@ impl CloudTasks for CloudTasksService {
             }
         }
 
-        let mut state = self.emulator.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         let queue = state
             .queues
             .get_mut(&request.resource)
@@ -621,11 +560,20 @@ impl CloudTasks for CloudTasksService {
                 c_escape(etag)
             )));
         }
-        let policy = queue.policy.insert(Policy {
-            etag: rand::random(),
-            bindings,
+        let policy = queue.policy.insert(iam::Policy {
+            version: 1,
+            etag: rand::random::<[u8; 8]>().to_vec(),
+            bindings: bindings
+                .into_iter()
+                .map(|(role, members)| iam::Binding {
+                    role,
+                    members: members.into_iter().collect(),
+                    condition: None,
+                })
+                .collect(),
+            audit_configs: Vec::new(),
         });
-        Ok(Response::new(policy_to_proto(Some(policy))))
+        Ok(Response::new(policy.clone()))
     }
 
     async fn test_iam_permissions(
@@ -640,7 +588,6 @@ impl CloudTasks for CloudTasksService {
             "google.cloud.tasks.v2.CloudTasks.TestIamPermissions",
         )?;
         if !self
-            .emulator
             .state
             .lock()
             .unwrap()
@@ -666,7 +613,7 @@ impl CloudTasks for CloudTasksService {
                 )));
             }
         }
-        // Grants every permission, as the emulator has no caller identity
+        // Grants every permission, as emulator has no caller identity
         let mut permissions = request.permissions;
         permissions.sort();
         Ok(Response::new(iam::TestIamPermissionsResponse {
@@ -685,12 +632,12 @@ impl CloudTasks for CloudTasksService {
             "cloudtasks.tasks.list",
             "google.cloud.tasks.v2.CloudTasks.ListTasks",
         )?;
-        // Unlike create and get, list echoes an unknown view as basic
+        // Unlike create and get, list echoes unknown view as basic
         let view = match response_view(request.response_view) {
             pb::task::View::Full => pb::task::View::Full,
             _ => pb::task::View::Basic,
         };
-        let state = self.emulator.state.lock().unwrap();
+        let state = self.state.lock().unwrap();
         let queue = state
             .queues
             .get(&request.parent)
@@ -723,7 +670,7 @@ impl CloudTasks for CloudTasksService {
             "google.cloud.tasks.v2.CloudTasks.GetTask",
         )?;
         let view = response_view(request.response_view);
-        let mut state = self.emulator.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         let queue = state
             .queues
             .get_mut(
@@ -757,11 +704,11 @@ impl CloudTasks for CloudTasksService {
             "cloudtasks.tasks.create",
             "google.cloud.tasks.v2.CloudTasks.CreateTask",
         )?;
-        // Cloud Tasks reads a missing task as one without a payload
+        // Cloud Tasks reads missing task as one without payload
         let task = request.task.unwrap_or_default();
         let name = task_name(&request.parent, &task.name)?;
-        let mut state = self.emulator.state.lock().unwrap();
-        let response = self.create(
+        let mut state = self.state.lock().unwrap();
+        let response = self.insert_task(
             &mut state,
             &request.parent,
             name,
@@ -769,7 +716,7 @@ impl CloudTasks for CloudTasksService {
             response_view(request.response_view),
         )?;
         drop(state);
-        self.emulator.wake.notify_one();
+        self.wake.notify_one();
         Ok(Response::new(response))
     }
 
@@ -815,15 +762,15 @@ impl CloudTasks for CloudTasksService {
         }
 
         let start_time = SystemTime::now();
-        let mut state = self.emulator.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         let name = operation_name(&state, &request.parent, request.request_id)?;
         let mut tasks = Vec::new();
         let mut failed_requests = BTreeMap::new();
         for (index, (task_name, task, view)) in creates.into_iter().enumerate() {
-            // A batch words a missing payload differently from CreateTask
+            // Batch words missing payload differently from CreateTask
             let created = match task.message_type {
                 None => Err(Status::invalid_argument("Payload type must be set.")),
-                Some(_) => self.create(&mut state, &request.parent, task_name, task, view),
+                Some(_) => self.insert_task(&mut state, &request.parent, task_name, task, view),
             };
             match created {
                 Ok(task) => tasks.push(task),
@@ -852,24 +799,19 @@ impl CloudTasks for CloudTasksService {
         };
         let operation = Operation {
             name: name.clone(),
-            metadata: Some(prost_types::Any {
-                type_url: "type.googleapis.com/google.cloud.tasks.v2.BatchCreateTasksMetadata"
-                    .to_owned(),
-                value: metadata.encode_to_vec(),
-            }),
+            metadata: Some(Any::from_msg(&metadata).expect("Vec grows to fit")),
             done: true,
-            // A batch that created nothing has no response
+            // Batch that created nothing has no response
             result: (!tasks.is_empty()).then(|| {
-                operation::Result::Response(prost_types::Any {
-                    type_url: "type.googleapis.com/google.cloud.tasks.v2.BatchCreateTasksResponse"
-                        .to_owned(),
-                    value: pb::BatchCreateTasksResponse { tasks }.encode_to_vec(),
-                })
+                operation::Result::Response(
+                    Any::from_msg(&pb::BatchCreateTasksResponse { tasks })
+                        .expect("Vec grows to fit"),
+                )
             }),
         };
         state.operations.insert(name, operation.clone());
         drop(state);
-        self.emulator.wake.notify_one();
+        self.wake.notify_one();
         Ok(Response::new(operation))
     }
 
@@ -884,7 +826,7 @@ impl CloudTasks for CloudTasksService {
             "cloudtasks.tasks.delete",
             "google.cloud.tasks.v2.CloudTasks.DeleteTask",
         )?;
-        let mut state = self.emulator.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         state
             .queues
             .get_mut(
@@ -923,12 +865,12 @@ impl CloudTasks for CloudTasksService {
         }
 
         let start_time = SystemTime::now();
-        let mut state = self.emulator.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         let name = operation_name(&state, &request.parent, request.request_id)?;
         let mut deleted = HashSet::new();
         let mut failed_requests = BTreeMap::new();
         for (index, task) in request.names.iter().enumerate() {
-            // A name deleted earlier in the batch counts as deleted again
+            // Name deleted earlier in batch counts as deleted again
             if deleted.contains(task) {
                 continue;
             }
@@ -967,10 +909,7 @@ impl CloudTasks for CloudTasksService {
                 details: Vec::new(),
             })
         } else {
-            operation::Result::Response(prost_types::Any {
-                type_url: "type.googleapis.com/google.protobuf.Empty".to_owned(),
-                value: Vec::new(),
-            })
+            operation::Result::Response(Any::from_msg(&()).expect("Vec grows to fit"))
         };
         // Cloud Tasks reports partial success even when every deletion fails
         let batch_state = if failed_requests.is_empty() {
@@ -986,11 +925,7 @@ impl CloudTasks for CloudTasksService {
         };
         let operation = Operation {
             name: name.clone(),
-            metadata: Some(prost_types::Any {
-                type_url: "type.googleapis.com/google.cloud.tasks.v2.BatchDeleteTasksMetadata"
-                    .to_owned(),
-                value: metadata.encode_to_vec(),
-            }),
+            metadata: Some(Any::from_msg(&metadata).expect("Vec grows to fit")),
             done: true,
             result: Some(result),
         };
@@ -1010,7 +945,7 @@ impl CloudTasks for CloudTasksService {
             "google.cloud.tasks.v2.CloudTasks.RunTask",
         )?;
         let view = response_view(request.response_view);
-        let mut state = self.emulator.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         let task = state
             .queues
             .get_mut(
@@ -1025,7 +960,7 @@ impl CloudTasks for CloudTasksService {
             .get_mut(&request.name)
             .ok_or_else(|| Status::not_found(NOT_FOUND))?;
         task.run_requested = true;
-        // Cloud Tasks answers before it dispatches, so the new attempt has only its schedule time
+        // Cloud Tasks answers before it dispatches, so new attempt has only its schedule time
         let mut response = task_to_proto(task, view);
         response.dispatch_count += 1;
         response.last_attempt = Some(pb::Attempt {
@@ -1033,7 +968,7 @@ impl CloudTasks for CloudTasksService {
             ..Default::default()
         });
         drop(state);
-        self.emulator.wake.notify_one();
+        self.wake.notify_one();
         Ok(Response::new(response))
     }
 
@@ -1041,24 +976,24 @@ impl CloudTasks for CloudTasksService {
         &self,
         request: Request<pb::UpdateCmekConfigRequest>,
     ) -> Result<Response<pb::CmekConfig>, Status> {
-        // Cloud Tasks reads a missing config as one with an empty name
+        // Cloud Tasks reads missing config as one with empty name
         let config = request.into_inner().cmek_config.unwrap_or_default();
         let location = cmek_location(
             &config.name,
             "google.cloud.tasks.v2.CloudTasks.UpdateCmekConfig",
         )?;
-        let mut state = self.emulator.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         if config.kms_key.is_empty() {
             state.cmek_keys.remove(location);
             return Ok(Response::new(config));
         }
-        // Unlike the docs, which name a URI override host instead
+        // Header overrides block CMEK, though docs name URI override host
         let prefix = format!("{location}/queues/");
         if state.queues.values().any(|queue| {
             queue.name.starts_with(&prefix)
                 && queue
-                    .http_target
-                    .as_ref()
+                    .config
+                    .http_target()
                     .is_some_and(|target| !target.header_overrides.is_empty())
         }) {
             return Err(detailed(
@@ -1080,7 +1015,7 @@ impl CloudTasks for CloudTasksService {
             "cryptoKeys",
             "cryptoKeyVersions",
         ];
-        // Checks only the key's form and location, as the emulator cannot see Cloud KMS
+        // Checks only key's form and location, as emulator cannot see Cloud KMS
         match names::ids(&config.kms_key, crypto_key) {
             Some(ids) if ids[1] != names::last_segment(location) => {
                 return Err(Status::not_found(NOT_FOUND));
@@ -1115,7 +1050,7 @@ impl CloudTasks for CloudTasksService {
             &request.name,
             "google.cloud.tasks.v2.CloudTasks.GetCmekConfig",
         )?;
-        let state = self.emulator.state.lock().unwrap();
+        let state = self.state.lock().unwrap();
         let kms_key = state.cmek_keys.get(location).cloned().unwrap_or_default();
         Ok(Response::new(pb::CmekConfig {
             name: request.name,
@@ -1124,18 +1059,8 @@ impl CloudTasks for CloudTasksService {
     }
 }
 
-pub(crate) struct OperationsService {
-    emulator: Arc<Emulator>,
-}
-
-impl OperationsService {
-    pub fn new(emulator: Arc<Emulator>) -> Self {
-        Self { emulator }
-    }
-}
-
 #[tonic::async_trait]
-impl Operations for OperationsService {
+impl Operations for Emulator {
     async fn get_operation(
         &self,
         request: Request<longrunning::GetOperationRequest>,
@@ -1147,7 +1072,7 @@ impl Operations for OperationsService {
             "cloudtasks.operations.get",
             "google.longrunning.Operations.GetOperation",
         )?;
-        let state = self.emulator.state.lock().unwrap();
+        let state = self.state.lock().unwrap();
         let operation = state
             .operations
             .get(&request.name)
@@ -1184,7 +1109,7 @@ impl Operations for OperationsService {
     }
 }
 
-/// Rejects a malformed name the way Google's front end does, then checks its IDs as Cloud Tasks does
+/// Rejects malformed name as Google's front end does, then checks its IDs as Cloud Tasks does
 fn resource(
     name: &str,
     collections: &[&str],
@@ -1200,7 +1125,7 @@ fn resource(
     check_ids(&ids, collections)
 }
 
-/// Rejects an empty name or one outside a project, the way Google's front end does for `method`
+/// Rejects empty name or one outside project, as Google's front end does for `method`
 fn check_project(name: &str, method: &str) -> Result<(), Status> {
     if name.is_empty() {
         return Err(detailed(
@@ -1232,10 +1157,7 @@ fn check_project(name: &str, method: &str) -> Result<(), Status> {
                         ("service", "cloudtasks.googleapis.com"),
                     ],
                 ),
-                Any {
-                    type_url: "type.googleapis.com/google.rpc.LocalizedMessage".to_owned(),
-                    value: localized.encode_to_vec(),
-                },
+                Any::from_msg(&localized).expect("Vec grows to fit"),
                 help(
                     "Google developers console",
                     "https://console.developers.google.com",
@@ -1246,7 +1168,7 @@ fn check_project(name: &str, method: &str) -> Result<(), Status> {
     Ok(())
 }
 
-/// A status with `details`, which clients read from the `grpc-status-details-bin` trailer
+/// Status with `details`, which clients read from `grpc-status-details-bin` trailer
 fn detailed(code: Code, message: &str, details: Vec<Any>) -> Status {
     let status = rpc::Status {
         code: code as i32,
@@ -1265,10 +1187,7 @@ fn error_info(reason: &str, domain: &str, metadata: &[(&str, &str)]) -> Any {
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect(),
     };
-    Any {
-        type_url: "type.googleapis.com/google.rpc.ErrorInfo".to_owned(),
-        value: info.encode_to_vec(),
-    }
+    Any::from_msg(&info).expect("Vec grows to fit")
 }
 
 fn help(description: &str, url: &str) -> Any {
@@ -1278,13 +1197,9 @@ fn help(description: &str, url: &str) -> Any {
             url: url.to_owned(),
         }],
     };
-    Any {
-        type_url: "type.googleapis.com/google.rpc.Help".to_owned(),
-        value: help.encode_to_vec(),
-    }
+    Any::from_msg(&help).expect("Vec grows to fit")
 }
 
-/// Checks a CMEK config name and returns its location's name
 fn cmek_location<'a>(name: &'a str, method: &str) -> Result<&'a str, Status> {
     check_project(name, method)?;
     name.strip_suffix("/cmekConfig")
@@ -1296,7 +1211,6 @@ fn cmek_location<'a>(name: &'a str, method: &str) -> Result<&'a str, Status> {
         })
 }
 
-/// Checks a create request's task name, generating an ID for an unnamed task
 fn task_name(parent: &str, name: &str) -> Result<String, Status> {
     if name.is_empty() {
         return Ok(format!("{parent}/tasks/{}", rand::random::<u64>()));
@@ -1317,7 +1231,6 @@ fn check_task_name(name: &str) -> Result<(), Status> {
     check_ids(&ids, names::TASK)
 }
 
-/// Checks that a well-formed task name is in the request's queue
 fn check_task_queue(parent: &str, name: &str) -> Result<(), Status> {
     let (queue, _) = name.rsplit_once("/tasks/").expect("checked task name");
     if queue != parent {
@@ -1328,7 +1241,6 @@ fn check_task_queue(parent: &str, name: &str) -> Result<(), Status> {
     Ok(())
 }
 
-/// Names a batch's operation by its request ID, or a generated one, refusing a name already taken
 fn operation_name(state: &State, parent: &str, request_id: String) -> Result<String, Status> {
     let id = if request_id.is_empty() {
         uuid::Uuid::new_v4().to_string()
@@ -1345,27 +1257,28 @@ fn operation_name(state: &State, parent: &str, request_id: String) -> Result<Str
     Ok(name)
 }
 
-/// Checks the queue, task and operation IDs among the IDs of a name in these collections
 fn check_ids(ids: &[&str], collections: &[&str]) -> Result<(), Status> {
     for (collection, id) in collections.iter().zip(ids) {
         let status = match *collection {
-            "queues" if !names::is_queue_id(id) => detailed(
+            "queues" if !names::is_id(id, 100, &['-']) => detailed(
                 Code::InvalidArgument,
                 &format!(
                     "Queue ID \"{id}\" can contain only letters ([A-Za-z]), numbers ([0-9]), or hyphens (-). Queue ID must be between 1 and 100 characters."
                 ),
                 vec![help("Definition of queue ID", QUEUE_NAME_DOCS)],
             ),
-            "tasks" if !names::is_task_id(id) => detailed(
+            "tasks" if !names::is_id(id, 500, &['-', '_']) => detailed(
                 Code::InvalidArgument,
                 &format!(
                     "Task ID \"{id}\" can contain only letters ([A-Za-z]), numbers ([0-9]), hyphens (-), or underscores (_). Task ID must between 1 and 500 characters."
                 ),
                 vec![help("Definition of task ID", TASK_NAME_DOCS)],
             ),
-            "operations" if !names::is_operation_id(id) => Status::invalid_argument(format!(
-                "Operation ID \"{id}\" can contain only letters ([A-Za-z]), numbers ([0-9]), hyphens (-), or underscores (_). Operation ID must be between 1 and 100 characters."
-            )),
+            "operations" if !names::is_id(id, 100, &['-', '_']) => {
+                Status::invalid_argument(format!(
+                    "Operation ID \"{id}\" can contain only letters ([A-Za-z]), numbers ([0-9]), hyphens (-), or underscores (_). Operation ID must be between 1 and 100 characters."
+                ))
+            }
             _ => continue,
         };
         return Err(status);
@@ -1373,275 +1286,62 @@ fn check_ids(ids: &[&str], collections: &[&str]) -> Result<(), Status> {
     Ok(())
 }
 
-/// Copies the fields `paths` name from `update` onto `current`, ignoring output-only ones
-fn masked(
-    mut current: pb::Queue,
-    update: pb::Queue,
-    paths: &[String],
-) -> Result<pb::Queue, Status> {
+/// Copies fields named in `paths` from `update` onto `current`, leaving output-only ones unread
+fn masked(current: pb::Queue, update: pb::Queue, paths: &[String]) -> Result<pb::Queue, Status> {
+    let queue = crate::DESCRIPTORS
+        .get_message_by_name("google.cloud.tasks.v2.Queue")
+        .expect("descriptors include the queue");
+    let mut merged = DynamicMessage::new(queue.clone());
+    merged.transcode_from(&current).expect("queues transcode");
+    let mut update_message = DynamicMessage::new(queue);
+    update_message
+        .transcode_from(&update)
+        .expect("queues transcode");
     for path in paths {
-        merge_queue(&mut current, &update, path)
+        merge(&mut merged, &update_message, path)
             .ok_or_else(|| Status::invalid_argument(format!("Invalid mask: {path}")))?;
     }
-    Ok(current)
+    Ok(merged.transcode_to().expect("queues transcode"))
 }
 
-fn split_path(path: &str) -> (&str, Option<&str>) {
-    path.split_once('.')
-        .map_or((path, None), |(field, rest)| (field, Some(rest)))
-}
-
-/// None for a path below a scalar
-fn merge_leaf<T: Clone>(current: &mut T, update: &T, rest: Option<&str>) -> Option<()> {
-    if rest.is_some() {
-        return None;
-    }
-    current.clone_from(update);
-    Some(())
-}
-
-/// Replaces the whole message, or merges below it when either side has it
-fn merge_message<T: Clone + Default>(
-    current: &mut Option<T>,
-    update: &Option<T>,
-    rest: Option<&str>,
-    merge: impl Fn(&mut T, &T, &str) -> Option<()>,
-) -> Option<()> {
+/// None when `path` names no field, and merges below message only when either side has it
+fn merge(current: &mut DynamicMessage, update: &DynamicMessage, path: &str) -> Option<()> {
+    let (name, rest) = path
+        .split_once('.')
+        .map_or((path, None), |(name, rest)| (name, Some(rest)));
+    let field = current.descriptor().get_field_by_name(name)?;
     let Some(rest) = rest else {
-        current.clone_from(update);
+        if update.has_field(&field) {
+            current.set_field(&field, update.get_field(&field).into_owned());
+        } else {
+            current.clear_field(&field);
+        }
         return Some(());
     };
-    // Merges even when neither side has the message, so its path is still checked
-    let mut merged = current.clone().unwrap_or_default();
-    merge(&mut merged, &update.clone().unwrap_or_default(), rest)?;
-    if current.is_some() || update.is_some() {
-        *current = Some(merged);
+    // Lists and well-known types are leaves, like scalars
+    let Kind::Message(message) = field.kind() else {
+        return None;
+    };
+    if field.is_list() || message.full_name().starts_with("google.protobuf.") {
+        return None;
     }
-    Some(())
-}
-
-/// Merges one member of a oneof, which leaves the oneof unchanged when neither side holds that member
-fn merge_member<O, T: Clone + Default>(
-    current: &mut Option<O>,
-    update: &Option<O>,
-    rest: Option<&str>,
-    member: impl Fn(&O) -> Option<&T>,
-    wrap: impl Fn(T) -> O,
-    merge: impl Fn(&mut T, &T, &str) -> Option<()>,
-) -> Option<()> {
-    let held = current.as_ref().and_then(&member).is_some();
-    let mut merged = current.as_ref().and_then(&member).cloned();
-    merge_message(
-        &mut merged,
-        &update.as_ref().and_then(&member).cloned(),
-        rest,
-        merge,
-    )?;
-    match merged {
-        Some(merged) => *current = Some(wrap(merged)),
-        None if held => *current = None,
-        None => {}
-    }
-    Some(())
-}
-
-fn merge_queue(current: &mut pb::Queue, update: &pb::Queue, path: &str) -> Option<()> {
-    let (field, rest) = split_path(path);
-    match field {
-        "rate_limits" => merge_message(
-            &mut current.rate_limits,
-            &update.rate_limits,
-            rest,
-            |current, update, path| {
-                let (field, rest) = split_path(path);
-                match field {
-                    "max_dispatches_per_second" => merge_leaf(
-                        &mut current.max_dispatches_per_second,
-                        &update.max_dispatches_per_second,
-                        rest,
-                    ),
-                    "max_burst_size" => {
-                        merge_leaf(&mut current.max_burst_size, &update.max_burst_size, rest)
-                    }
-                    "max_concurrent_dispatches" => merge_leaf(
-                        &mut current.max_concurrent_dispatches,
-                        &update.max_concurrent_dispatches,
-                        rest,
-                    ),
-                    _ => None,
-                }
-            },
-        ),
-        "retry_config" => merge_message(
-            &mut current.retry_config,
-            &update.retry_config,
-            rest,
-            |current, update, path| {
-                let (field, rest) = split_path(path);
-                match field {
-                    "max_attempts" => {
-                        merge_leaf(&mut current.max_attempts, &update.max_attempts, rest)
-                    }
-                    "max_retry_duration" => merge_leaf(
-                        &mut current.max_retry_duration,
-                        &update.max_retry_duration,
-                        rest,
-                    ),
-                    "min_backoff" => {
-                        merge_leaf(&mut current.min_backoff, &update.min_backoff, rest)
-                    }
-                    "max_backoff" => {
-                        merge_leaf(&mut current.max_backoff, &update.max_backoff, rest)
-                    }
-                    "max_doublings" => {
-                        merge_leaf(&mut current.max_doublings, &update.max_doublings, rest)
-                    }
-                    _ => None,
-                }
-            },
-        ),
-        "http_target" => merge_message(
-            &mut current.http_target,
-            &update.http_target,
-            rest,
-            merge_http_target,
-        ),
-        "stackdriver_logging_config" => merge_message(
-            &mut current.stackdriver_logging_config,
-            &update.stackdriver_logging_config,
-            rest,
-            |current, update, path| match split_path(path) {
-                ("sampling_ratio", rest) => {
-                    merge_leaf(&mut current.sampling_ratio, &update.sampling_ratio, rest)
-                }
-                _ => None,
-            },
-        ),
-        "app_engine_routing_override" => merge_message(
-            &mut current.app_engine_routing_override,
-            &update.app_engine_routing_override,
-            rest,
-            |current, update, path| {
-                let (field, rest) = split_path(path);
-                match field {
-                    "service" => merge_leaf(&mut current.service, &update.service, rest),
-                    "version" => merge_leaf(&mut current.version, &update.version, rest),
-                    "instance" => merge_leaf(&mut current.instance, &update.instance, rest),
-                    "host" => merge_leaf(&mut current.host, &update.host, rest),
-                    _ => None,
-                }
-            },
-        ),
-        // Output only
-        "name" | "state" | "purge_time" if rest.is_none() => Some(()),
-        _ => None,
+    let below = update.get_field(&field);
+    let below = below.as_message().expect("message fields hold messages");
+    if current.has_field(&field) || update.has_field(&field) {
+        let current = current
+            .get_field_mut(&field)
+            .as_message_mut()
+            .expect("message fields hold messages");
+        merge(current, below, rest)
+    } else {
+        // Checks path without setting message
+        merge(&mut DynamicMessage::new(message), below, rest)
     }
 }
 
-fn merge_http_target(
-    current: &mut pb::HttpTarget,
-    update: &pb::HttpTarget,
-    path: &str,
-) -> Option<()> {
-    use pb::http_target::AuthorizationHeader as Header;
-    let (field, rest) = split_path(path);
-    match field {
-        "uri_override" => merge_message(
-            &mut current.uri_override,
-            &update.uri_override,
-            rest,
-            |current, update, path| {
-                let (field, rest) = split_path(path);
-                match field {
-                    "scheme" => merge_leaf(&mut current.scheme, &update.scheme, rest),
-                    "host" => merge_leaf(&mut current.host, &update.host, rest),
-                    "port" => merge_leaf(&mut current.port, &update.port, rest),
-                    "path_override" => merge_message(
-                        &mut current.path_override,
-                        &update.path_override,
-                        rest,
-                        |current, update, path| match split_path(path) {
-                            ("path", rest) => merge_leaf(&mut current.path, &update.path, rest),
-                            _ => None,
-                        },
-                    ),
-                    "query_override" => merge_message(
-                        &mut current.query_override,
-                        &update.query_override,
-                        rest,
-                        |current, update, path| match split_path(path) {
-                            ("query_params", rest) => {
-                                merge_leaf(&mut current.query_params, &update.query_params, rest)
-                            }
-                            _ => None,
-                        },
-                    ),
-                    "uri_override_enforce_mode" => merge_leaf(
-                        &mut current.uri_override_enforce_mode,
-                        &update.uri_override_enforce_mode,
-                        rest,
-                    ),
-                    _ => None,
-                }
-            },
-        ),
-        "http_method" => merge_leaf(&mut current.http_method, &update.http_method, rest),
-        "header_overrides" => merge_leaf(
-            &mut current.header_overrides,
-            &update.header_overrides,
-            rest,
-        ),
-        "oauth_token" => merge_member(
-            &mut current.authorization_header,
-            &update.authorization_header,
-            rest,
-            |header| match header {
-                Header::OauthToken(token) => Some(token),
-                Header::OidcToken(_) => None,
-            },
-            Header::OauthToken,
-            |current, update, path| {
-                let (field, rest) = split_path(path);
-                match field {
-                    "service_account_email" => merge_leaf(
-                        &mut current.service_account_email,
-                        &update.service_account_email,
-                        rest,
-                    ),
-                    "scope" => merge_leaf(&mut current.scope, &update.scope, rest),
-                    _ => None,
-                }
-            },
-        ),
-        "oidc_token" => merge_member(
-            &mut current.authorization_header,
-            &update.authorization_header,
-            rest,
-            |header| match header {
-                Header::OidcToken(token) => Some(token),
-                Header::OauthToken(_) => None,
-            },
-            Header::OidcToken,
-            |current, update, path| {
-                let (field, rest) = split_path(path);
-                match field {
-                    "service_account_email" => merge_leaf(
-                        &mut current.service_account_email,
-                        &update.service_account_email,
-                        rest,
-                    ),
-                    "audience" => merge_leaf(&mut current.audience, &update.audience, rest),
-                    _ => None,
-                }
-            },
-        ),
-        _ => None,
-    }
-}
-
-/// Formats a time as Cloud Tasks reports it, in Pacific time with the shortest fraction
+/// Formats time as Cloud Tasks reports it, in Pacific time with shortest fraction
 fn pacific_time(time: Timestamp) -> String {
-    // jiff's timestamps end a day before 10000, by when the offset has stopped changing
+    // jiff's timestamps end one day before 10000, by when offset has stopped changing
     let offset = jiff::tz::get!("America/Los_Angeles")
         .to_offset(jiff::Timestamp::new(time.seconds, time.nanos).unwrap_or(jiff::Timestamp::MAX));
     let local = jiff::civil::date(1970, 1, 1)
@@ -1658,7 +1358,7 @@ fn pacific_time(time: Timestamp) -> String {
         .expect("format suits a datetime with an offset")
 }
 
-/// Pages through names under `prefix`, using the last name returned as an opaque page token
+/// Pages through names under `prefix`, using last name returned as opaque page token
 fn page<T, U>(
     items: &BTreeMap<String, T>,
     prefix: &str,
@@ -1692,23 +1392,36 @@ fn page<T, U>(
         None => Bound::Included(prefix),
         Some(name) => Bound::Excluded(name.as_str()),
     };
-    let names: Vec<&String> = items
+    let items: Vec<(&String, &T)> = items
         .range::<str, _>((start, Bound::Unbounded))
-        .map(|(name, _)| name)
-        .take_while(|name| name.starts_with(prefix))
+        .take_while(|(name, _)| name.starts_with(prefix))
         .take(page_size)
         .collect();
-    // Cloud Tasks returns a token after every non-empty page, so only an empty page ends the list
-    let next_page_token = names
+    // Cloud Tasks returns token after every non-empty page, so only empty page ends list
+    let next_page_token = items
         .last()
-        .map_or_else(String::new, |name| URL_SAFE_NO_PAD.encode(name));
+        .map_or_else(String::new, |(name, _)| URL_SAFE_NO_PAD.encode(name));
     Ok((
-        names
-            .into_iter()
-            .map(|name| to_proto(&items[name]))
-            .collect(),
+        items.into_iter().map(|(_, item)| to_proto(item)).collect(),
         next_page_token,
     ))
+}
+
+/// Checks queue's settings, keeping only App Engine target of queue with both, as Cloud Tasks does
+fn queue_config(queue: pb::Queue) -> Result<QueueConfig, Status> {
+    let rate_limits = rate_limits(queue.rate_limits.unwrap_or_default())?;
+    let retry_config = retry_config(queue.retry_config.unwrap_or_default())?;
+    let target = match (queue.app_engine_routing_override, queue.http_target) {
+        (Some(routing), _) => Some(Target::AppEngine(app_engine_routing(routing, &queue.name)?)),
+        (None, Some(target)) => Some(Target::Http(http_target(target)?)),
+        (None, None) => None,
+    };
+    Ok(QueueConfig {
+        rate_limits,
+        retry_config,
+        target,
+        log_sampling_ratio: log_sampling_ratio(queue.stackdriver_logging_config)?,
+    })
 }
 
 fn rate_limits(limits: pb::RateLimits) -> Result<RateLimits, Status> {
@@ -1737,7 +1450,7 @@ fn rate_limits(limits: pb::RateLimits) -> Result<RateLimits, Status> {
             Status::invalid_argument("RateLimits.maxConcurrentDispatches cannot be negative.")
         })?,
     };
-    // Output only, so the caller's value is ignored
+    // Output only, so caller's value is ignored
     Ok(RateLimits {
         max_dispatches_per_second,
         max_burst_size: ((max_dispatches_per_second / 5.0) as u32).max(10),
@@ -1824,7 +1537,7 @@ fn http_request(request: pb::HttpRequest) -> Result<HttpRequest, Status> {
             Ok::<_, Status>(header)
         })
         .transpose()?;
-    // Cloud Tasks stores an unknown method as POST
+    // Cloud Tasks stores unknown method as POST
     let http_method = pb::HttpMethod::try_from(request.http_method)
         .ok()
         .and_then(http_method)
@@ -1848,6 +1561,7 @@ fn http_request(request: pb::HttpRequest) -> Result<HttpRequest, Status> {
 
 fn app_engine_http_request(
     request: pb::AppEngineHttpRequest,
+    queue: &str,
 ) -> Result<AppEngineHttpRequest, Status> {
     let relative_uri = match request.relative_uri.as_str() {
         "" => "/".to_owned(),
@@ -1858,7 +1572,7 @@ fn app_engine_http_request(
             "Invalid relative uri. The relative uri must begin with '/'. No spaces are allowed and the maximum length allowed is 2083 characters.",
         ));
     }
-    // Cloud Tasks stores an unknown method as POST
+    // Cloud Tasks stores unknown method as POST
     let http_method = pb::HttpMethod::try_from(request.http_method)
         .ok()
         .and_then(http_method)
@@ -1891,32 +1605,53 @@ fn app_engine_http_request(
             );
         }
     }
+    let routing = app_engine_routing(request.app_engine_routing.unwrap_or_default(), queue)?;
+    // Cloud Tasks keeps only host, and reads its labels back as version and service or as all three
+    let labels: Vec<&str> = [&routing.instance, &routing.version, &routing.service]
+        .into_iter()
+        .filter(|label| !label.is_empty())
+        .flat_map(|label| label.split('.'))
+        .collect();
+    let (instance, version, service) = match labels[..] {
+        [version, service] => ("", version, service),
+        [instance, version, service] => (instance, version, service),
+        _ => ("", "", ""),
+    };
     Ok(AppEngineHttpRequest {
         http_method,
-        routing: app_engine_routing(request.app_engine_routing.unwrap_or_default())?,
+        routing: pb::AppEngineRouting {
+            service: service.to_owned(),
+            version: version.to_owned(),
+            instance: instance.to_owned(),
+            host: routing.host.clone(),
+        },
         relative_uri,
         headers,
         body: request.body,
     })
 }
 
-/// Ignores the host, which is output only
-fn app_engine_routing(routing: pb::AppEngineRouting) -> Result<AppEngineRouting, Status> {
-    let set = |value: String| Some(value).filter(|value| !value.is_empty());
-    let routing = AppEngineRouting {
-        service: set(routing.service),
-        version: set(routing.version),
-        instance: set(routing.instance),
-    };
-    if routing.instance.is_some() && routing.service.is_none() && routing.version.is_none() {
+/// Checks routing and sets its output-only host, taking app's domain to be `<project>.appspot.com`
+fn app_engine_routing(
+    routing: pb::AppEngineRouting,
+    name: &str,
+) -> Result<pb::AppEngineRouting, Status> {
+    if !routing.instance.is_empty() && routing.service.is_empty() && routing.version.is_empty() {
         return Err(Status::invalid_argument(
             "If instance is set then service or version must also be set. For more information, see https://cloud.google.com/appengine/docs/standard/python/how-requests-are-routed#targeted_routing",
         ));
     }
-    Ok(routing)
+    let host = [&routing.instance, &routing.version, &routing.service]
+        .into_iter()
+        .filter(|label| !label.is_empty())
+        .cloned()
+        .chain([format!("{}.appspot.com", names::project(name))])
+        .collect::<Vec<_>>()
+        .join(".");
+    Ok(pb::AppEngineRouting { host, ..routing })
 }
 
-/// For the project in a queue or task name, as Cloud Tasks answers when the project has no app
+/// For project in queue or task name, as Cloud Tasks answers when project has no app
 fn no_app_engine(name: &str) -> Status {
     let project = names::project(name);
     Status::not_found(format!(
@@ -1924,18 +1659,6 @@ fn no_app_engine(name: &str) -> Status {
     ))
 }
 
-/// The instance, version and service before the app's domain, which the emulator takes to be `<project>.appspot.com`
-fn app_engine_host(routing: &AppEngineRouting, name: &str) -> String {
-    [&routing.instance, &routing.version, &routing.service]
-        .into_iter()
-        .flatten()
-        .cloned()
-        .chain([format!("{}.appspot.com", names::project(name))])
-        .collect::<Vec<_>>()
-        .join(".")
-}
-
-/// None for unspecified
 fn http_method(method: pb::HttpMethod) -> Option<HttpMethod> {
     Some(match method {
         pb::HttpMethod::Unspecified => return None,
@@ -1990,15 +1713,6 @@ fn service_account(header: &AuthorizationHeader) -> Result<(), Status> {
     Ok(())
 }
 
-/// Checks a requested target in full, as Cloud Tasks skips the token check once a mask merges it
-fn check_http_target(target: &pb::HttpTarget) -> Result<(), Status> {
-    let target = http_target(target.clone())?;
-    target
-        .authorization_header
-        .as_ref()
-        .map_or(Ok(()), service_account)
-}
-
 fn http_target(target: pb::HttpTarget) -> Result<HttpTarget, Status> {
     let parse_error = |detail: &str| {
         detailed(
@@ -2024,15 +1738,11 @@ fn http_target(target: pb::HttpTarget) -> Result<HttpTarget, Status> {
             }
             let scheme = uri
                 .scheme
-                .map(|scheme| match pb::uri_override::Scheme::try_from(scheme) {
-                    Ok(pb::uri_override::Scheme::Unspecified) => Ok(Scheme::Unspecified),
-                    Ok(pb::uri_override::Scheme::Http) => Ok(Scheme::Http),
-                    Ok(pb::uri_override::Scheme::Https) => Ok(Scheme::Https),
-                    Err(_) => Err(parse_error("")),
-                })
-                .transpose()?;
+                .map(pb::uri_override::Scheme::try_from)
+                .transpose()
+                .map_err(|_| parse_error(""))?;
             if let Some(host) = &uri.host
-                // Only a bare host, which parses back to itself
+                // Only bare host, which parses back to itself
                 && !reqwest::Url::parse(&format!("http://{host}/")).is_ok_and(|url| {
                     url.host_str()
                         .is_some_and(|parsed| parsed.eq_ignore_ascii_case(host))
@@ -2047,16 +1757,9 @@ fn http_target(target: pb::HttpTarget) -> Result<HttpTarget, Status> {
                 .map(u64::try_from)
                 .transpose()
                 .map_err(|_| parse_error("Port number should be a positive integer."))?;
-            let enforce_mode = match pb::uri_override::UriOverrideEnforceMode::try_from(
-                uri.uri_override_enforce_mode,
-            ) {
-                Ok(pb::uri_override::UriOverrideEnforceMode::Unspecified) => None,
-                Ok(pb::uri_override::UriOverrideEnforceMode::IfNotExists) => {
-                    Some(EnforceMode::IfNotExists)
-                }
-                Ok(pb::uri_override::UriOverrideEnforceMode::Always) => Some(EnforceMode::Always),
-                Err(_) => return Err(parse_error("")),
-            };
+            let enforce_mode =
+                pb::uri_override::UriOverrideEnforceMode::try_from(uri.uri_override_enforce_mode)
+                    .map_err(|_| parse_error(""))?;
             Ok(UriOverride {
                 scheme,
                 host: uri.host,
@@ -2108,7 +1811,7 @@ fn http_target(target: pb::HttpTarget) -> Result<HttpTarget, Status> {
     })
 }
 
-/// Zero logs nothing, and is how Cloud Tasks reads a missing config
+/// Zero logs nothing, and is how Cloud Tasks reads missing config
 fn log_sampling_ratio(config: Option<pb::StackdriverLoggingConfig>) -> Result<f64, Status> {
     let ratio = config.map_or(0.0, |config| config.sampling_ratio);
     if !(0.0..=1.0).contains(&ratio) {
@@ -2119,13 +1822,13 @@ fn log_sampling_ratio(config: Option<pb::StackdriverLoggingConfig>) -> Result<f6
     Ok(ratio)
 }
 
-/// Drops and rewrites headers as Cloud Tasks does when it stores a task, never rejecting one, but leaves User-Agent to the caller
+/// Drops and rewrites headers as Cloud Tasks stores them, leaving User-Agent to caller
 fn stored_headers(headers: BTreeMap<String, String>) -> BTreeMap<String, String> {
     headers
         .into_iter()
         .filter_map(|(name, value)| {
             let lowercase = name.to_ascii_lowercase();
-            // Cloud Tasks ends a value at NUL and replaces line breaks
+            // Cloud Tasks ends value at NUL and replaces line breaks
             let value = value
                 .split('\0')
                 .next()
@@ -2146,7 +1849,7 @@ fn stored_headers(headers: BTreeMap<String, String>) -> BTreeMap<String, String>
         .collect()
 }
 
-/// Basic for an unknown view too, which create and get then echo as unspecified
+/// Unknown view renders as basic but echoes as unspecified
 fn response_view(view: i32) -> pb::task::View {
     match pb::task::View::try_from(view) {
         Ok(pb::task::View::Unspecified | pb::task::View::Basic) => pb::task::View::Basic,
@@ -2164,36 +1867,9 @@ fn proto_duration(duration: Duration) -> prost_types::Duration {
 
 /// Truncated to microseconds, as Cloud Tasks stores times
 fn timestamp(time: SystemTime) -> Timestamp {
-    let since_epoch = time
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .expect("times are after the epoch");
-    Timestamp {
-        seconds: since_epoch.as_secs() as i64,
-        nanos: (since_epoch.subsec_micros() * 1000) as i32,
-    }
-}
-
-fn policy_to_proto(policy: Option<&Policy>) -> iam::Policy {
-    match policy {
-        None => iam::Policy {
-            etag: NO_POLICY_ETAG.to_vec(),
-            ..Default::default()
-        },
-        Some(policy) => iam::Policy {
-            version: 1,
-            etag: policy.etag.to_vec(),
-            bindings: policy
-                .bindings
-                .iter()
-                .map(|(role, members)| iam::Binding {
-                    role: role.clone(),
-                    members: members.iter().cloned().collect(),
-                    condition: None,
-                })
-                .collect(),
-            audit_configs: Vec::new(),
-        },
-    }
+    let mut timestamp = Timestamp::from(time);
+    timestamp.nanos -= timestamp.nanos % 1000;
+    timestamp
 }
 
 /// Prints bytes as Google's error messages do, in octal outside printable ASCII
@@ -2208,30 +1884,24 @@ fn c_escape(bytes: &[u8]) -> String {
 }
 
 fn queue_to_proto(queue: &Queue) -> pb::Queue {
+    let config = &queue.config;
     pb::Queue {
         name: queue.name.clone(),
         rate_limits: Some(pb::RateLimits {
-            max_dispatches_per_second: queue.rate_limits.max_dispatches_per_second,
-            max_burst_size: queue.rate_limits.max_burst_size as i32,
-            max_concurrent_dispatches: queue.rate_limits.max_concurrent_dispatches as i32,
+            max_dispatches_per_second: config.rate_limits.max_dispatches_per_second,
+            max_burst_size: config.rate_limits.max_burst_size as i32,
+            max_concurrent_dispatches: config.rate_limits.max_concurrent_dispatches as i32,
         }),
-        retry_config: Some(retry_config_to_proto(&queue.retry_config)),
+        retry_config: Some(retry_config_to_proto(&config.retry_config)),
         state: match queue.state {
             QueueState::Running => pb::queue::State::Running,
             QueueState::Paused => pb::queue::State::Paused,
         }
         .into(),
         purge_time: queue.purge_time.map(timestamp),
-        http_target: queue.http_target.as_ref().map(|target| pb::HttpTarget {
+        http_target: config.http_target().map(|target| pb::HttpTarget {
             uri_override: target.uri_override.as_ref().map(|uri| pb::UriOverride {
-                scheme: uri.scheme.map(|scheme| {
-                    match scheme {
-                        Scheme::Unspecified => pb::uri_override::Scheme::Unspecified,
-                        Scheme::Http => pb::uri_override::Scheme::Http,
-                        Scheme::Https => pb::uri_override::Scheme::Https,
-                    }
-                    .into()
-                }),
+                scheme: uri.scheme.map(Into::into),
                 host: uri.host.clone(),
                 port: uri.port.map(|port| port as i64),
                 path_override: uri.path.clone().map(|path| pb::PathOverride { path }),
@@ -2239,14 +1909,7 @@ fn queue_to_proto(queue: &Queue) -> pb::Queue {
                     .query
                     .clone()
                     .map(|query_params| pb::QueryOverride { query_params }),
-                uri_override_enforce_mode: match uri.enforce_mode {
-                    None => pb::uri_override::UriOverrideEnforceMode::Unspecified,
-                    Some(EnforceMode::IfNotExists) => {
-                        pb::uri_override::UriOverrideEnforceMode::IfNotExists
-                    }
-                    Some(EnforceMode::Always) => pb::uri_override::UriOverrideEnforceMode::Always,
-                }
-                .into(),
+                uri_override_enforce_mode: uri.enforce_mode.into(),
             }),
             http_method: target
                 .http_method
@@ -2282,17 +1945,13 @@ fn queue_to_proto(queue: &Queue) -> pb::Queue {
                     }),
                 }),
         }),
-        app_engine_routing_override: queue.app_engine_routing_override.as_ref().map(|routing| {
-            pb::AppEngineRouting {
-                service: routing.service.clone().unwrap_or_default(),
-                version: routing.version.clone().unwrap_or_default(),
-                instance: routing.instance.clone().unwrap_or_default(),
-                host: app_engine_host(routing, &queue.name),
-            }
-        }),
-        stackdriver_logging_config: (queue.log_sampling_ratio != 0.0).then_some(
+        app_engine_routing_override: match &config.target {
+            Some(Target::AppEngine(routing)) => Some(routing.clone()),
+            Some(Target::Http(_)) | None => None,
+        },
+        stackdriver_logging_config: (config.log_sampling_ratio != 0.0).then_some(
             pb::StackdriverLoggingConfig {
-                sampling_ratio: queue.log_sampling_ratio,
+                sampling_ratio: config.log_sampling_ratio,
             },
         ),
     }
@@ -2321,10 +1980,6 @@ fn retry_config_to_proto(retry_config: &RetryConfig) -> pb::RetryConfig {
 }
 
 fn task_to_proto(task: &Task, view: pb::task::View) -> pb::Task {
-    let create_time = task
-        .create_time
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .expect("times are after the epoch");
     let body = |body: &Vec<u8>| {
         if view == pb::task::View::Full {
             body.clone()
@@ -2360,43 +2015,24 @@ fn task_to_proto(task: &Task, view: pb::task::View) -> pb::Task {
             }),
             Some(task.dispatch_deadline.unwrap_or(DEFAULT_DEADLINE)),
         ),
-        Payload::AppEngine(request) => {
-            let routing = &request.routing;
-            // Cloud Tasks keeps only the host, and reads its labels back as version and service or as all three
-            let labels: Vec<&str> = [&routing.instance, &routing.version, &routing.service]
-                .into_iter()
-                .flatten()
-                .flat_map(|value| value.split('.'))
-                .collect();
-            let (instance, version, service) = match labels[..] {
-                [version, service] => ("", version, service),
-                [instance, version, service] => (instance, version, service),
-                _ => ("", "", ""),
-            };
-            (
-                pb::task::MessageType::AppEngineHttpRequest(pb::AppEngineHttpRequest {
-                    http_method: http_method_to_proto(request.http_method).into(),
-                    app_engine_routing: Some(pb::AppEngineRouting {
-                        service: service.to_owned(),
-                        version: version.to_owned(),
-                        instance: instance.to_owned(),
-                        host: app_engine_host(routing, &task.name),
-                    }),
-                    relative_uri: request.relative_uri.clone(),
-                    headers: request.headers.clone(),
-                    body: body(&request.body),
-                }),
-                task.dispatch_deadline,
-            )
-        }
+        Payload::AppEngine(request) => (
+            pb::task::MessageType::AppEngineHttpRequest(pb::AppEngineHttpRequest {
+                http_method: http_method_to_proto(request.http_method).into(),
+                app_engine_routing: Some(request.routing.clone()),
+                relative_uri: request.relative_uri.clone(),
+                headers: request.headers.clone(),
+                body: body(&request.body),
+            }),
+            task.dispatch_deadline,
+        ),
     };
     pb::Task {
         name: task.name.clone(),
         message_type: Some(message_type),
         schedule_time: Some(timestamp(task.schedule_time)),
         create_time: Some(Timestamp {
-            seconds: create_time.as_secs() as i64,
             nanos: 0,
+            ..Timestamp::from(task.create_time)
         }),
         dispatch_deadline: dispatch_deadline.map(proto_duration),
         dispatch_count: task.dispatch_count as i32,

@@ -234,7 +234,7 @@ async fn app_engine_task_goes_to_app_engine_url() {
 async fn app_engine_task_does_not_follow_redirects() {
     let receiver = support::Receiver::start().await;
     let (mut client, _) = support::start_emulator_with(Some(&receiver.url)).await;
-    // An hour's backoff keeps the task from a second attempt
+    // One-hour backoff keeps task from second attempt
     client
         .create_queue(queue(Some(RetryConfig {
             min_backoff: Some(prost_types::Duration {

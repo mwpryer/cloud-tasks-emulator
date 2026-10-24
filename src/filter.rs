@@ -1,23 +1,14 @@
-//! ListQueues filters, in the syntax of https://google.aip.dev/160
+//! ListQueues filters, in syntax of https://google.aip.dev/160
 
 use std::cmp::Ordering;
 use std::iter::Peekable;
 use std::str::Chars;
 
+use tonic::Status;
+
 use crate::proto::google::cloud::tasks::v2 as pb;
 
-pub(crate) struct Filter(Expression);
-
-pub(crate) enum Error {
-    /// The token where parsing failed, `<EOF>` at the end
-    Syntax(String),
-    FieldNotFound(String),
-    IncorrectType(String),
-    NestedType(String),
-    Unsupported(&'static str),
-}
-
-enum Expression {
+pub(crate) enum Expression {
     All(Vec<Expression>),
     Any(Vec<Expression>),
     Not(Box<Expression>),
@@ -27,7 +18,7 @@ enum Expression {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Comparator {
+pub(crate) enum Comparator {
     Has,
     Equal,
     NotEqual,
@@ -38,17 +29,16 @@ enum Comparator {
 }
 
 #[derive(PartialEq, PartialOrd)]
-enum Scalar {
+pub(crate) enum Scalar {
     Number(f64),
     Nanos(i128),
 }
 
-/// A queue field's value, by the kind of operand it takes
 enum Value<'a> {
     Text(&'a str),
-    /// A field of each element of a repeated message
+    /// Field of each element of repeated message
     Texts(Vec<&'a str>),
-    /// With the parser for its value names
+    /// With parser for its value names
     Enum(i32, fn(&str) -> Option<i32>),
     Number(f64),
     Duration(Option<prost_types::Duration>),
@@ -66,27 +56,21 @@ enum Token {
     End,
 }
 
-impl Filter {
-    pub fn parse(filter: &str) -> Result<Self, Error> {
-        let mut parser = Parser {
-            tokens: tokens(filter)?,
-            next: 0,
-        };
-        if parser.peek() == &Token::End {
-            return Ok(Self(Expression::All(Vec::new())));
-        }
-        let expression = parser.expression()?;
-        parser.expect(Token::End)?;
-        Ok(Self(expression))
+pub(crate) fn parse(filter: &str) -> Result<Expression, Status> {
+    let mut parser = Parser {
+        tokens: tokens(filter)?,
+        next: 0,
+    };
+    if parser.peek() == &Token::End {
+        return Ok(Expression::All(Vec::new()));
     }
-
-    pub fn matches(&self, queue: &pb::Queue) -> bool {
-        self.0.matches(queue)
-    }
+    let expression = parser.expression()?;
+    parser.expect(Token::End)?;
+    Ok(expression)
 }
 
 impl Expression {
-    fn matches(&self, queue: &pb::Queue) -> bool {
+    pub fn matches(&self, queue: &pb::Queue) -> bool {
         match self {
             Expression::All(expressions) => expressions.iter().all(|e| e.matches(queue)),
             Expression::Any(expressions) => expressions.iter().any(|e| e.matches(queue)),
@@ -138,7 +122,7 @@ impl Expression {
     }
 }
 
-/// Looks up a path in lower case without underscores, so snake and camel case both match
+/// Looks up path in lower case without underscores, so snake and camel case both match
 fn value<'a>(queue: &'a pb::Queue, path: &str) -> Option<Value<'a>> {
     use pb::http_target::AuthorizationHeader;
     let rate_limits = queue.rate_limits.unwrap_or_default();
@@ -245,22 +229,34 @@ fn value<'a>(queue: &'a pb::Queue, path: &str) -> Option<Value<'a>> {
     })
 }
 
-fn restriction(field: &str, comparator: Comparator, operand: &str) -> Result<Expression, Error> {
+fn restriction(field: &str, comparator: Comparator, operand: &str) -> Result<Expression, Status> {
     let path = field.to_lowercase().replace('_', "");
-    // Types the operand by the field's value in an empty queue
+    // Types operand by field's value in empty queue
     let empty = pb::Queue::default();
-    let kind = value(&empty, &path).ok_or_else(|| Error::FieldNotFound(field.to_owned()))?;
+    let kind = value(&empty, &path)
+        .ok_or_else(|| Status::invalid_argument(format!("Field not found: '{field}'.")))?;
     if comparator == Comparator::Has && operand == "*" {
         return Ok(Expression::Present(path));
     }
-    let incorrect_type = || Error::IncorrectType(operand.to_lowercase());
+    let incorrect_type = || {
+        Status::invalid_argument(format!(
+            "The value '{}' is of incorrect type.",
+            operand.to_lowercase()
+        ))
+    };
     let scalar = match kind {
-        Value::Message(_) => return Err(Error::NestedType(field.to_owned())),
+        Value::Message(_) => {
+            return Err(Status::invalid_argument(format!(
+                "Cannot match a nested type '{field}'. A member field of scalar or enum type must be provided."
+            )));
+        }
         Value::Text(_) | Value::Texts(_) if comparator == Comparator::Has => {
             return Ok(Expression::Contains(path, operand.to_lowercase()));
         }
         Value::Text(_) | Value::Texts(_) => {
-            return Err(Error::Unsupported("text comparisons other than ':'"));
+            return Err(Status::unimplemented(
+                "ListQueues filter text comparisons other than ':' is not supported yet",
+            ));
         }
         Value::Enum(_, parse) => parse(&operand.to_uppercase())
             .map(|number| Scalar::Number(number.into()))
@@ -281,7 +277,14 @@ fn restriction(field: &str, comparator: Comparator, operand: &str) -> Result<Exp
     Ok(Expression::Compare(path, comparator, scalar))
 }
 
-fn tokens(filter: &str) -> Result<Vec<Token>, Error> {
+/// For token where parsing failed, `<EOF>` at end
+fn syntax_error(token: &str) -> Status {
+    Status::invalid_argument(format!(
+        "Failed to parse filter expression: syntax error at token '{token}'"
+    ))
+}
+
+fn tokens(filter: &str) -> Result<Vec<Token>, Status> {
     let mut tokens = Vec::new();
     let mut chars = filter.chars().peekable();
     while let Some(c) = chars.next() {
@@ -304,12 +307,12 @@ fn tokens(filter: &str) -> Result<Vec<Token>, Error> {
                         Some('"') => break,
                         Some('\\') => text.extend(chars.next()),
                         Some(c) => text.push(c),
-                        None => return Err(Error::Syntax("<EOF>".to_owned())),
+                        None => return Err(syntax_error("<EOF>")),
                     }
                 }
                 Token::Quoted(text)
             }
-            c if is_symbol(c) => return Err(Error::Syntax(c.to_string())),
+            c if is_symbol(c) => return Err(syntax_error(&c.to_string())),
             c => {
                 let mut text = c.to_string();
                 while let Some(c) = chars.next_if(|&c| !c.is_whitespace() && !is_symbol(c)) {
@@ -352,17 +355,17 @@ impl Parser {
         found
     }
 
-    fn expect(&mut self, expected: Token) -> Result<(), Error> {
+    fn expect(&mut self, expected: Token) -> Result<(), Status> {
         if *self.peek() == expected {
             self.take();
             Ok(())
         } else {
-            Err(self.syntax_error())
+            Err(self.unexpected())
         }
     }
 
-    fn syntax_error(&self) -> Error {
-        Error::Syntax(match self.peek() {
+    fn unexpected(&self) -> Status {
+        syntax_error(&match self.peek() {
             Token::Text(text) => text.clone(),
             Token::Quoted(text) => format!("\"{text}\""),
             Token::Comparator(comparator) => match comparator {
@@ -382,7 +385,7 @@ impl Parser {
     }
 
     /// Sequences joined by AND, which binds looser than OR
-    fn expression(&mut self) -> Result<Expression, Error> {
+    fn expression(&mut self) -> Result<Expression, Status> {
         let mut sequences = vec![self.sequence()?];
         while self.keyword("AND") {
             sequences.push(self.sequence()?);
@@ -391,7 +394,7 @@ impl Parser {
     }
 
     /// Factors side by side, which AIP-160 reads as AND
-    fn sequence(&mut self) -> Result<Expression, Error> {
+    fn sequence(&mut self) -> Result<Expression, Status> {
         let mut factors = vec![self.factor()?];
         while match self.peek() {
             Token::Text(text) => text != "AND" && text != "OR",
@@ -403,7 +406,7 @@ impl Parser {
         Ok(Expression::All(factors))
     }
 
-    fn factor(&mut self) -> Result<Expression, Error> {
+    fn factor(&mut self) -> Result<Expression, Status> {
         let mut terms = vec![self.term()?];
         while self.keyword("OR") {
             terms.push(self.term()?);
@@ -411,7 +414,7 @@ impl Parser {
         Ok(Expression::Any(terms))
     }
 
-    fn term(&mut self) -> Result<Expression, Error> {
+    fn term(&mut self) -> Result<Expression, Status> {
         if self.keyword("NOT") {
             return Ok(Expression::Not(Box::new(self.simple()?)));
         }
@@ -425,7 +428,7 @@ impl Parser {
         self.simple()
     }
 
-    fn simple(&mut self) -> Result<Expression, Error> {
+    fn simple(&mut self) -> Result<Expression, Status> {
         if self.peek() == &Token::Open {
             self.take();
             let expression = self.expression()?;
@@ -435,16 +438,18 @@ impl Parser {
         let field = match self.peek() {
             Token::Text(text) if !["AND", "OR", "NOT"].contains(&text.as_str()) => text.clone(),
             Token::Quoted(text) => text.clone(),
-            _ => return Err(self.syntax_error()),
+            _ => return Err(self.unexpected()),
         };
         self.take();
         let Token::Comparator(comparator) = *self.peek() else {
-            return Err(Error::Unsupported("search across every field"));
+            return Err(Status::unimplemented(
+                "ListQueues filter search across every field is not supported yet",
+            ));
         };
         self.take();
         let operand = match self.peek() {
             Token::Text(text) | Token::Quoted(text) => text.clone(),
-            _ => return Err(self.syntax_error()),
+            _ => return Err(self.unexpected()),
         };
         self.take();
         restriction(&field, comparator, &operand)

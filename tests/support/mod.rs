@@ -14,12 +14,11 @@ use tokio::net::TcpListener;
 use tonic::Status;
 use tonic::transport::Channel;
 
-/// Starts an emulator whose projects have no App Engine app
 pub async fn start_emulator() -> CloudTasksClient<Channel> {
     start_emulator_with(None).await.0
 }
 
-/// Starts an emulator whose OIDC issuer is its own URL, returned with the client
+/// Starts emulator whose OIDC issuer is its own URL, returned with client
 pub async fn start_emulator_with(app_engine: Option<&str>) -> (CloudTasksClient<Channel>, String) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -59,7 +58,7 @@ impl Receiver {
         Self { url, requests }
     }
 
-    /// URL whose requests get each comma-separated step in turn, repeating the last
+    /// URL whose requests get each comma-separated step in turn, repeating last
     pub fn url_for(&self, key: &str, steps: &str) -> String {
         format!("{}/{key}/{steps}", self.url)
     }
@@ -83,7 +82,7 @@ impl Receiver {
                 if requests.len() >= count {
                     return requests;
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
@@ -118,7 +117,7 @@ async fn respond(
     let (key, steps) = path.rsplit_once('/').unwrap();
     let steps: Vec<&str> = steps.split(',').collect();
     match steps[attempt.min(steps.len() - 1)] {
-        // Outlasts the 15s dispatch deadline that slow cases set
+        // Outlasts 15s dispatch deadline that slow cases set
         "slow" => {
             tokio::time::sleep(Duration::from_secs(20)).await;
             StatusCode::OK.into_response()
@@ -134,7 +133,7 @@ async fn respond(
     }
 }
 
-/// Polls the task until `done` holds, or returns the error once it is gone
+/// Polls task until `done` holds, or returns error once it is gone
 pub async fn poll_task(
     client: &mut CloudTasksClient<Channel>,
     name: &str,

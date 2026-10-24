@@ -32,7 +32,7 @@ curl http://127.0.0.1:8123/v2/projects/p/locations/l/queues
 ## Handlers
 
 - HTTP tasks go to their URL with the `X-CloudTasks-*` headers. App Engine tasks go to `APP_ENGINE_URL` with the `X-AppEngine-*` headers.
-- The emulator signs OIDC tokens with a key made at startup. Handlers verify them through `<OIDC_ISSUER>/.well-known/openid-configuration`.
+- The emulator signs OIDC tokens with a key made each run. Handlers verify them through `<OIDC_ISSUER>/.well-known/openid-configuration`.
 - OAuth tokens are opaque, as only Google APIs could check a real one.
 - Unlike Cloud Tasks, the emulator sends tokens to http URLs, so local handlers receive them.
 
@@ -59,4 +59,10 @@ curl http://127.0.0.1:8123/emulator/projects/p/locations/l/queues/q:waitIdle
 
 Check every change with `cargo test`, `cargo clippy --all-targets` and `cargo fmt --check`. Building needs no `protoc`.
 
-`cargo test` compares the emulator with the transcripts in `tests/recordings`. The comment at the top of `tests/conformance.rs` explains how to record them again. Record in a sandbox project, since a run creates and deletes queues there.
+`cargo test` compares the emulator with the transcripts in `tests/recordings`. To record them again, install `cloudflared` and run:
+
+```sh
+CLOUD_TASKS_PROJECT=<id> CLOUD_TASKS_LOCATION=<id> CLOUD_TASKS_SERVICE_ACCOUNT=<email> CLOUD_TASKS_TOKEN=$(gcloud auth print-access-token) cargo test --test conformance -- --ignored record
+```
+
+Record in a sandbox project, since a run creates and deletes queues there. The service account must be in that project, and you need permission to act as it.

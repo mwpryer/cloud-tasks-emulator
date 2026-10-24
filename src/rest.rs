@@ -9,8 +9,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use prost::Message;
 use prost_reflect::{
-    DescriptorPool, DynamicMessage, FieldDescriptor, Kind, MessageDescriptor, MethodDescriptor,
-    SerializeOptions,
+    DynamicMessage, FieldDescriptor, Kind, MessageDescriptor, MethodDescriptor, SerializeOptions,
 };
 use prost_types::Any;
 use serde_json::{Map, Value};
@@ -18,48 +17,40 @@ use tonic::Code;
 use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tonic::service::Routes;
 
+use crate::DESCRIPTORS;
+use crate::proto::google::api::{HttpRule, http_rule};
 use crate::proto::google::rpc;
 
-const DESCRIPTORS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descriptors.bin"));
-
-/// Serves the HTTP/JSON mapping of the API by calling `grpc` in process
+/// Serves HTTP/JSON mapping of API by calling `grpc` in process
 pub fn router(grpc: Routes) -> axum::Router {
-    let pool = DescriptorPool::decode(DESCRIPTORS).expect("build.rs encodes the descriptors");
-    let http = pool
+    let http = DESCRIPTORS
         .get_extension_by_name("google.api.http")
         .expect("descriptors include google/api/annotations.proto");
-    let service = pool
+    let service = DESCRIPTORS
         .get_service_by_name("google.cloud.tasks.v2.CloudTasks")
         .expect("descriptors include the Cloud Tasks service");
     let mut rules: Vec<Rule> = service
         .methods()
         .map(|rpc| {
-            let options = rpc.options();
-            let annotation = options.get_extension(&http);
-            let annotation = annotation
+            let rule: HttpRule = rpc
+                .options()
+                .get_extension(&http)
                 .as_message()
-                .expect("every Cloud Tasks method has an HTTP rule");
-            let field = |name: &str| {
-                annotation
-                    .get_field_by_name(name)
-                    .and_then(|value| value.as_str().map(str::to_owned))
-                    .unwrap_or_default()
+                .expect("every Cloud Tasks method has an HTTP rule")
+                .transcode_to()
+                .expect("HTTP rules transcode");
+            let (method, template) = match rule.pattern {
+                Some(http_rule::Pattern::Get(template)) => (Method::GET, template),
+                Some(http_rule::Pattern::Post(template)) => (Method::POST, template),
+                Some(http_rule::Pattern::Patch(template)) => (Method::PATCH, template),
+                Some(http_rule::Pattern::Delete(template)) => (Method::DELETE, template),
+                pattern => panic!("Cloud Tasks maps no method as {pattern:?}"),
             };
-            let (method, template) = [
-                (Method::GET, "get"),
-                (Method::POST, "post"),
-                (Method::PATCH, "patch"),
-                (Method::DELETE, "delete"),
-            ]
-            .into_iter()
-            .map(|(method, name)| (method, field(name)))
-            .find(|(_, template)| !template.is_empty())
-            .expect("every HTTP rule has a get, post, patch or delete template");
-            Rule::new(rpc, method, &template, &field("body"))
+            Rule::new(rpc, method, &template, &rule.body)
         })
         .collect();
     // Cloud Tasks maps GetOperation in its service config rather than its protos, and maps no other Operations RPC
-    let get_operation = pool
+    let get_operation = DESCRIPTORS
         .get_service_by_name("google.longrunning.Operations")
         .and_then(|service| {
             service
@@ -73,7 +64,7 @@ pub fn router(grpc: Routes) -> axum::Router {
         "/v2/{name=projects/*/locations/*/operations/*}",
         "",
     ));
-    let status = pool
+    let status = DESCRIPTORS
         .get_message_by_name("google.rpc.Status")
         .expect("descriptors include google/rpc/status.proto");
     let rest = Arc::new(Rest {
@@ -92,13 +83,13 @@ struct Rest {
     status: MessageDescriptor,
 }
 
-/// An RPC's HTTP rule, as `google.api.http` defines it
+/// RPC's HTTP rule, as `google.api.http` defines it
 struct Rule {
     method: Method,
-    /// The template's segments, where `*` matches any one segment
+    /// Template's segments, where `*` matches any one segment
     segments: Vec<String>,
     verb: Option<String>,
-    /// Each variable's field path and the segments it binds
+    /// Each variable's field path and segments it binds
     variables: Vec<(String, Range<usize>)>,
     body: Body,
     rpc: PathAndQuery,
@@ -106,7 +97,6 @@ struct Rule {
     output: MessageDescriptor,
 }
 
-/// Where a rule reads the request body into
 enum Body {
     None,
     Whole,
@@ -156,7 +146,6 @@ impl Rule {
         }
     }
 
-    /// Returns each variable's field path and value when the request matches this rule
     fn bind<'a>(&'a self, method: &Method, path: &str) -> Option<Vec<(&'a str, String)>> {
         let path = path.strip_prefix('/')?;
         let (path, verb) = match path.rsplit_once(':') {
@@ -240,7 +229,7 @@ async fn handle(
     respond(json, pretty)
 }
 
-/// Builds the request from the body, query and path, rejecting what Google's front end rejects
+/// Builds request from body, query and path, rejecting what Google's front end rejects
 fn request(
     rule: &Rule,
     bindings: Vec<(&str, String)>,
@@ -289,7 +278,7 @@ fn object(body: &[u8]) -> Result<Map<String, Value>, rpc::Status> {
     }
 }
 
-/// Resolves a query parameter's dotted field names, in JSON or proto form, to proto field names
+/// Resolves query parameter's dotted field names, in JSON or proto form, to proto field names
 fn field_path(message: &MessageDescriptor, key: &str) -> Option<String> {
     let mut message = Some(message.clone());
     let mut path = Vec::new();
@@ -306,7 +295,7 @@ fn field_path(message: &MessageDescriptor, key: &str) -> Option<String> {
     Some(path.join("."))
 }
 
-/// Sets the field at a dotted path of proto field names, replacing anything in the way
+/// Sets field at dotted path of proto field names, replacing anything in the way
 fn insert(request: &mut Map<String, Value>, path: &str, value: String) {
     let (parents, field) = path.rsplit_once('.').unwrap_or(("", path));
     let mut object = request;
@@ -322,7 +311,7 @@ fn insert(request: &mut Map<String, Value>, path: &str, value: String) {
     object.insert(field.to_owned(), Value::String(value));
 }
 
-/// Collects the unknown names and mistyped values in a message, with Google's wording
+/// Collects unknown names and mistyped values in message, with Google's wording
 fn check_message(
     value: &Value,
     message: &MessageDescriptor,
@@ -400,7 +389,7 @@ fn check_value(
     violations: &mut Vec<rpc::bad_request::FieldViolation>,
 ) {
     let valid = match kind {
-        // Left to the JSON mapping, which knows each well-known type's own form
+        // Left to JSON mapping, which knows each well-known type's own form
         Kind::Message(message) if message.full_name().starts_with("google.protobuf.") => true,
         Kind::Message(message) => return check_message(value, message, path, violations),
         Kind::Enum(values) => {
@@ -460,10 +449,7 @@ fn bad_request(violations: Vec<rpc::bad_request::FieldViolation>) -> rpc::Status
     rpc::Status {
         code: Code::InvalidArgument as i32,
         message,
-        details: vec![Any {
-            type_url: "type.googleapis.com/google.rpc.BadRequest".to_owned(),
-            value: details.encode_to_vec(),
-        }],
+        details: vec![Any::from_msg(&details).expect("Vec grows to fit")],
     }
 }
 
@@ -498,7 +484,6 @@ async fn call(
     }
 }
 
-/// Encodes requests and decodes responses of the given type as dynamic messages
 #[derive(Clone)]
 struct DynamicCodec(MessageDescriptor);
 
@@ -538,7 +523,6 @@ impl Decoder for DynamicCodec {
     }
 }
 
-/// The error body for `status`, with its details as JSON
 fn error(descriptor: &MessageDescriptor, status: rpc::Status) -> (StatusCode, Value) {
     let (http, name) = match Code::from(status.code) {
         Code::Ok => (200, "OK"),
@@ -584,7 +568,7 @@ fn to_json(message: &DynamicMessage, options: &SerializeOptions) -> Value {
     json
 }
 
-/// Prints whole doubles without a fraction, and Empty in an Any as a plain message, as Google does
+/// Prints whole doubles without fraction, and Empty in Any as plain message, as Google does
 fn like_google(json: &mut Value) {
     match json {
         Value::Number(number) => {

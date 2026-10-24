@@ -12,9 +12,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         format!("{out_dir}/descriptors.bin"),
         compiler.encode_file_descriptor_set(),
     )?;
+    let mut config = tonic_prost_build::Config::new();
+    config
+        .enable_type_names()
+        .type_name_domain(["."], "type.googleapis.com");
     tonic_prost_build::configure()
         .btree_map(".")
-        .compile_fds(compiler.file_descriptor_set())?;
+        .compile_fds_with_config(compiler.file_descriptor_set(), config)?;
     println!("cargo:rerun-if-changed=proto");
     Ok(())
 }

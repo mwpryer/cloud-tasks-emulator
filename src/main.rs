@@ -28,7 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Ok(())
 }
 
-/// The origin of an http or https URL that has nothing after it
+/// None unless `url` is bare http or https origin
 fn origin(url: &str) -> Option<String> {
     let url = reqwest::Url::parse(url).ok()?;
     let origin = url.origin().ascii_serialization();

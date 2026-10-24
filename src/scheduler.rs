@@ -7,13 +7,12 @@ use crate::oidc::Issuer;
 use crate::state::{Delivery, Emulator, HttpMethod, Outcome, Request, Token};
 
 pub(crate) async fn run(emulator: Arc<Emulator>, issuer: Arc<Issuer>) {
-    let clients = Clients {
-        following: reqwest::Client::new(),
-        not_following: reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("client config is valid"),
-    };
+    // Redirect policy is per client, and App Engine tasks don't follow redirects
+    let following = reqwest::Client::new();
+    let not_following = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("client config is valid");
     loop {
         let (deliveries, wait) = emulator
             .state
@@ -21,10 +20,14 @@ pub(crate) async fn run(emulator: Arc<Emulator>, issuer: Arc<Issuer>) {
             .unwrap()
             .start_due(emulator.app_engine.as_deref(), SystemTime::now());
         for delivery in deliveries {
+            let client = match &delivery.request {
+                Some(request) if !request.follows_redirects => &not_following,
+                _ => &following,
+            };
             tokio::spawn(deliver(
                 emulator.clone(),
                 issuer.clone(),
-                clients.clone(),
+                client.clone(),
                 delivery,
             ));
         }
@@ -40,24 +43,14 @@ pub(crate) async fn run(emulator: Arc<Emulator>, issuer: Arc<Issuer>) {
     }
 }
 
-/// Redirect policy is per client, and App Engine tasks don't follow redirects
-#[derive(Clone)]
-struct Clients {
-    following: reqwest::Client,
-    not_following: reqwest::Client,
-}
-
 async fn deliver(
     emulator: Arc<Emulator>,
     issuer: Arc<Issuer>,
-    clients: Clients,
+    client: reqwest::Client,
     delivery: Delivery,
 ) {
     let outcome = match &delivery.request {
-        Some(request) if request.follows_redirects => {
-            send(&issuer, &clients.following, request).await
-        }
-        Some(request) => send(&issuer, &clients.not_following, request).await,
+        Some(request) => send(&issuer, &client, request).await,
         None => Outcome::Unreachable,
     };
     let result = match outcome {
@@ -97,7 +90,7 @@ async fn send(issuer: &Issuer, client: &reqwest::Client, request: &Request) -> O
     }
     if let Some(token) = &request.token {
         let token = match token {
-            // Opaque, as only Google APIs could check a real access token
+            // Opaque, as only Google APIs could check real access token
             Token::OAuth => format!("{:032x}", rand::random::<u128>()),
             Token::Oidc {
                 service_account_email,

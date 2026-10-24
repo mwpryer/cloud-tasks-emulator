@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::SystemTime;
 
 use aws_lc_rs::digest::{SHA256, digest};
@@ -11,10 +11,10 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::{Value, json};
 
-/// Signs ID tokens with a key made at startup, which handlers find through discovery
 pub(crate) struct Issuer {
     url: String,
-    key: RsaKeyPair,
+    /// Lazy, as making it takes up to 300 ms
+    key: LazyLock<RsaKeyPair>,
     key_id: String,
 }
 
@@ -22,7 +22,9 @@ impl Issuer {
     pub fn new(url: String) -> Self {
         Self {
             url,
-            key: RsaKeyPair::generate(KeySize::Rsa2048).expect("RSA key generation succeeds"),
+            key: LazyLock::new(|| {
+                RsaKeyPair::generate(KeySize::Rsa2048).expect("RSA key generation succeeds")
+            }),
             key_id: format!("{:032x}", rand::random::<u128>()),
         }
     }
@@ -32,7 +34,7 @@ impl Issuer {
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("times are after the epoch")
             .as_secs();
-        // Stands in for the service account's numeric unique ID, which only IAM knows
+        // Stands in for service account's numeric unique ID, which only IAM knows
         let hash = digest(&SHA256, service_account_email.as_bytes());
         let unique_id = format!(
             "1{:020}",

@@ -1,6 +1,4 @@
-//! Compares the emulator with transcripts recorded from real Cloud Tasks in `tests/recordings`
-//! To record, install `cloudflared` and run `CLOUD_TASKS_PROJECT=<id> CLOUD_TASKS_LOCATION=<id> CLOUD_TASKS_SERVICE_ACCOUNT=<email> CLOUD_TASKS_TOKEN=$(gcloud auth print-access-token) cargo test --test conformance -- --ignored record`
-//! The caller needs permission to act as the service account, which must be in the project
+//! Compares emulator with transcripts recorded from real Cloud Tasks in `tests/recordings`
 
 mod support;
 
@@ -54,9 +52,7 @@ const RECORDINGS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/recordings"
 async fn emulator_matches_recordings() {
     let receiver = Receiver::start().await;
     let (_, url) = support::start_emulator_with(Some(&receiver.url)).await;
-    let channel = Endpoint::new(url.clone()).unwrap().connect().await.unwrap();
     let mut target = Target::new(
-        channel,
         &url,
         MetadataMap::new(),
         "emulator-project",
@@ -64,7 +60,8 @@ async fn emulator_matches_recordings() {
         "tasks@emulator-project.iam.gserviceaccount.com",
         &url,
         receiver,
-    );
+    )
+    .await;
     target.discover_app_domain().await;
 
     let results: Vec<_> = run_cases(&target)
@@ -101,16 +98,10 @@ async fn record() {
             .parse()
             .unwrap(),
     );
-    let channel = Endpoint::new("https://cloudtasks.googleapis.com")
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
     let mut receiver = Receiver::start().await;
     let (_tunnel, url) = open_tunnel(&receiver.url).await;
     receiver.url = url;
     let mut target = Target::new(
-        channel,
         "https://cloudtasks.googleapis.com",
         metadata,
         &env("CLOUD_TASKS_PROJECT"),
@@ -118,11 +109,12 @@ async fn record() {
         &env("CLOUD_TASKS_SERVICE_ACCOUNT"),
         "https://accounts.google.com",
         receiver,
-    );
+    )
+    .await;
 
     target.discover_app_domain().await;
     let results = run_cases(&target).await;
-    // Deletes by the run's prefix, so a case that panicked leaks nothing
+    // Deletes by run's prefix, so case that panicked leaks nothing
     let prefix = target.queue_name("");
     let mut leftovers = Vec::new();
     let mut page_token = String::new();
@@ -162,7 +154,7 @@ async fn record() {
     }
 }
 
-/// Makes a local URL public through a Cloudflare quick tunnel, which lasts as long as the returned process
+/// Makes local URL public through Cloudflare quick tunnel, which lasts as long as returned process
 async fn open_tunnel(local_url: &str) -> (Child, String) {
     let mut tunnel = Command::new("cloudflared")
         .args(["tunnel", "--no-autoupdate", "--url", local_url])
@@ -171,7 +163,6 @@ async fn open_tunnel(local_url: &str) -> (Child, String) {
         .spawn()
         .expect("cloudflared is installed");
     let mut lines = BufReader::new(tunnel.stderr.take().unwrap()).lines();
-    // cloudflared retries forever when outbound port 7844 is blocked
     let url = tokio::time::timeout(std::time::Duration::from_secs(60), async {
         let url = loop {
             let line = lines
@@ -197,9 +188,9 @@ async fn open_tunnel(local_url: &str) -> (Child, String) {
     })
     .await
     .expect("cloudflared registers the tunnel within 60s, which needs outbound port 7844");
-    // Drains the log so cloudflared never blocks on a full pipe
+    // Drains log so cloudflared never blocks on full pipe
     tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
-    // The host resolves a few seconds after registering, and a lookup before then is cached as missing for 60s
+    // Host resolves a few seconds after registering, and lookup before then is cached as missing for 60s
     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
     let client = reqwest::Client::new();
     for _ in 0..60 {
@@ -216,22 +207,40 @@ async fn open_tunnel(local_url: &str) -> (Child, String) {
     panic!("tunnel {url} never answered");
 }
 
+/// Repeats `call` each second until `done` holds, for answers real Cloud Tasks varies or delays
+macro_rules! retry_until {
+    ($call:expr, $done:expr) => {
+        retry_until!($call, $done, 60)
+    };
+    ($call:expr, $done:expr, $seconds:expr) => {
+        tokio::time::timeout(std::time::Duration::from_secs($seconds), async {
+            loop {
+                let result = $call.await;
+                if $done(&result) {
+                    break result;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        })
+        .await
+        .expect("real Cloud Tasks gives the expected answer in time")
+    };
+}
+
 #[derive(Clone)]
 struct Target {
     client: CloudTasksClient<Channel>,
     operations: OperationsClient<Channel>,
     rest: reqwest::Client,
-    /// Origin of the REST API
     rest_url: String,
-    /// Sent with every request, so empty for the emulator
+    /// Sent with every request, so empty for emulator
     metadata: MetadataMap,
     project: String,
     parent: String,
-    /// Email of the service account that tokens are generated for
     service_account: String,
-    /// Prefixes queue IDs, as real Cloud Tasks blocks a deleted queue's name for days
+    /// Prefixes queue IDs, as real Cloud Tasks blocks deleted queue's name for days
     run: String,
-    /// A day out, so no task dispatches
+    /// Keeps tasks from dispatching
     tomorrow: Timestamp,
     receiver: Receiver,
     placeholders: Vec<(String, &'static str)>,
@@ -239,13 +248,8 @@ struct Target {
 }
 
 impl Target {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "each target differs in every one"
-    )]
-    fn new(
-        channel: Channel,
-        rest_url: &str,
+    async fn new(
+        url: &str,
         metadata: MetadataMap,
         project: &str,
         location: &str,
@@ -253,9 +257,14 @@ impl Target {
         issuer: &str,
         receiver: Receiver,
     ) -> Self {
+        let channel = Endpoint::new(url.to_owned())
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
         let run = format!("r{:08x}", rand::random::<u32>());
         let tomorrow = seconds_from_now(24 * 60 * 60);
-        // REST shows times in RFC 3339, so the fraction after the seconds stays in transcripts
+        // REST shows times in RFC 3339, so fraction after seconds stays in transcripts
         let tomorrow_time = Timestamp {
             seconds: tomorrow,
             nanos: 0,
@@ -265,7 +274,7 @@ impl Target {
             client: CloudTasksClient::new(channel.clone()),
             operations: OperationsClient::new(channel),
             rest: reqwest::Client::new(),
-            rest_url: rest_url.to_owned(),
+            rest_url: url.to_owned(),
             metadata,
             project: format!("projects/{project}"),
             parent: format!("projects/{project}/locations/{location}"),
@@ -294,12 +303,10 @@ impl Target {
         format!("{}/queues/{}-{id}", self.parent, self.run)
     }
 
-    /// Creates a queue with the default config and returns its name
     async fn queue(&mut self, id: &str) -> String {
         self.queue_with(id, Queue::default()).await
     }
 
-    /// Creates a queue with the given config and returns its name
     async fn queue_with(&mut self, id: &str, queue: Queue) -> String {
         let name = self.queue_name(id);
         self.create_queue(CreateQueueRequest {
@@ -331,7 +338,7 @@ impl Target {
         }
     }
 
-    /// Learns the app's domain, which an App Engine task without routing reports as its host
+    /// Learns app's domain, which App Engine task without routing reports as its host
     async fn discover_app_domain(&mut self) {
         let queue = self.queue("app-domain").await;
         let request = CreateTaskRequest {
@@ -346,7 +353,6 @@ impl Target {
         self.placeholder(request.app_engine_routing.unwrap().host, "{app_domain}");
     }
 
-    /// Replaces `value` with `placeholder` in this case's transcript
     fn placeholder(&mut self, value: String, placeholder: &'static str) {
         self.placeholders.push((value, placeholder));
     }
@@ -372,8 +378,7 @@ impl Target {
         self.transcript += &format!("{label} -> {entry}\n");
     }
 
-    /// Sends a REST request with the target's credentials and records the status and body as received
-    /// Retries while real Cloud Tasks reports exhaustion, as it does for RunTask in a new queue's first seconds
+    /// Records status and body as received, retrying on exhaustion as `run_task` does
     async fn rest(&mut self, label: &str, method: Method, path: &str, body: &str) -> String {
         let (status, body) = tokio::time::timeout(std::time::Duration::from_secs(60), async {
             loop {
@@ -399,7 +404,6 @@ impl Target {
         body
     }
 
-    /// Replaces the string at `pointer` in a JSON body
     fn json_placeholder(&mut self, body: &str, pointer: &str, placeholder: &'static str) {
         let json: Value = serde_json::from_str(body).unwrap();
         let value = json
@@ -409,7 +413,7 @@ impl Target {
         self.placeholder(value.to_owned(), placeholder);
     }
 
-    /// Returns the transcript with run-specific values replaced, most specific first
+    /// Returns transcript with run-specific values replaced, most specific first
     fn finish(self) -> String {
         let mut transcript = self.transcript;
         for (value, placeholder) in self.placeholders.iter().rev() {
@@ -418,7 +422,7 @@ impl Target {
         transcript
     }
 
-    /// Polls the task in full view until `done` holds for the result
+    /// Polls task in full view until `done` holds for result
     async fn poll_task(
         &mut self,
         name: &str,
@@ -442,7 +446,7 @@ impl Target {
         .unwrap_or_else(|_| panic!("{name} reached the expected state in time"))
     }
 
-    /// Adds the routing header that official clients send and real Cloud Tasks requires
+    /// Adds routing header that official clients send and real Cloud Tasks requires
     fn request<T>(&self, routing: String, message: T) -> Request<T> {
         let mut request = Request::new(message);
         *request.metadata_mut() = self.metadata.clone();
@@ -578,7 +582,7 @@ impl Target {
         Ok(response.permissions)
     }
 
-    /// Sends the routing field that real Cloud Tasks wants, as it rejects the `name` that official clients send
+    /// Sends routing field that real Cloud Tasks wants, as it rejects `name` that official clients send
     async fn get_cmek_config(
         &mut self,
         request: GetCmekConfigRequest,
@@ -599,7 +603,7 @@ impl Target {
         Ok(self.client.update_cmek_config(request).await?.into_inner())
     }
 
-    /// Replaces each changing etag, keeping the fixed one of a queue that never had a policy
+    /// Replaces each changing etag, keeping fixed one of queue that never had policy
     fn etagged(&mut self, policy: Policy) -> Etagged {
         let etag = STANDARD.encode(&policy.etag);
         if etag != "ACAB" {
@@ -612,13 +616,12 @@ impl Target {
         }
     }
 
-    /// Replaces the ID that Cloud Tasks generated for an operation
     fn operation_id(&mut self, name: &str) {
         let (_, id) = name.rsplit_once("/operations/").unwrap();
         self.placeholder(id.to_owned(), "{operation}");
     }
 
-    /// Gets an operation whose times an earlier call already replaced
+    /// Gets operation whose times earlier call already replaced
     async fn get_operation<M: Message + Default, R: Message + Default>(
         &mut self,
         request: GetOperationRequest,
@@ -664,7 +667,7 @@ impl Target {
         ))
     }
 
-    /// Replaces an operation's times, sharing the create time placeholder as both fall in the same second or two
+    /// Replaces operation's times, sharing create time placeholder as both fall in same second or two
     fn times(&mut self, start: Option<Timestamp>, end: Option<Timestamp>) {
         for (time, nanos) in [(start, "{start_nanos}"), (end, "{end_nanos}")] {
             let time = time.unwrap();
@@ -701,25 +704,16 @@ impl Target {
         Ok(())
     }
 
-    /// Retries while real Cloud Tasks reports RunTask as exhausted, which it does for a new queue's first seconds
+    /// Retries while real Cloud Tasks reports RunTask as exhausted, which it does for new queue's first seconds
     async fn run_task(&mut self, request: RunTaskRequest) -> Result<Task, Status> {
         let routing = format!("name={}", request.name);
-        let task = tokio::time::timeout(std::time::Duration::from_secs(60), async {
-            loop {
-                match self
-                    .client
-                    .run_task(self.request(routing.clone(), request.clone()))
-                    .await
-                {
-                    Err(status) if status.code() == Code::ResourceExhausted => {
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    }
-                    result => return result,
-                }
-            }
-        })
-        .await
-        .expect("RunTask stops reporting exhaustion in time")?
+        let task = retry_until!(
+            self.client
+                .run_task(self.request(routing.clone(), request.clone())),
+            |result: &Result<_, Status>| !result
+                .as_ref()
+                .is_err_and(|status| status.code() == Code::ResourceExhausted)
+        )?
         .into_inner();
         self.placeholder(
             task.create_time.unwrap().seconds.to_string(),
@@ -729,7 +723,7 @@ impl Target {
     }
 }
 
-/// An operation with its metadata and result unpacked, each beside its type URL
+/// Operation with its metadata and result unpacked, each beside its type URL
 #[derive(Debug)]
 struct Decoded<M, R> {
     name: String,
@@ -739,7 +733,7 @@ struct Decoded<M, R> {
     result: Option<Result<(String, R), rpc::Status>>,
 }
 
-/// A policy with its etag in base64, as REST shows it
+/// Policy with its etag in base64, as REST shows it
 #[derive(Debug)]
 #[expect(dead_code, reason = "read through Debug in transcripts")]
 struct Etagged {
@@ -779,28 +773,8 @@ fn detail(any: &Any) -> Box<dyn Debug> {
     }
 }
 
-/// Repeats `call` each second until `done` holds, for answers real Cloud Tasks varies between requests
-macro_rules! retry_until {
-    ($call:expr, $done:expr) => {
-        tokio::time::timeout(std::time::Duration::from_secs(60), async {
-            loop {
-                let result = $call.await;
-                if $done(&result) {
-                    break result;
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
-        })
-        .await
-        .expect("real Cloud Tasks gives the expected answer in time")
-    };
-}
-
 fn seconds_from_now(seconds: i64) -> i64 {
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap();
-    now.as_secs() as i64 + seconds
+    Timestamp::from(SystemTime::now()).seconds + seconds
 }
 
 macro_rules! cases {
@@ -971,6 +945,10 @@ fn with_headers(headers: &[(&str, &str)]) -> HttpRequest {
     }
 }
 
+fn seconds(seconds: i64) -> Option<Duration> {
+    Some(Duration { seconds, nanos: 0 })
+}
+
 async fn create_queue_returns_defaults(t: &mut Target) {
     let request = CreateQueueRequest {
         parent: t.parent.clone(),
@@ -997,18 +975,9 @@ async fn create_queue_returns_config(t: &mut Target) {
             }),
             retry_config: Some(RetryConfig {
                 max_attempts: 5,
-                max_retry_duration: Some(Duration {
-                    seconds: 60,
-                    nanos: 0,
-                }),
-                min_backoff: Some(Duration {
-                    seconds: 1,
-                    nanos: 0,
-                }),
-                max_backoff: Some(Duration {
-                    seconds: 10,
-                    nanos: 0,
-                }),
+                max_retry_duration: seconds(60),
+                min_backoff: seconds(1),
+                max_backoff: seconds(10),
                 max_doublings: 3,
             }),
             ..Default::default()
@@ -1081,10 +1050,7 @@ async fn create_queue_with_unlimited_retries(t: &mut Target) {
             name: t.queue_name("unlimited"),
             retry_config: Some(RetryConfig {
                 max_attempts: -1,
-                max_retry_duration: Some(Duration {
-                    seconds: 0,
-                    nanos: 0,
-                }),
+                max_retry_duration: seconds(0),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1117,10 +1083,6 @@ async fn create_queue_treats_zero_config_as_unset(t: &mut Target) {
 }
 
 async fn create_queue_rejects_invalid_config(t: &mut Target) {
-    let negative = Some(Duration {
-        seconds: -1,
-        nanos: 0,
-    });
     for (label, rate_limits, retry_config) in [
         (
             "rate 501",
@@ -1174,7 +1136,7 @@ async fn create_queue_rejects_invalid_config(t: &mut Target) {
             "min backoff -1s",
             RateLimits::default(),
             RetryConfig {
-                min_backoff: negative,
+                min_backoff: seconds(-1),
                 ..Default::default()
             },
         ),
@@ -1193,7 +1155,7 @@ async fn create_queue_rejects_invalid_config(t: &mut Target) {
             "max backoff -1s",
             RateLimits::default(),
             RetryConfig {
-                max_backoff: negative,
+                max_backoff: seconds(-1),
                 ..Default::default()
             },
         ),
@@ -1201,7 +1163,7 @@ async fn create_queue_rejects_invalid_config(t: &mut Target) {
             "max retry duration -1s",
             RateLimits::default(),
             RetryConfig {
-                max_retry_duration: negative,
+                max_retry_duration: seconds(-1),
                 ..Default::default()
             },
         ),
@@ -1220,14 +1182,8 @@ async fn create_queue_rejects_invalid_config(t: &mut Target) {
             "min backoff above max backoff",
             RateLimits::default(),
             RetryConfig {
-                min_backoff: Some(Duration {
-                    seconds: 10,
-                    nanos: 0,
-                }),
-                max_backoff: Some(Duration {
-                    seconds: 5,
-                    nanos: 0,
-                }),
+                min_backoff: seconds(10),
+                max_backoff: seconds(5),
                 ..Default::default()
             },
         ),
@@ -1295,14 +1251,19 @@ async fn create_queue_rejects_invalid_names(t: &mut Target) {
     }
 }
 
-async fn get_queue_rejects_invalid_names(t: &mut Target) {
-    for (label, name) in [
+/// Names that every queue RPC rejects, alongside queue that does not exist
+fn invalid_queue_names(t: &Target) -> [(&'static str, String); 5] {
+    [
         ("unknown queue", t.queue_name("missing")),
         ("empty name", String::new()),
         ("name not in a project", "not-a-valid-name".to_owned()),
         ("name without queue id", format!("{}/queues", t.parent)),
         ("invalid queue id", format!("{}/queues/not_valid", t.parent)),
-    ] {
+    ]
+}
+
+async fn get_queue_rejects_invalid_names(t: &mut Target) {
+    for (label, name) in invalid_queue_names(t) {
         let result = t.get_queue(GetQueueRequest { name }).await;
 
         t.record(label, result);
@@ -1320,7 +1281,7 @@ async fn list_queues_returns_every_queue(t: &mut Target) {
         })
         .await;
 
-    // Other cases' queues share the location
+    // Other cases' queues share location
     t.record(
         "list_queues",
         result.map(|response| {
@@ -1420,13 +1381,7 @@ async fn delete_queue_removes_queue(t: &mut Target) {
 }
 
 async fn delete_queue_rejects_invalid_names(t: &mut Target) {
-    for (label, name) in [
-        ("unknown queue", t.queue_name("missing")),
-        ("empty name", String::new()),
-        ("name not in a project", "not-a-valid-name".to_owned()),
-        ("name without queue id", format!("{}/queues", t.parent)),
-        ("invalid queue id", format!("{}/queues/not_valid", t.parent)),
-    ] {
+    for (label, name) in invalid_queue_names(t) {
         let result = t.delete_queue(DeleteQueueRequest { name }).await;
 
         t.record(label, result);
@@ -1619,8 +1574,8 @@ async fn create_task_rejects_invalid_requests(t: &mut Target) {
         body: b"hi".to_vec(),
         ..http("https://example.com/work")
     };
-    let with_deadline = |seconds: i64| Task {
-        dispatch_deadline: Some(Duration { seconds, nanos: 0 }),
+    let with_deadline = |deadline| Task {
+        dispatch_deadline: seconds(deadline),
         ..t.task("", http("https://example.com/work"))
     };
     for (label, task) in [
@@ -1758,9 +1713,9 @@ async fn get_task_returns_basic_and_full_views(t: &mut Target) {
     t.record("get_task full", full);
 }
 
-async fn get_task_rejects_invalid_names(t: &mut Target) {
-    let queue = t.queue("get-tasks").await;
-    for (label, name) in [
+/// Names that every task RPC rejects, alongside task and queue that do not exist
+fn invalid_task_names(t: &Target, queue: &str) -> [(&'static str, String); 6] {
+    [
         ("unknown task", format!("{queue}/tasks/missing")),
         (
             "unknown queue",
@@ -1770,12 +1725,18 @@ async fn get_task_rejects_invalid_names(t: &mut Target) {
         ("name not in a project", "not-a-valid-name".to_owned()),
         ("name without task id", format!("{queue}/tasks")),
         ("invalid task id", format!("{queue}/tasks/not valid")),
+    ]
+}
+
+async fn get_task_rejects_invalid_names(t: &mut Target) {
+    let queue = t.queue("get-tasks").await;
+    for (label, name) in invalid_task_names(t, &queue).into_iter().chain([
         (
             "invalid queue id",
             format!("{}/queues/not_valid/tasks/t", t.parent),
         ),
         ("name with extra segment", format!("{queue}/tasks/t/extra")),
-    ] {
+    ]) {
         let result = t
             .get_task(GetTaskRequest {
                 name,
@@ -1954,17 +1915,7 @@ async fn delete_task_removes_task(t: &mut Target) {
 
 async fn delete_task_rejects_invalid_names(t: &mut Target) {
     let queue = t.queue("delete-invalid").await;
-    for (label, name) in [
-        ("unknown task", format!("{queue}/tasks/missing")),
-        (
-            "unknown queue",
-            format!("{}/tasks/t", t.queue_name("missing")),
-        ),
-        ("empty name", String::new()),
-        ("name not in a project", "not-a-valid-name".to_owned()),
-        ("name without task id", format!("{queue}/tasks")),
-        ("invalid task id", format!("{queue}/tasks/not valid")),
-    ] {
+    for (label, name) in invalid_task_names(t, &queue) {
         let result = t.delete_task(DeleteTaskRequest { name }).await;
 
         t.record(label, result);
@@ -2039,11 +1990,7 @@ async fn unknown_enums_fall_back_to_defaults(t: &mut Target) {
     );
 }
 
-fn seconds(seconds: i64) -> Option<Duration> {
-    Some(Duration { seconds, nanos: 0 })
-}
-
-/// Headers Cloud Tasks sets or passes on, leaving out those the tunnel or HTTP client add
+/// Headers Cloud Tasks sets or passes on, leaving out those tunnel or HTTP client add
 fn dispatched_headers(request: &Received) -> BTreeMap<String, String> {
     request
         .headers
@@ -2057,7 +2004,7 @@ fn dispatched_headers(request: &Received) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// Creates a task that dispatches now, unlike `Target::task`
+/// Creates task that dispatches now, unlike `Target::task`
 fn due_task(name: &str, url: String) -> Task {
     Task {
         name: name.to_owned(),
@@ -2204,7 +2151,7 @@ async fn dispatch_follows_redirects(t: &mut Target) {
 }
 
 async fn dispatch_records_response_status(t: &mut Target) {
-    // An hour's backoff keeps each task, and its last attempt, after the first failure
+    // One-hour backoff keeps each task, and its last attempt, after first failure
     let queue = t
         .queue_with(
             "dispatch-statuses",
@@ -2422,7 +2369,7 @@ fn mask(paths: &[&str]) -> Option<FieldMask> {
     })
 }
 
-/// Rate limits and retry config unlike the defaults, so an update shows which fields it changed
+/// Rate limits and retry config unlike defaults, so update shows which fields it changed
 fn configured() -> Queue {
     Queue {
         rate_limits: Some(RateLimits {
@@ -2829,17 +2776,6 @@ async fn pause_and_resume_repeat(t: &mut Target) {
     t.record("second resume", second_resume.map(|queue| queue.state()));
 }
 
-/// Names that every queue RPC rejects, alongside a queue that does not exist
-fn invalid_queue_names(t: &Target) -> [(&'static str, String); 5] {
-    [
-        ("unknown queue", t.queue_name("missing")),
-        ("empty name", String::new()),
-        ("name not in a project", "not-a-valid-name".to_owned()),
-        ("name without queue id", format!("{}/queues", t.parent)),
-        ("invalid queue id", format!("{}/queues/not_valid", t.parent)),
-    ]
-}
-
 async fn pause_queue_rejects_invalid_names(t: &mut Target) {
     for (label, name) in invalid_queue_names(t) {
         let result = t.pause_queue(PauseQueueRequest { name }).await;
@@ -2864,36 +2800,6 @@ async fn purge_queue_rejects_invalid_names(t: &mut Target) {
     }
 }
 
-/// Polls the queue's task names until `done` holds, as a purge takes a moment in real Cloud Tasks
-async fn poll_task_names(
-    t: &mut Target,
-    queue: &str,
-    done: impl Fn(&[String]) -> bool,
-) -> Vec<String> {
-    tokio::time::timeout(std::time::Duration::from_secs(120), async {
-        loop {
-            let mut names: Vec<String> = t
-                .list_tasks(ListTasksRequest {
-                    parent: queue.to_owned(),
-                    ..Default::default()
-                })
-                .await
-                .unwrap()
-                .tasks
-                .into_iter()
-                .map(|task| task.name)
-                .collect();
-            names.sort();
-            if done(&names) {
-                return names;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("{queue} reached the expected tasks in time"))
-}
-
 async fn purge_queue_deletes_existing_tasks(t: &mut Target) {
     let queue = t.queue("purged").await;
     let purged_task = format!("{queue}/tasks/a");
@@ -2901,6 +2807,21 @@ async fn purge_queue_deletes_existing_tasks(t: &mut Target) {
         parent: queue.clone(),
         task: Some(t.task(name, http("https://example.com/work"))),
         response_view: task::View::Unspecified.into(),
+    };
+    let task_names = async |t: &mut Target| {
+        let mut names: Vec<String> = t
+            .list_tasks(ListTasksRequest {
+                parent: queue.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .tasks
+            .into_iter()
+            .map(|task| task.name)
+            .collect();
+        names.sort();
+        names
     };
     t.create_task(create(t, &purged_task)).await.unwrap();
 
@@ -2910,13 +2831,14 @@ async fn purge_queue_deletes_existing_tasks(t: &mut Target) {
         })
         .await;
 
-    poll_task_names(t, &queue, <[String]>::is_empty).await;
-    // Cloud Tasks keeps create_time in whole seconds, so a task created in the purge's second can count as before it
+    // Purge takes a moment in real Cloud Tasks
+    retry_until!(task_names(t), Vec::is_empty, 120);
+    // Cloud Tasks keeps create_time in whole seconds, so task created in purge's second can count as before it
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     t.create_task(create(t, &format!("{queue}/tasks/b")))
         .await
         .unwrap();
-    let listed = poll_task_names(t, &queue, |names| !names.is_empty()).await;
+    let listed = retry_until!(task_names(t), |names: &Vec<String>| !names.is_empty(), 120);
     let got = t
         .get_task(GetTaskRequest {
             name: purged_task.clone(),
@@ -3071,17 +2993,7 @@ async fn run_task_backs_off_after_failure(t: &mut Target) {
 
 async fn run_task_rejects_invalid_names(t: &mut Target) {
     let queue = t.queue("run-invalid").await;
-    for (label, name) in [
-        ("unknown task", format!("{queue}/tasks/missing")),
-        (
-            "unknown queue",
-            format!("{}/tasks/t", t.queue_name("missing")),
-        ),
-        ("empty name", String::new()),
-        ("name not in a project", "not-a-valid-name".to_owned()),
-        ("name without task id", format!("{queue}/tasks")),
-        ("invalid task id", format!("{queue}/tasks/not valid")),
-    ] {
+    for (label, name) in invalid_task_names(t, &queue) {
         let result = t
             .run_task(RunTaskRequest {
                 name,
@@ -3093,7 +3005,7 @@ async fn run_task_rejects_invalid_names(t: &mut Target) {
     }
 }
 
-/// Lists with the filter, keeping only this case's queues as other cases share the location
+/// Lists with filter, keeping only this case's queues as other cases share location
 async fn filtered_queue_names(
     t: &mut Target,
     filter: &str,
@@ -3202,17 +3114,6 @@ async fn list_queues_rejects_invalid_filters(t: &mut Target) {
     }
 }
 
-/// Retry config unlike the queue defaults
-fn task_retry_config() -> RetryConfig {
-    RetryConfig {
-        max_attempts: 3,
-        max_retry_duration: seconds(60),
-        min_backoff: seconds(2),
-        max_backoff: seconds(4),
-        max_doublings: 1,
-    }
-}
-
 async fn create_task_returns_retry_config(t: &mut Target) {
     let queue = t.queue("task-retry").await;
     let name = format!("{queue}/tasks/t");
@@ -3222,7 +3123,13 @@ async fn create_task_returns_retry_config(t: &mut Target) {
         .create_task(CreateTaskRequest {
             parent: queue.clone(),
             task: Some(Task {
-                retry_config: Some(task_retry_config()),
+                retry_config: Some(RetryConfig {
+                    max_attempts: 3,
+                    max_retry_duration: seconds(60),
+                    min_backoff: seconds(2),
+                    max_backoff: seconds(4),
+                    max_doublings: 1,
+                }),
                 ..t.task(&name, http("https://example.com/work"))
             }),
             response_view: task::View::Unspecified.into(),
@@ -3258,10 +3165,6 @@ async fn create_task_returns_retry_config(t: &mut Target) {
 
 async fn create_task_rejects_invalid_retry_config(t: &mut Target) {
     let queue = t.queue("task-retry-invalid").await;
-    let negative = Some(Duration {
-        seconds: -1,
-        nanos: 0,
-    });
     for (label, retry_config) in [
         (
             "max attempts -2",
@@ -3280,21 +3183,21 @@ async fn create_task_rejects_invalid_retry_config(t: &mut Target) {
         (
             "min backoff -1s",
             RetryConfig {
-                min_backoff: negative,
+                min_backoff: seconds(-1),
                 ..Default::default()
             },
         ),
         (
             "max backoff -1s",
             RetryConfig {
-                max_backoff: negative,
+                max_backoff: seconds(-1),
                 ..Default::default()
             },
         ),
         (
             "max retry duration -1s",
             RetryConfig {
-                max_retry_duration: negative,
+                max_retry_duration: seconds(-1),
                 ..Default::default()
             },
         ),
@@ -3373,7 +3276,7 @@ async fn retries_follow_task_retry_config(t: &mut Target) {
 async fn create_task_limits_task_size(t: &mut Target) {
     let queue = t.queue("task-size").await;
     let name = format!("{queue}/tasks/t");
-    // Searches for the largest body accepted, which is below 2 MB
+    // Searches for largest body accepted, which is below 2 MB
     let (mut accepted, mut rejected) = (0, 2_000_000);
     let mut error = None;
     let mut probe = 0;
@@ -3400,7 +3303,7 @@ async fn create_task_limits_task_size(t: &mut Target) {
         }
     }
 
-    // The name's length counts towards the size, and differs between targets
+    // Name's length counts towards size, and differs between targets
     t.record(
         "largest body plus name length",
         Ok::<_, Status>(accepted + name.len()),
@@ -3493,7 +3396,7 @@ async fn delete_queue_blocks_name(t: &mut Target) {
         }),
     };
 
-    // Real Cloud Tasks accepts the name for a moment after the delete
+    // Real Cloud Tasks accepts name for a moment after delete
     let created = retry_until!(t.create_queue(create.clone()), Result::is_err);
     // Real Cloud Tasks accepts about 1 in 50, though no queue appears
     let updated = retry_until!(
@@ -3504,7 +3407,7 @@ async fn delete_queue_blocks_name(t: &mut Target) {
         Result::is_err
     );
     let got = t.get_queue(GetQueueRequest { name: name.clone() }).await;
-    // Real Cloud Tasks sometimes accepts the delete again
+    // Real Cloud Tasks sometimes accepts delete again
     let deleted = retry_until!(
         t.delete_queue(DeleteQueueRequest { name: name.clone() }),
         Result::is_err
@@ -3512,7 +3415,7 @@ async fn delete_queue_blocks_name(t: &mut Target) {
     let paused = t
         .pause_queue(PauseQueueRequest { name: name.clone() })
         .await;
-    // Real Cloud Tasks answers about 1 in 3 with FailedPrecondition, saying the queue existed recently
+    // Real Cloud Tasks answers about 1 in 3 with FailedPrecondition, saying queue existed recently
     let task = retry_until!(
         t.create_task(CreateTaskRequest {
             parent: name.clone(),
@@ -3592,7 +3495,7 @@ async fn create_task_moves_past_schedule_time_to_now(t: &mut Target) {
 
         let result = t.create_task(request).await;
 
-        // Whether the task is due as it is created
+        // Whether task is due as it is created
         t.record(
             label,
             result.map(|task| {
@@ -3737,7 +3640,7 @@ async fn create_task_rejects_invalid_tokens(t: &mut Target) {
     }
 }
 
-/// Decodes a JWT's header and claims, with run-specific values as placeholders and `exp` as its lifetime
+/// Decodes JWT's header and claims, with run-specific values as placeholders and `exp` as its lifetime
 fn decode_jwt(t: &mut Target, token: &str) -> (BTreeMap<String, Value>, BTreeMap<String, Value>) {
     let decode = |part: &str| -> BTreeMap<String, Value> {
         serde_json::from_slice(&URL_SAFE_NO_PAD.decode(part).unwrap()).unwrap()
@@ -3844,7 +3747,6 @@ fn queue_oauth(service_account: &str, scope: &str) -> Option<http_target::Author
     }))
 }
 
-/// Creates a queue for each target and records what it stored
 async fn record_http_targets(t: &mut Target, prefix: &str, targets: Vec<(&str, HttpTarget)>) {
     for (label, http_target) in targets {
         let request = CreateQueueRequest {
@@ -4361,7 +4263,6 @@ async fn create_task_takes_queue_token(t: &mut Target) {
     }
 }
 
-/// Points the task URL at the receiver's `path`
 fn to_receiver(t: &Target, path: &str) -> UriOverride {
     let url = reqwest::Url::parse(&t.receiver.url).unwrap();
     UriOverride {
@@ -4381,7 +4282,7 @@ fn to_receiver(t: &Target, path: &str) -> UriOverride {
     }
 }
 
-/// What a handler sees of a request, with any token as its decoded claims
+/// What handler sees of request, with any token as its decoded claims
 fn handled(t: &mut Target, request: &Received) -> impl Debug + use<> {
     let headers: BTreeMap<_, _> = request
         .headers
@@ -4464,7 +4365,7 @@ async fn dispatch_applies_http_target(t: &mut Target) {
                     http_method: HttpMethod::Get.into(),
                     ..Default::default()
                 }),
-                // An hour's backoff keeps a failed task, and its last attempt
+                // One-hour backoff keeps failed task, and its last attempt
                 retry_config: Some(RetryConfig {
                     max_attempts: 2,
                     min_backoff: seconds(3600),
@@ -4608,17 +4509,13 @@ async fn dispatch_applies_http_target_to_existing_tasks(t: &mut Target) {
     .await
     .unwrap();
 
-    // Real Cloud Tasks takes minutes to apply an update, so earlier attempts fail on the old URL
-    let request = tokio::time::timeout(std::time::Duration::from_secs(300), async {
-        loop {
-            if let Some(request) = t.receiver.received("target-existing").pop() {
-                return request;
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        }
-    })
-    .await
-    .expect("real Cloud Tasks applies the update in time");
+    // Real Cloud Tasks takes minutes to apply update, so earlier attempts fail on old URL
+    let request = retry_until!(
+        async { t.receiver.received("target-existing").pop() },
+        Option::is_some,
+        300
+    )
+    .unwrap();
     let request = handled(t, &request);
     t.record("request", Ok::<_, Status>(request));
 }
@@ -5173,10 +5070,7 @@ async fn batch_create_tasks_reports_failed_requests(t: &mut Target) {
                 },
             ))),
             create(Some(Task {
-                dispatch_deadline: Some(Duration {
-                    seconds: 14,
-                    nanos: 0,
-                }),
+                dispatch_deadline: seconds(14),
                 ..t.task("", http("https://example.com/work"))
             })),
             create(Some(Task {
@@ -5668,7 +5562,7 @@ async fn set_iam_policy_checks_etag(t: &mut Target) {
     let empty_policy_etag = t.set_iam_policy(set(t, vec![0x00, 0x20, 0x01])).await;
     let no_etag = t.set_iam_policy(set(t, vec![])).await;
 
-    // Cuts the message before the first etag that changes on every set
+    // Cuts message before first etag that changes on every set
     let cut = |result: Result<Etagged, Status>, at: &str| {
         result.map_err(|status| {
             let (message, _) = status.message().split_once(at).unwrap();
@@ -5865,11 +5759,11 @@ async fn get_cmek_config_rejects_invalid_names(t: &mut Target) {
 }
 
 async fn update_cmek_config_rejects_invalid_requests(t: &mut Target) {
-    // The run creates no queues here, as a queue with header overrides blocks every key check
+    // Run creates no queues here, as queue with header overrides blocks every key check
     let location = format!("{}/locations/us-central1", t.project);
     let name = format!("{location}/cmekConfig");
     let key_ring = format!("{location}/keyRings/missing");
-    // Every key here is rejected, as a real one would turn on CMEK for the location
+    // Every key here is rejected, as real one would turn on CMEK for location
     let config = |name: &str, kms_key: &str| {
         Some(CmekConfig {
             name: name.to_owned(),
@@ -5976,7 +5870,7 @@ async fn rest_manages_queues(t: &mut Target) {
 async fn rest_lists_queues(t: &mut Target) {
     t.queue("restlist").await;
 
-    // Other cases' queues share the location
+    // Other cases' queues share location
     let path = format!("/v2/{}/queues?filter=name:restlist", t.parent);
     let listed = t.rest("list", Method::GET, &path, "").await;
 
@@ -5986,7 +5880,7 @@ async fn rest_lists_queues(t: &mut Target) {
 async fn rest_manages_tasks(t: &mut Target) {
     let queue = t.queue("rest-tasks").await;
     let name = format!("{queue}/tasks/t");
-    // No headers beyond the User-Agent that Cloud Tasks adds, as it orders map entries differently on each request
+    // No headers beyond User-Agent that Cloud Tasks adds, as it orders map entries differently on each request
     let request = json!({
         "task": {
             "name": name,
@@ -6101,7 +5995,7 @@ async fn rest_manages_iam_policies(t: &mut Target) {
 }
 
 async fn rest_manages_cmek_config(t: &mut Target) {
-    // The run creates no queues here, and the key is rejected, as a real one would turn on CMEK for the location
+    // Run creates no queues here, and key is rejected, as real one would turn on CMEK for location
     let path = format!("/v2/{}/locations/us-central1/cmekConfig", t.project);
 
     t.rest("get", Method::GET, &path, "").await;
@@ -6152,7 +6046,7 @@ async fn rest_rejects_invalid_requests(t: &mut Target) {
         .rest("malformed json", Method::POST, &tasks, r#"{"task": "#)
         .await;
 
-    // Cuts the parser's account of the error, which only Google's parser gives
+    // Cuts parser's account of error, which only Google's parser gives
     let body: Value = serde_json::from_str(&malformed).unwrap();
     let message = body["error"]["message"].to_string();
     let (_, account) = message

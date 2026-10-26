@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime};
 
 use cloud_tasks_emulator::proto::google::cloud::tasks::v2::{
     CreateQueueRequest, CreateTaskRequest, HttpRequest, OidcToken, PauseQueueRequest, Queue,
-    RetryConfig, Task, http_request, task,
+    RateLimits, RetryConfig, Task, http_request, task,
 };
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
@@ -103,6 +103,142 @@ async fn first_retry_waits_min_backoff() {
         elapsed(task.last_attempt.unwrap().response_time, task.schedule_time),
         Duration::from_millis(100)
     );
+}
+
+#[tokio::test]
+async fn retry_past_9999_waits_until_end_of_9999() {
+    let mut client = support::start_emulator().await;
+    let receiver = support::Receiver::start().await;
+    let backoff = prost_types::Duration {
+        seconds: 315_576_000_000,
+        nanos: 0,
+    };
+    client
+        .create_queue(queue(Some(RetryConfig {
+            min_backoff: Some(backoff),
+            max_backoff: Some(backoff),
+            ..Default::default()
+        })))
+        .await
+        .unwrap();
+    client
+        .create_task(create(&receiver.url_for("t", "404")))
+        .await
+        .unwrap();
+
+    let task = support::poll_task(
+        &mut client,
+        "projects/p/locations/l/queues/q/tasks/t",
+        |task| task.response_count == 1,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        task.schedule_time,
+        Some(Timestamp {
+            seconds: 253_402_300_799,
+            nanos: 0,
+        })
+    );
+}
+
+#[tokio::test]
+async fn retry_past_clock_range_waits_until_end_of_9999() {
+    let mut client = support::start_emulator().await;
+    let receiver = support::Receiver::start().await;
+    let backoff = prost_types::Duration {
+        seconds: i64::MAX,
+        nanos: 0,
+    };
+    client
+        .create_queue(queue(Some(RetryConfig {
+            min_backoff: Some(backoff),
+            max_backoff: Some(backoff),
+            ..Default::default()
+        })))
+        .await
+        .unwrap();
+    client
+        .create_task(create(&receiver.url_for("t", "404")))
+        .await
+        .unwrap();
+
+    let task = support::poll_task(
+        &mut client,
+        "projects/p/locations/l/queues/q/tasks/t",
+        |task| task.response_count == 1,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        task.schedule_time,
+        Some(Timestamp {
+            seconds: 253_402_300_799,
+            nanos: 0,
+        })
+    );
+}
+
+#[tokio::test]
+async fn near_zero_rate_leaves_other_queues_dispatching() {
+    let mut client = support::start_emulator().await;
+    let receiver = support::Receiver::start().await;
+    let backoff = prost_types::Duration {
+        seconds: 0,
+        nanos: 1,
+    };
+    client
+        .create_queue(CreateQueueRequest {
+            parent: "projects/p/locations/l".to_owned(),
+            queue: Some(Queue {
+                name: "projects/p/locations/l/queues/near-zero".to_owned(),
+                rate_limits: Some(RateLimits {
+                    max_dispatches_per_second: 1e-300,
+                    ..Default::default()
+                }),
+                retry_config: Some(RetryConfig {
+                    min_backoff: Some(backoff),
+                    max_backoff: Some(backoff),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        })
+        .await
+        .unwrap();
+    client
+        .create_task(CreateTaskRequest {
+            parent: "projects/p/locations/l/queues/near-zero".to_owned(),
+            task: Some(Task {
+                name: "projects/p/locations/l/queues/near-zero/tasks/t".to_owned(),
+                message_type: Some(task::MessageType::HttpRequest(HttpRequest {
+                    url: receiver.url_for("burst", "404"),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }),
+            response_view: task::View::Unspecified.into(),
+        })
+        .await
+        .unwrap();
+    // Burst of 10 spends every token, which never refills, leaving retry due but waiting
+    support::poll_task(
+        &mut client,
+        "projects/p/locations/l/queues/near-zero/tasks/t",
+        |task| task.response_count == 10,
+    )
+    .await
+    .unwrap();
+    client.create_queue(queue(None)).await.unwrap();
+
+    client
+        .create_task(create(&receiver.url_for("t", "200")))
+        .await
+        .unwrap();
+
+    assert_eq!(receiver.wait_for("t", 1).await.len(), 1);
 }
 
 #[tokio::test]

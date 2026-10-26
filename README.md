@@ -78,7 +78,7 @@ LISTEN_ADDR=127.0.0.1:8123 OIDC_ISSUER=http://127.0.0.1:8123 QUEUES= cloud-tasks
 ## Docker
 
 ```sh
-docker run -p 8123:8123 -e OIDC_ISSUER=http://127.0.0.1:8123 -e QUEUES= ghcr.io/mwpryer/cloud-tasks-emulator
+docker run -p 127.0.0.1:8123:8123 -e OIDC_ISSUER=http://127.0.0.1:8123 -e QUEUES= ghcr.io/mwpryer/cloud-tasks-emulator
 ```
 
 The image sets `LISTEN_ADDR` to `0.0.0.0:8123`. Inside the container, `localhost` is the container itself, so tasks reach handlers on your machine at `host.docker.internal`. On Linux, that needs `--add-host=host.docker.internal:host-gateway`.
@@ -89,7 +89,7 @@ With Compose, handlers in other containers reach the emulator by its service nam
 services:
   tasks:
     image: ghcr.io/mwpryer/cloud-tasks-emulator
-    ports: ["8123:8123"]
+    ports: ["127.0.0.1:8123:8123"]
     environment:
       OIDC_ISSUER: http://tasks:8123
       QUEUES: projects/p/locations/l/queues/q

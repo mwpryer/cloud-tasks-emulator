@@ -295,8 +295,12 @@ impl State {
                     break;
                 }
                 if queue.tokens < 1.0 {
-                    let until_token = Duration::from_secs_f64((1.0 - queue.tokens) / rate);
-                    wait = Some(wait.map_or(until_token, |wait| wait.min(until_token)));
+                    // Rate near zero puts next token past what Duration holds, so needs no timer
+                    if let Ok(until_token) =
+                        Duration::try_from_secs_f64((1.0 - queue.tokens) / rate)
+                    {
+                        wait = Some(wait.map_or(until_token, |wait| wait.min(until_token)));
+                    }
                     break;
                 }
                 queue.tokens -= 1.0;
@@ -355,7 +359,12 @@ impl State {
             queue.remove_task(&delivery.task, now);
             return;
         }
-        task.schedule_time = now + retry_config.backoff(task.dispatch_count);
+        // Caps at end of 9999, last time Timestamp holds
+        let last = SystemTime::UNIX_EPOCH + Duration::from_secs(253_402_300_799);
+        task.schedule_time = now
+            .checked_add(retry_config.backoff(task.dispatch_count))
+            .unwrap_or(last)
+            .min(last);
     }
 }
 

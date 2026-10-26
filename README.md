@@ -58,10 +58,10 @@ One port serves gRPC, REST and OIDC discovery. REST requests become gRPC calls i
 ## Install
 
 ```sh
-cargo install --git https://github.com/mwpryer/cloud-tasks-emulator
+cargo install cloud-tasks-emulator
 ```
 
-Building needs no `protoc`.
+Building needs no `protoc`. The emulator runs on Linux and macOS. On Windows, use [Docker](#docker) or WSL.
 
 ## Quick start
 

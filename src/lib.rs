@@ -92,7 +92,7 @@ pub async fn serve(
     tonic::transport::Server::builder()
         .accept_http1(true)
         .add_routes(routes.into())
-        .serve_with_incoming(TcpIncoming::from(listener))
+        .serve_with_incoming(TcpIncoming::from(listener).with_nodelay(Some(true)))
         .await?;
     Ok(())
 }
@@ -143,7 +143,7 @@ async fn wait_idle(State(emulator): State<Arc<Emulator>>, Path(path): Path<Strin
                 )
                     .into_response();
             };
-            if queue.tasks.is_empty() {
+            if queue.tasks().is_empty() {
                 return StatusCode::NO_CONTENT.into_response();
             }
             if queue.state == QueueState::Paused {

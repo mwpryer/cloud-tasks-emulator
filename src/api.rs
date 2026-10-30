@@ -165,7 +165,7 @@ fn insert_task(
             r#"Invalid url for HttpRequest.oauth_token. The hostname in the url must end with ".googleapis.com""#,
         ));
     }
-    if queue.tasks.contains_key(&name) {
+    if queue.tasks().contains_key(&name) {
         return Err(Status::already_exists("Requested entity already exists"));
     }
     if queue.removed_tasks.contains(&name, now) {
@@ -182,13 +182,12 @@ fn insert_task(
         response_count: 0,
         first_attempt: None,
         last_attempt: None,
-        run_requested: false,
     };
     if task_to_proto(&task, pb::task::View::Full).encoded_len() > MAX_TASK_SIZE {
         return Err(Status::invalid_argument("Task size too large"));
     }
     let response = task_to_proto(&task, view);
-    queue.tasks.insert(task.name.clone(), task);
+    queue.insert_task(task);
     Ok(response)
 }
 
@@ -626,7 +625,7 @@ impl CloudTasks for Emulator {
             .ok_or_else(|| Status::not_found(QUEUE_NOT_FOUND))?;
         let prefix = format!("{}/tasks/", request.parent);
         let (tasks, next_page_token) = page(
-            &queue.tasks,
+            queue.tasks(),
             &prefix,
             "ListTasksRequest",
             request.page_size,
@@ -663,8 +662,12 @@ impl CloudTasks for Emulator {
                     .0,
             )
             .ok_or_else(|| Status::not_found(NOT_FOUND))?;
-        match queue.tasks.get(&request.name) {
-            Some(task) => Ok(Response::new(task_to_proto(task, view))),
+        match queue
+            .tasks()
+            .get(&request.name)
+            .map(|task| task_to_proto(task, view))
+        {
+            Some(task) => Ok(Response::new(task)),
             None if queue
                 .removed_tasks
                 .contains(&request.name, SystemTime::now()) =>
@@ -938,10 +941,8 @@ impl CloudTasks for Emulator {
                     .0,
             )
             .ok_or_else(|| Status::not_found(QUEUE_NOT_FOUND))?
-            .tasks
-            .get_mut(&request.name)
+            .run_task(&request.name)
             .ok_or_else(|| Status::not_found(NOT_FOUND))?;
-        task.run_requested = true;
         // Cloud Tasks answers before it dispatches, so new attempt has only its schedule time
         let mut response = task_to_proto(task, view);
         response.dispatch_count += 1;

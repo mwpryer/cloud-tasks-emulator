@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
@@ -34,7 +34,11 @@ pub(crate) struct Queue {
     pub config: QueueConfig,
     pub state: QueueState,
     pub purge_time: Option<SystemTime>,
-    pub tasks: BTreeMap<String, Task>,
+    tasks: BTreeMap<String, Task>,
+    /// Tasks not in flight, in order they dispatch
+    waiting: BTreeSet<(SystemTime, String)>,
+    /// Set by RunTask until scheduler starts attempt
+    run_requested: BTreeSet<String>,
     /// Finished and deleted task names
     pub removed_tasks: Tombstones,
     /// Stored only, as emulator has no caller identity
@@ -124,8 +128,6 @@ pub(crate) struct Task {
     /// Dispatch time only, as Cloud Tasks keeps nothing else of first attempt
     pub first_attempt: Option<SystemTime>,
     pub last_attempt: Option<Attempt>,
-    /// Set by RunTask until scheduler starts attempt
-    pub run_requested: bool,
 }
 
 pub(crate) struct HttpRequest {
@@ -256,8 +258,12 @@ impl State {
             queue.refilled_at = now;
 
             // RunTask dispatches whatever queue's state, limits and task's schedule
-            for task in queue.tasks.values_mut().filter(|task| task.run_requested) {
-                task.run_requested = false;
+            for name in std::mem::take(&mut queue.run_requested) {
+                let task = queue
+                    .tasks
+                    .get_mut(&name)
+                    .expect("removing task drops its run request");
+                queue.waiting.remove(&(task.schedule_time, name));
                 self.next_attempt_id += 1;
                 queue.in_flight += 1;
                 deliveries.push(task.start_attempt(
@@ -273,18 +279,8 @@ impl State {
                 continue;
             }
 
-            let mut waiting: Vec<&mut Task> = queue
-                .tasks
-                .values_mut()
-                .filter(|task| {
-                    task.last_attempt
-                        .as_ref()
-                        .is_none_or(|attempt| attempt.response.is_some())
-                })
-                .collect();
-            waiting.sort_by_key(|task| task.schedule_time);
-            for task in waiting {
-                if let Ok(until_due) = task.schedule_time.duration_since(now)
+            while let Some((schedule_time, _)) = queue.waiting.first() {
+                if let Ok(until_due) = schedule_time.duration_since(now)
                     && !until_due.is_zero()
                 {
                     wait = Some(wait.map_or(until_due, |wait| wait.min(until_due)));
@@ -304,6 +300,11 @@ impl State {
                     break;
                 }
                 queue.tokens -= 1.0;
+                let (_, name) = queue.waiting.pop_first().expect("first was checked");
+                let task = queue
+                    .tasks
+                    .get_mut(&name)
+                    .expect("removing task drops it from waiting");
                 self.next_attempt_id += 1;
                 queue.in_flight += 1;
                 deliveries.push(task.start_attempt(
@@ -365,6 +366,9 @@ impl State {
             .checked_add(retry_config.backoff(task.dispatch_count))
             .unwrap_or(last)
             .min(last);
+        queue
+            .waiting
+            .insert((task.schedule_time, delivery.task.clone()));
     }
 }
 
@@ -377,6 +381,8 @@ impl Queue {
             state: QueueState::Running,
             purge_time: None,
             tasks: BTreeMap::new(),
+            waiting: BTreeSet::new(),
+            run_requested: BTreeSet::new(),
             removed_tasks: Tombstones::new(Duration::from_secs(24 * 60 * 60)),
             policy: iam::Policy {
                 // Etag of queue that never had policy, `ACAB` in base64
@@ -388,14 +394,35 @@ impl Queue {
         }
     }
 
+    pub fn tasks(&self) -> &BTreeMap<String, Task> {
+        &self.tasks
+    }
+
+    pub fn insert_task(&mut self, task: Task) {
+        self.waiting.insert((task.schedule_time, task.name.clone()));
+        self.tasks.insert(task.name.clone(), task);
+    }
+
+    /// Asks scheduler to start attempt now
+    pub fn run_task(&mut self, name: &str) -> Option<&Task> {
+        let task = self.tasks.get(name)?;
+        self.run_requested.insert(task.name.clone());
+        Some(task)
+    }
+
     pub fn remove_task(&mut self, name: &str, now: SystemTime) -> Option<Task> {
         let task = self.tasks.remove(name)?;
+        self.run_requested.remove(name);
+        self.waiting
+            .remove(&(task.schedule_time, task.name.clone()));
         self.removed_tasks.insert(task.name.clone(), now);
         Some(task)
     }
 
     pub fn purge(&mut self, now: SystemTime) {
         self.purge_time = Some(now);
+        self.waiting.clear();
+        self.run_requested.clear();
         for name in std::mem::take(&mut self.tasks).into_keys() {
             self.removed_tasks.insert(name, now);
         }

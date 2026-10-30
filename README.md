@@ -63,6 +63,8 @@ cargo install cloud-tasks-emulator
 
 Building needs no `protoc`. The emulator runs on Linux and macOS. On Windows, use [Docker](#docker) or WSL.
 
+Each [release](https://github.com/mwpryer/cloud-tasks-emulator/releases) also carries a Linux x86_64 binary.
+
 ## Quick start
 
 ```sh
